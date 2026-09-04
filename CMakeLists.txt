@@ -115,9 +115,9 @@ set(VITAGL_LIB ${VITAGL_DIR}/libvitaGL.a)
 
 add_custom_command(
     OUTPUT ${VITAGL_LIB}
-    COMMAND ${CMAKE_MAKE_PROGRAM} MATH_SPEEDHACK=1 DRAW_SPEEDHACK=1 NO_DEBUG=1 HAVE_SHARK_LOG=1 NO_SPLASHSCREEN=1
+    COMMAND ${CMAKE_MAKE_PROGRAM} NO_SPLASHSCREEN=1 HAVE_SHARK_LOG=1
     WORKING_DIRECTORY ${VITAGL_DIR}
-    COMMENT "Building vendorized vitaGL..."
+    COMMENT "Building vendorized vitaGL without aggressive hacks..."
 )
 
 add_custom_target(vitaGL_build DEPENDS ${VITAGL_LIB})
