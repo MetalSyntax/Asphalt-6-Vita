@@ -47,3 +47,4 @@ void so_patch(void) {
     hook_addr((uintptr_t)so_symbol(&so_mod, "_ZN7gameswf4root7advanceEfb"), (uintptr_t)&hooked_gameswf_root_advance);
     hook_addr((uintptr_t)(so_mod.text_base + 0x683af8), (uintptr_t)&hooked_RenderFX_Find_pt);
 }
+void shark_set_shader_association_path(const char *path) {}

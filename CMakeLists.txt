@@ -110,8 +110,22 @@ add_executable(${CMAKE_PROJECT_NAME}
 add_subdirectory(lib/libc_bridge)
 add_dependencies(${CMAKE_PROJECT_NAME} SceLibcBridge)
 
+set(VITAGL_DIR ${CMAKE_SOURCE_DIR}/lib/vitaGL)
+set(VITAGL_LIB ${VITAGL_DIR}/libvitaGL.a)
+
+add_custom_command(
+    OUTPUT ${VITAGL_LIB}
+    COMMAND ${CMAKE_MAKE_PROGRAM} MATH_SPEEDHACK=1 DRAW_SPEEDHACK=1 NO_DEBUG=1 HAVE_SHARK_LOG=1
+    WORKING_DIRECTORY ${VITAGL_DIR}
+    COMMENT "Building vendorized vitaGL..."
+)
+
+add_custom_target(vitaGL_build DEPENDS ${VITAGL_LIB})
+add_dependencies(${CMAKE_PROJECT_NAME} vitaGL_build)
+
 target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM
                            PUBLIC ${CMAKE_SOURCE_DIR}/lib
+                           PUBLIC ${VITAGL_DIR}/source
                            )
 
 target_include_directories(${CMAKE_PROJECT_NAME}
@@ -121,7 +135,7 @@ target_include_directories(${CMAKE_PROJECT_NAME}
 target_link_libraries(${CMAKE_PROJECT_NAME}
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
-                      vitaGL
+                      ${VITAGL_LIB}
                       vitashark
                       SceShaccCgExt
                       taihen_stub
