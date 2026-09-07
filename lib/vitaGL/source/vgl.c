@@ -840,5 +840,14 @@ void vglSetShaderCachePath(const char *path) {
 }
 
 void vglSetShaderAssociationPath(const char *path) {
+	// Igual que Asphalt-5-Vita: upstream nunca protege esta llamada --
+	// shark_set_shader_association_path es un simbolo de profiling
+	// Razor/devkit ausente en un toolchain release, asi que compilar sin
+	// HAVE_RAZOR/HAVE_DEVKIT (nuestro caso) falla al linkear. Nunca llamamos
+	// esta funcion (HAVE_SHADER_CACHE se apaña sin ella); protegerla igual
+	// que HAVE_SHADER_CACHE protege vglSetShaderCachePath para que un
+	// feature sin uso no exija una libreria de devkit.
+#ifdef HAVE_RAZOR
 	shark_set_shader_association_path(path);
+#endif
 }

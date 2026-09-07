@@ -29,6 +29,12 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offs);
 
 int munmap(void *addr, size_t length);
 
+// Envoltorios que solo dejan migas; ver el comentario en mem.c.
+void *malloc_soloader(size_t size);
+void *calloc_soloader(size_t nmemb, size_t size);
+void *realloc_soloader(void *ptr, size_t size);
+void free_soloader(void *ptr);
+
 #ifdef __cplusplus
 };
 #endif

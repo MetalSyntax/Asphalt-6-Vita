@@ -289,6 +289,15 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
     return EGL_TRUE;
 }
 
+// Este motor NO usa EGL para presentar (nunca llama aca): swapea via el callback JNI
+// `swapEGLBuffers` desde glitch::CAndroidOSDevice::flush() -- ver java.c. Igual se deja
+// implementado y contabilizado por gl_swap(), para que si alguna ruta del .so si lo
+// llamara, main.c no presente el frame una segunda vez.
+EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+    gl_swap();
+    return EGL_TRUE;
+}
+
 EGLBoolean eglDestroyContext (EGLDisplay dpy, EGLContext ctx) {
     if (ctx) free(ctx);
     return EGL_TRUE;

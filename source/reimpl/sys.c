@@ -18,8 +18,9 @@
 #include <psp2/rtc.h>
 #include <stdlib.h>
 
-#include "utils/utils.h"
+#include "utils/breadcrumb.h"
 #include "utils/logger.h"
+#include "utils/utils.h"
 
 #define BIONIC_CLOCK_REALTIME           0
 #define BIONIC_CLOCK_MONOTONIC          1
@@ -80,6 +81,47 @@ int clock_getres_soloader(clockid_t clock_id, struct timespec * res) {
 
 clock_t clock_soloader(void) {
     return sceKernelGetProcessTimeLow();
+}
+
+/*
+ * Paridad con Asphalt-5-Vita. El motor (glitch::os::Timer::getRealTime/
+ * getMicroSeconds, CFPSCounter, DisplayFrame cada 100 ms) vive de gettimeofday;
+ * el newlib de stock no da un reloj monotonico fiable en Vita y los sleeps
+ * sub-milisegundo / yields hunden el rendimiento del hilo principal.
+ */
+int gettimeofday_soloader(struct timeval *tv, void *tz) {
+    // Contador para el testigo (ver bc_spin_time): una espera activa de tiempo
+    // con un reloj que no avanzara seria invisible sin esto.
+    bc_spin_time();
+    if (tv) {
+        uint64_t proctime = sceKernelGetProcessTimeWide();
+        tv->tv_sec = proctime / 1000000;
+        tv->tv_usec = proctime % 1000000;
+    }
+    return 0;
+}
+
+int usleep_soloader(useconds_t usec) {
+    // Las migas van ANTES del corte de <1ms a proposito: un bucle de espera del motor que
+    // duerme 100 us es invisible en el log (no llega a dormir) pero deja rastro en el anillo.
+    bc_event("usleep", BC_RA);
+    if (usec < 1000) {
+        return 0; // Just return immediately to keep the spinlock fast.
+    }
+    return sceKernelDelayThread(usec);
+}
+
+int nanosleep_soloader(const struct timespec *req, struct timespec *rem) {
+    bc_event("nanosleep", BC_RA);
+    if (req && req->tv_sec == 0 && req->tv_nsec < 1000000) {
+        return 0; // Skip sleeps under 1ms
+    }
+    return nanosleep(req, rem);
+}
+
+int sched_yield_soloader(void) {
+    bc_event("sched_yield", BC_RA);
+    return 0; // Do nothing. Yielding on a single-core dominant engine tanks FPS.
 }
 
 int sigaction(int signum, const struct sigaction * act, struct sigaction * oldact) {

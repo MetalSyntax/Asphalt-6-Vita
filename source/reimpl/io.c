@@ -21,6 +21,7 @@
 #include <libc_bridge/libc_bridge.h>
 #endif
 
+#include "utils/breadcrumb.h"
 #include "utils/logger.h"
 #include "utils/utils.h"
 
@@ -53,6 +54,7 @@ static bool remap_gameloft_sdcard_path(const char * path, char * out, size_t out
 }
 
 FILE * fopen_soloader(const char * filename, const char * mode) {
+    bc_event("fopen", BC_RA);
     if (strcmp(filename, "/proc/cpuinfo") == 0) {
         return fopen_soloader("app0:/cpuinfo", mode);
     } else if (strcmp(filename, "/proc/meminfo") == 0) {
@@ -79,6 +81,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
 }
 
 int open_soloader(const char * path, int oflag, ...) {
+    bc_event("open", BC_RA);
     if (strcmp(path, "/proc/cpuinfo") == 0) {
         return open_soloader("app0:/cpuinfo", oflag);
     } else if (strcmp(path, "/proc/meminfo") == 0) {
@@ -120,6 +123,7 @@ int fstat_soloader(int fd, stat64_bionic * buf) {
 }
 
 int stat_soloader(const char * path, stat64_bionic * buf) {
+    bc_event("stat", BC_RA);
     char remapped[256];
     if (remap_gameloft_sdcard_path(path, remapped, sizeof(remapped))) {
         return stat_soloader(remapped, buf);
@@ -153,6 +157,7 @@ int close_soloader(int fd) {
 }
 
 DIR* opendir_soloader(char* _pathname) {
+    bc_event("opendir", BC_RA);
     DIR* ret = opendir(_pathname);
     l_debug("opendir(\"%s\"): %p", _pathname, ret);
     return ret;

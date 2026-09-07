@@ -224,3 +224,39 @@ void _log_print(int t, const char* fmt, ...) {
         sceKernelUnlockLwMutex(&_log_mutex, 1);
     }
 }
+
+/*
+ * Sumidero de los mensajes de FalsoJNI (lib/falso_jni/FalsoJNI_Logger.c).
+ *
+ * FalsoJNI imprime sus avisos con sceClibPrintf, que en una consola retail no va a ningun
+ * lado que se pueda leer -- asi que sus mensajes mas utiles ("method ID 0 not found",
+ * "GetMethodID: not found", "Could not find the array") eran invisibles. Aca se reenvian al
+ * MISMO archivo que se baja por FTP.
+ *
+ * La linea ya viene formateada y con ANSI adentro; se le sacan los colores y el \n final
+ * porque _log_print() pone los suyos.
+ */
+void fjni_log_sink(const char *line) {
+    if (!line || !*line)
+        return;
+
+    char clean[1024];
+    size_t o = 0;
+    for (const char *p = line; *p && o + 1 < sizeof(clean); ++p) {
+        if (*p == '\x1B') {
+            // Secuencia ANSI: descartar hasta la letra final inclusive.
+            while (*p && *p != 'm')
+                ++p;
+            if (!*p)
+                break;
+            continue;
+        }
+        if (*p == '\n' || *p == '\r')
+            continue;
+        clean[o++] = *p;
+    }
+    clean[o] = '\0';
+
+    if (o > 0)
+        _log_print(LT_ERROR, "[FalsoJNI] %s", clean);
+}

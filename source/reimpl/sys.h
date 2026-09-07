@@ -25,6 +25,14 @@ extern "C" {
 
 clock_t clock_soloader(void);
 
+int gettimeofday_soloader(struct timeval *tv, void *tz);
+
+int usleep_soloader(useconds_t usec);
+
+int nanosleep_soloader(const struct timespec *req, struct timespec *rem);
+
+int sched_yield_soloader(void);
+
 int clock_gettime_soloader(clockid_t clock_id, struct timespec * tp);
 
 int clock_getres_soloader(clockid_t clock_id, struct timespec * res);

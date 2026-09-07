@@ -1,16 +1,30 @@
 #include <falso_jni/FalsoJNI.h>
 #include <falso_jni/FalsoJNI_Impl.h>
 
+#include <string.h>
+
+#include <psp2/kernel/processmgr.h>
+
+#include "utils/glutil.h"
+#include "utils/logger.h"
+
 /*
  * JNI Methods
 */
 
-// Methods declarations
-jboolean GLGame_nativeIsXperia(JNIEnv *env, jobject thiz) {
+/*
+ * Methods declarations.
+ *
+ * Todos los handlers de las tablas Methods*[] de abajo tienen la MISMA firma
+ * (jmethodID, va_list) -- son lo que FalsoJNI invoca cuando el .so hace un Call*Method,
+ * no nativos JNI. Declararlos como (JNIEnv*, jobject) compilaba con warning y habría
+ * leído basura de los registros si el motor llegara a invocarlos.
+ */
+jboolean GLGame_nativeIsXperia(jmethodID id, va_list args) {
     return JNI_FALSE;
 }
 
-jint GLGame_nativeGetLanguageIndex(JNIEnv *env, jobject thiz) {
+jint GLGame_nativeGetLanguageIndex(jmethodID id, va_list args) {
     return 1; // English
 }
 
@@ -38,8 +52,20 @@ jint GLGame_nativeGetLanguageIndex(JNIEnv *env, jobject thiz) {
 
 static jstring s_glgameMac;
 static jstring s_glgameIdentifier;
-static jstring s_glgameVersion;
-static jstring s_glgameHostName;
+// getVersion()/getHostName() estan declarados "()[B" en el .so (confirmado leyendo los
+// GetStaticMethodID de GLGame_nativeInit con Ghidra + objdump), y nativeGetVersion()/
+// nativegetHostName() los consumen con GetArrayLength()+GetByteArrayRegion(). Un jstring
+// de FalsoJNI NO es un JavaDynArray, asi que GetArrayLength() devolvia 0 y el motor se
+// quedaba con la cadena vacia -- tienen que ser jbyteArray de verdad.
+static jbyteArray s_glgameVersion;
+static jbyteArray s_glgameHostName;
+
+static jbyteArray java_new_byte_array(const char *str) {
+    jsize len = (jsize)strlen(str);
+    jbyteArray arr = jni->NewByteArray(&jni, len);
+    if (arr) jni->SetByteArrayRegion(&jni, arr, 0, len, (const jbyte *)str);
+    return arr;
+}
 
 // fieldsObject[] no se puede inicializar con NewStringUTF() en tiempo de compilación
 // (jni todavía no existe), así que se completa acá -- llamar una sola vez, después de
@@ -47,8 +73,8 @@ static jstring s_glgameHostName;
 void java_init_static_strings(void) {
     s_glgameMac = jni->NewStringUTF(&jni, "00:00:00:00:00:00");
     s_glgameIdentifier = jni->NewStringUTF(&jni, "PSVITA-ASPHALT6");
-    s_glgameVersion = jni->NewStringUTF(&jni, "1.3.3");
-    s_glgameHostName = jni->NewStringUTF(&jni, "localhost");
+    s_glgameVersion = java_new_byte_array("1.3.3");
+    s_glgameHostName = java_new_byte_array("localhost");
 
     for (size_t i = 0; i < fieldsObject_size() / sizeof(FieldsObject); i++) {
         if (fieldsObject[i].id == 2) fieldsObject[i].value = jni->NewStringUTF(&jni, "sony");
@@ -72,26 +98,72 @@ jobject GLGame_getHostName(jmethodID id, va_list args) {
     return s_glgameHostName;
 }
 
-jobject GLGame_getWifiIP(jmethodID id, va_list args) {
-    return NULL;
+// getWifiIP() esta declarado "()I" en el .so (no String): sin red, 0.0.0.0.
+jint GLGame_getWifiIP(jmethodID id, va_list args) {
+    return 0;
 }
 
-// Edición offline (Asphalt-6-Adrenaline-v1.3.3-offline.apk): sin red real, se
-// declara todo apagado para que el motor tome el camino sin conexión.
-jboolean GLGame_IsWifiEnabled(jmethodID id, va_list args) {
-    return JNI_FALSE;
+/*
+ * Edición offline (Asphalt-6-Adrenaline-v1.3.3-offline.apk): sin red real, se declara
+ * todo apagado para que el motor tome el camino sin conexión.
+ *
+ * OJO con el tipo: los cuatro estan declarados "()I" en el .so y el motor los invoca con
+ * CallStaticIntMethod (vtable +0x204), no con CallStaticBooleanMethod -- registrarlos como
+ * METHOD_TYPE_BOOLEAN hacia que methodIntCall() no los encontrara ("method ID N not
+ * found!") y devolviera 0 por descarte.
+ */
+jint GLGame_IsWifiEnabled(jmethodID id, va_list args) {
+    return 0;
 }
 
-jboolean GLGame_IsInternetAvaliable(jmethodID id, va_list args) {
-    return JNI_FALSE;
+jint GLGame_IsInternetAvaliable(jmethodID id, va_list args) {
+    return 0;
 }
 
-jboolean GLGame_isExternalMusicActive(jmethodID id, va_list args) {
-    return JNI_FALSE;
+jint GLGame_isExternalMusicActive(jmethodID id, va_list args) {
+    return 0;
 }
 
-jboolean GLGame_IsFirmwareBefore22(jmethodID id, va_list args) {
-    return JNI_FALSE;
+jint GLGame_IsFirmwareBefore22(jmethodID id, va_list args) {
+    return 0;
+}
+
+/*
+ * ESTE es el swap real del motor -- la razón de la pantalla negra hasta el Bug #013.
+ *
+ * glitch::CAndroidOSDevice::flush() (0x701898 en el .so) hace
+ * `CallStaticVoidMethod(env, GameRenderer.class, swapEGLBuffers)`, y GameRenderer_nativeInit
+ * es quien resuelve ese jmethodID (junto a getKeyboardText/setKeyboard/isKeyboardVisible).
+ * O sea: el .so NUNCA llama eglSwapBuffers -- presenta cada frame por este callback JNI.
+ * Como no estaba en la tabla, ningún frame llegaba al display.
+ *
+ * Además es el ÚNICO camino de swap mientras el motor está adentro de un bucle de carga
+ * (Loading::Start() prende mbIsEnableSwapBuffer y Loading::DisplayFrame() dibuja+swapea
+ * cada 100 ms): ahí nativeRender() no retorna por varios segundos, así que el swap del
+ * bucle principal de main.c no corre. Sin swap, vitaGL nunca cierra la escena de sceGxm ni
+ * recicla su circular pool, y el juego terminaba colgado dentro del frame 3 (log 009).
+ */
+void GameRenderer_swapEGLBuffers(jmethodID id, va_list args) {
+    gl_swap();
+}
+
+// getKeyboardText()[B / setKeyboard(ILjava/lang/String;I)V / isKeyboardVisible()I: los
+// resuelve GameRenderer_nativeInit. Sin teclado virtual en el port, no-ops explícitos
+// (registrarlos evita el ruido de "GetStaticMethodID: not found" en el log).
+jobject GameRenderer_getKeyboardText(jmethodID id, va_list args) {
+    return java_new_byte_array("");
+}
+
+void GameRenderer_setKeyboard(jmethodID id, va_list args) {}
+
+jint GameRenderer_isKeyboardVisible(jmethodID id, va_list args) {
+    return 0;
+}
+
+// nativeExit() -> GLGame.Exit(): el motor pide cerrar la aplicación.
+void GLGame_Exit(jmethodID id, va_list args) {
+    l_error("El juego pidió salir (GLGame.Exit)");
+    sceKernelExitProcess(0);
 }
 
 void GLGame_sendAppToBackground(jmethodID id, va_list args) {}
@@ -127,10 +199,10 @@ NameToMethodID nameToMethodId[] = {
 
     { 20, "sendAppToBackground", METHOD_TYPE_VOID },
     { 21, "setFullyLoaded", METHOD_TYPE_VOID },
-    { 22, "IsWifiEnabled", METHOD_TYPE_BOOLEAN },
-    { 23, "IsInternetAvaliable", METHOD_TYPE_BOOLEAN },
-    { 24, "isExternalMusicActive", METHOD_TYPE_BOOLEAN },
-    { 25, "IsFirmwareBefore22", METHOD_TYPE_BOOLEAN },
+    { 22, "IsWifiEnabled", METHOD_TYPE_INT },
+    { 23, "IsInternetAvaliable", METHOD_TYPE_INT },
+    { 24, "isExternalMusicActive", METHOD_TYPE_INT },
+    { 25, "IsFirmwareBefore22", METHOD_TYPE_INT },
     { 26, "getMac", METHOD_TYPE_OBJECT },
     { 27, "getIdentifier", METHOD_TYPE_OBJECT },
     { 28, "showIAPDialog", METHOD_TYPE_VOID },
@@ -140,9 +212,16 @@ NameToMethodID nameToMethodId[] = {
     { 32, "getHostName", METHOD_TYPE_OBJECT },
     { 33, "OpenGLive", METHOD_TYPE_VOID },
     { 34, "NotifyTrophy", METHOD_TYPE_VOID },
-    { 35, "getWifiIP", METHOD_TYPE_OBJECT },
+    { 35, "getWifiIP", METHOD_TYPE_INT },
     { 36, "OpenIGP", METHOD_TYPE_VOID },
     { 37, "onLaunchGame1", METHOD_TYPE_VOID },
+    { 38, "Exit", METHOD_TYPE_VOID },
+
+    // Resueltos por GameRenderer_nativeInit (jni_GameRenderer.c del motor).
+    { 50, "swapEGLBuffers", METHOD_TYPE_VOID },
+    { 51, "getKeyboardText", METHOD_TYPE_OBJECT },
+    { 52, "setKeyboard", METHOD_TYPE_VOID },
+    { 53, "isKeyboardVisible", METHOD_TYPE_INT },
 
     { 40, "getResourceFull", METHOD_TYPE_OBJECT },
     { 41, "getResourceBytes", METHOD_TYPE_OBJECT },
@@ -153,10 +232,6 @@ NameToMethodID nameToMethodId[] = {
 
 MethodsBoolean methodsBoolean[] = {
     { 10, GLGame_nativeIsXperia },
-    { 22, GLGame_IsWifiEnabled },
-    { 23, GLGame_IsInternetAvaliable },
-    { 24, GLGame_isExternalMusicActive },
-    { 25, GLGame_IsFirmwareBefore22 },
 };
 MethodsByte methodsByte[] = {};
 MethodsChar methodsChar[] = {};
@@ -164,8 +239,14 @@ MethodsDouble methodsDouble[] = {};
 MethodsFloat methodsFloat[] = {};
 MethodsInt methodsInt[] = {
     { 11, GLGame_nativeGetLanguageIndex },
+    { 22, GLGame_IsWifiEnabled },
+    { 23, GLGame_IsInternetAvaliable },
+    { 24, GLGame_isExternalMusicActive },
+    { 25, GLGame_IsFirmwareBefore22 },
+    { 35, GLGame_getWifiIP },
     { 42, GLGame_getResourceLength },
     { 44, GLGame_getResourceLengthSoundRaw },
+    { 53, GameRenderer_isKeyboardVisible },
 };
 MethodsLong methodsLong[] = {};
 MethodsObject methodsObject[] = {
@@ -173,10 +254,10 @@ MethodsObject methodsObject[] = {
     { 27, GLGame_getIdentifier },
     { 31, GLGame_getVersion },
     { 32, GLGame_getHostName },
-    { 35, GLGame_getWifiIP },
     { 40, GLGame_getResourceFull },
     { 41, GLGame_getResourceBytes },
     { 43, GLGame_getSoundRaw },
+    { 51, GameRenderer_getKeyboardText },
 };
 MethodsShort methodsShort[] = {};
 MethodsVoid methodsVoid[] = {
@@ -189,6 +270,9 @@ MethodsVoid methodsVoid[] = {
     { 34, GLGame_NotifyTrophy },
     { 36, GLGame_OpenIGP },
     { 37, GLGame_onLaunchGame1 },
+    { 38, GLGame_Exit },
+    { 50, GameRenderer_swapEGLBuffers },
+    { 52, GameRenderer_setKeyboard },
 };
 
 /*

@@ -31,7 +31,15 @@ extern "C" {
 // Debugging tool
 char *get_gxm_error_literal(uint32_t code);
 #ifdef LOG_ERRORS
-#define vgl_log sceClibPrintf
+/*
+ * PARCHE DEL PORT (Asphalt-6-Vita): upstream esto es `#define vgl_log sceClibPrintf`, que en
+ * una consola de retail escribe a un puerto de debug que no podemos leer. Acá se declara en
+ * su lugar una funcion que implementa el loader (source/utils/glutil.c) reenviando al mismo
+ * archivo de log que bajamos por FTP, para que los errores internos de vitaGL (fallos del
+ * shader patcher, allocations fallidas, overrun del circular pool, errores del compilador Cg)
+ * aparezcan junto al resto de la traza.
+ */
+void vgl_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #else
 #define vgl_log(...)
 #endif

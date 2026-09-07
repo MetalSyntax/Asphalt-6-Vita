@@ -16,8 +16,10 @@
 #include <psp2/kernel/threadmgr.h>
 #include <stdatomic.h>
 
-#include "utils/utils.h"
+#include "utils/breadcrumb.h"
 #include "utils/logger.h"
+#include "utils/utils.h"
+#include "utils/watchdog.h"
 
 #define PTHR_MAX_OBJECTS 1024
 
@@ -182,6 +184,17 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
         ret = pthread_create(thread, attr->real_ptr, start, param);
     }
 
+    /*
+     * Todo hilo que crea el .so entra a la lista del hilo testigo. En la implementacion de
+     * pthreads de vitasdk el `pthread_t` ES el UID del hilo de sceKernel, asi que se puede
+     * consultar con sceKernelGetThreadInfo(); si algun dia dejara de serlo, el testigo lo
+     * reporta una vez y sigue. Sin esto no hay forma de ver, cuando el juego se traba, si
+     * hay un hilo del motor girando en un bucle cerrado o bloqueado en un mutex.
+     */
+    bc_event("pthread_create", BC_RA);
+    if (ret == 0 && thread)
+        watchdog_register_thread((int)*thread, "hilo-del-.so");
+
     return ret;
 }
 
@@ -225,6 +238,7 @@ int pthread_mutex_lock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
     _mutex_t_static_init(mutex, NULL);
+    BC_SCOPE("pthread_mutex_lock");
     return pthread_mutex_lock(mutex->real_ptr);
 }
 
@@ -244,6 +258,7 @@ int pthread_mutex_unlock_soloader(pthread_mutex_t_bionic *mutex)
 
 int pthread_join_soloader(pthread_t thread, void **value_ptr)
 {
+    BC_SCOPE("pthread_join");
     return pthread_join(thread, value_ptr);
 }
 
@@ -293,6 +308,7 @@ int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t
     _cond_t_static_init(cond, NULL);
     _mutex_t_static_init(mutex, NULL);
 
+    BC_SCOPE("pthread_cond_timedwait");
     return pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, abstime);
 }
 
@@ -304,6 +320,7 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
     _cond_t_static_init(cond, NULL);
     _mutex_t_static_init(mutex, NULL);
 
+    BC_SCOPE("pthread_cond_wait");
     return pthread_cond_wait(cond->real_ptr, mutex->real_ptr);
 }
 

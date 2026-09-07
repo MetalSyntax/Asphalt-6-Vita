@@ -62,6 +62,18 @@ if (DUMP_COMPILED_SHADERS)
   endif()
 endif()
 
+# Traza pesada por-llamada GL (un sceIoWrite por draw): solo para corridas de
+# diagnostico, cuesta un orden de magnitud de rendimiento.
+#
+# Desde el bug #015 ya no hace falta prenderla para ubicar un cuelgue: el anillo de migas
+# (source/utils/breadcrumb.c) guarda las ultimas 128 llamadas interceptadas en RAM, sin tocar
+# la SD, y el hilo testigo lo vuelca al log cuando detecta que no avanzan los frames. Da la
+# misma informacion en el momento del cuelgue, sin el costo por llamada ni el sesgo de timing.
+option(TRACE_GL_CALLS "Log every intercepted GL call (diagnostic runs only)" OFF)
+if (TRACE_GL_CALLS)
+  add_definitions(-DTRACE_GL_CALLS)
+endif()
+
 # Unique debug definition for loader's logging to not interfere with anything
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_definitions(-DDEBUG_SOLOADER)
@@ -93,12 +105,15 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/sys.c
                source/reimpl/time64.c
                source/reimpl/asset_manager.cpp
+               source/utils/breadcrumb.c
                source/utils/dialog.c
                source/utils/glutil.c
                source/utils/init.c
                source/utils/logger.c
                source/utils/settings.c
+               source/utils/touch.c
                source/utils/utils.c
+               source/utils/watchdog.c
                lib/falso_jni/FalsoJNI.c
                lib/falso_jni/FalsoJNI_ImplBridge.c
                lib/falso_jni/FalsoJNI_Logger.c
@@ -113,15 +128,50 @@ add_dependencies(${CMAKE_PROJECT_NAME} SceLibcBridge)
 set(VITAGL_DIR ${CMAKE_SOURCE_DIR}/lib/vitaGL)
 set(VITAGL_LIB ${VITAGL_DIR}/libvitaGL.a)
 
+# Mismo set probado en Asphalt-5-Vita (y asphalt8-vita-main): DRAW_SPEEDHACK=2
+# (-DSAFER_DRAW_SPEEDHACK) evita que draws grandes agoten/corrompan el temp
+# pool circular de vertices (causa de GPU hangs en A5 Bugs #19/#20/#22);
+# HAVE_SHADER_CACHE=1 activa el cache oficial de vitaGL (default
+# ux0:data/shader_cache, sin llamar nada desde el loader); sin MATH_SPEEDHACK
+# ni HAVE_SHARK_LOG.
+# LOG_ERRORS=1 hace que vitaGL reporte sus fallos internos (registro de programas en el
+# shader patcher, allocations fallidas, overrun del circular pool, errores del compilador Cg
+# via vitaShaRK). Su macro `vgl_log` está parcheada en
+# lib/vitaGL/source/utils/debug_utils.h para caer en NUESTRO archivo de log (implementación
+# en source/utils/glutil.c) en vez de en sceClibPrintf, que en retail no se puede leer.
+set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2")
+separate_arguments(VITAGL_MAKE_ARGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS}")
+
+# Forzar rebuild completo de vitaGL cuando VITAGL_MAKE_FLAGS cambie (la regla
+# OUTPUT de abajo sola no reconstruye si la .a ya existe -- sin esto, editar
+# los flags no tiene efecto y se linkea la .a vieja sin avisar).
+set(VITAGL_FLAGS_STAMP ${CMAKE_BINARY_DIR}/vitagl_flags.stamp)
+set(vitagl_old_flags "")
+if (EXISTS ${VITAGL_FLAGS_STAMP})
+  file(READ ${VITAGL_FLAGS_STAMP} vitagl_old_flags)
+endif()
+if (NOT vitagl_old_flags STREQUAL VITAGL_MAKE_FLAGS)
+  file(GLOB_RECURSE vitagl_stale_objs ${VITAGL_DIR}/source/*.o)
+  file(REMOVE ${vitagl_stale_objs} ${VITAGL_LIB})
+  file(WRITE ${VITAGL_FLAGS_STAMP} "${VITAGL_MAKE_FLAGS}")
+endif()
+
 add_custom_command(
     OUTPUT ${VITAGL_LIB}
-    COMMAND ${CMAKE_MAKE_PROGRAM} SOFTFP_ABI=1 MATH_SPEEDHACK=1 DRAW_SPEEDHACK=1 NO_DEBUG=1 HAVE_SHARK_LOG=1 NO_SPLASHSCREEN=1
+    COMMAND ${CMAKE_MAKE_PROGRAM} ${VITAGL_MAKE_ARGS}
     WORKING_DIRECTORY ${VITAGL_DIR}
-    COMMENT "Building vendorized vitaGL with SOFTFP_ABI..."
+    COMMENT "Building vendorized vitaGL..."
 )
 
 add_custom_target(vitaGL_build DEPENDS ${VITAGL_LIB})
 add_dependencies(${CMAKE_PROJECT_NAME} vitaGL_build)
+
+# Helper para forzar rebuild de vitaGL tras cambiar sus flags (ver NOTA arriba).
+add_custom_target(vitagl-clean
+    COMMAND ${CMAKE_MAKE_PROGRAM} clean
+    WORKING_DIRECTORY ${VITAGL_DIR}
+    COMMENT "Cleaning vendorized vitaGL..."
+)
 
 target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM
                            PUBLIC ${CMAKE_SOURCE_DIR}/lib

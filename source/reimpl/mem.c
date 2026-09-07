@@ -8,6 +8,7 @@
  */
 
 #include "reimpl/mem.h"
+#include "utils/breadcrumb.h"
 #include "utils/logger.h"
 
 #include <string.h>
@@ -32,4 +33,33 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offs) {
 int munmap(void *addr, size_t length) {
     if (addr) free(addr);
     return 0;
+}
+
+/*
+ * Envoltorios de malloc/free que solo dejan migas (utils/breadcrumb.h).
+ *
+ * Sirven para el caso peor de un cuelgue: el motor girando en un bucle de codigo puro que no
+ * toca ni GL ni archivos. Casi cualquier bucle de este motor (construccion de escena, batching
+ * de mallas, contenedores de la STL) reserva memoria, asi que el anillo caliente termina lleno
+ * de direcciones de retorno DE ESE BUCLE -- que es exactamente el offset del .so que hay que
+ * buscar en el pseudo-C de Ghidra.
+ */
+void *malloc_soloader(size_t size) {
+    bc_hot("malloc", BC_RA);
+    return malloc(size);
+}
+
+void *calloc_soloader(size_t nmemb, size_t size) {
+    bc_hot("calloc", BC_RA);
+    return calloc(nmemb, size);
+}
+
+void *realloc_soloader(void *ptr, size_t size) {
+    bc_hot("realloc", BC_RA);
+    return realloc(ptr, size);
+}
+
+void free_soloader(void *ptr) {
+    bc_hot("free", BC_RA);
+    free(ptr);
 }
