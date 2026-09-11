@@ -8,6 +8,8 @@
 #include <stdlib.h>
 
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
+#include <psp2/power.h>
 
 #include <falso_jni/FalsoJNI.h>
 #include <so_util/so_util.h>
@@ -151,6 +153,11 @@ int main() {
      */
     unsigned int frame = 0;
     while (1) {
+        // Paridad con Asphalt-5-Vita (Bug #26 ahí): resetea el idle timer del sistema
+        // cada frame. Sin esto, la Vita atenúa/apaga la pantalla y suspende la app cuando
+        // el jugador no toca nada (típico en menús), y las esperas de display/audio en las
+        // que están bloqueados el motor y vitaGL nunca vuelven -- parece un freeze.
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         touch_poll();
 
         unsigned int swaps_before = gl_swap_count;

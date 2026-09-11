@@ -81,6 +81,36 @@ unsigned bc_spin_time_count(void) {
     return atomic_load_explicit(&s_spin_time, memory_order_relaxed);
 }
 
+// De donde vino la ultima consulta de reloj (ver el .h): el giro del log 021
+// solo toca gettimeofday (~1850/s) y nada mas envuelto, asi que el contador
+// dice QUE clase de giro es pero no en QUE funcion. Se guarda el ultimo sitio
+// (el giro lo sobrescribe continuamente: al volcar, es el del bucle).
+// Sin locks ni syscalls, igual que el resto de este modulo.
+static atomic_uint s_clock_ra0 = ATOMIC_VAR_INIT(0);
+static atomic_uint s_clock_ra1 = ATOMIC_VAR_INIT(0);
+static atomic_uint s_clock_ra2 = ATOMIC_VAR_INIT(0);
+static atomic_int s_clock_tid = ATOMIC_VAR_INIT(0);
+
+void bc_clock_site(uint32_t ra0, uint32_t ra1, uint32_t ra2) {
+    atomic_store_explicit(&s_clock_ra0, ra0, memory_order_relaxed);
+    atomic_store_explicit(&s_clock_ra1, ra1, memory_order_relaxed);
+    atomic_store_explicit(&s_clock_ra2, ra2, memory_order_relaxed);
+    atomic_store_explicit(&s_clock_tid, sceKernelGetThreadId(), memory_order_relaxed);
+}
+
+void bc_clock_site_get(uint32_t *ra0, uint32_t *ra1, uint32_t *ra2) {
+    if (ra0)
+        *ra0 = atomic_load_explicit(&s_clock_ra0, memory_order_relaxed);
+    if (ra1)
+        *ra1 = atomic_load_explicit(&s_clock_ra1, memory_order_relaxed);
+    if (ra2)
+        *ra2 = atomic_load_explicit(&s_clock_ra2, memory_order_relaxed);
+}
+
+int bc_clock_site_tid(void) {
+    return atomic_load_explicit(&s_clock_tid, memory_order_relaxed);
+}
+
 // Anillo aparte para las llamadas muy frecuentes (malloc/free): en el comun taparian todo.
 #define BC_HOT_RING 32
 #define BC_HOT_MASK (BC_HOT_RING - 1)
@@ -93,6 +123,10 @@ static uint32_t s_text_size = 0;
 void bc_set_base(uintptr_t text_base, uint32_t text_size) {
     s_text_base = text_base;
     s_text_size = text_size;
+}
+
+int bc_in_so(uint32_t addr) {
+    return s_text_base && addr >= s_text_base && addr < s_text_base + s_text_size;
 }
 
 /*
@@ -200,6 +234,23 @@ void bc_dump(const char *why) {
     l_error("[bc] ---- ultimas reservas de memoria (bucle caliente) ----");
     bc_dump_ring(s_hot, BC_HOT_MASK,
                  atomic_load_explicit(&s_hot_seq, memory_order_relaxed), BC_HOT_RING);
+
+    // Quien quema el reloj (ver bc_clock_site en el .h): ra0 es el llamador
+    // directo de gettimeofday (el wrapper hoja o CCondition::wait), ra1 su
+    // llamador (el bucle) y ra2 el marco de arriba. El tid dice QUÉ hilo lo
+    // quema: el contador del testigo es global y mezcla principal + workers.
+    uint32_t ra0 = atomic_load_explicit(&s_clock_ra0, memory_order_relaxed);
+    int ctid = atomic_load_explicit(&s_clock_tid, memory_order_relaxed);
+    if (ra0) {
+        if (bc_in_so(ra0))
+            l_error("[bc] sitio de reloj: tid=0x%08X consulta desde libasphalt6.so+0x%08X",
+                    (unsigned)ctid, (unsigned)(ra0 - (uint32_t)s_text_base));
+        else
+            l_error("[bc] sitio de reloj: tid=0x%08X consulta desde 0x%08X (fuera del .so)",
+                    (unsigned)ctid, (unsigned)ra0);
+    } else {
+        l_error("[bc] sitio de reloj: sin consultas");
+    }
 
     l_error("[bc] ---- fin del volcado (una ENTRA sin su 'sale' es donde se trabo) ----");
 }

@@ -587,8 +587,8 @@ so_default_dynlib default_dynlib[] = {
         { "glCompileShader", (uintptr_t)&glCompileShader_soloader },
         { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D_soloader },
         { "glCompressedTexSubImage2D", (uintptr_t)&ret0 },
-        { "glCopyTexImage2D", (uintptr_t)&glCopyTexImage2D },
-        { "glCopyTexSubImage2D", (uintptr_t)&glCopyTexSubImage2D },
+        { "glCopyTexImage2D", (uintptr_t)&glCopyTexImage2D_soloader },
+        { "glCopyTexSubImage2D", (uintptr_t)&glCopyTexSubImage2D_soloader },
         { "glCreateProgram", (uintptr_t)&glCreateProgram },
         { "glCreateShader", (uintptr_t)&glCreateShader },
         { "glCullFace", (uintptr_t)&glCullFace },
@@ -624,7 +624,11 @@ so_default_dynlib default_dynlib[] = {
         { "glEnable", (uintptr_t)&glEnable_soloader },
         { "glEnableClientState", (uintptr_t)&glEnableClientState },
         { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
-        { "glFinish", (uintptr_t)&glFinish_soloader },
+        // Paridad con Asphalt-5-Vita: glFinish bloquea hasta que la GPU queda idle --
+        // un stall completo del pipeline por llamada. El motor lo usa como barrera tras
+        // post-procesado/RTT del menú; eliminarlo es el no-op con más FPS por línea.
+        // glFlush (no bloqueante) sí se deja pasar a vitaGL.
+        { "glFinish", (uintptr_t)&ret0 },
         { "glFlush", (uintptr_t)&glFlush_soloader },
         { "glFogf", (uintptr_t)&glFogf },
         { "glFogfv", (uintptr_t)&glFogfv },
@@ -732,7 +736,9 @@ so_default_dynlib default_dynlib[] = {
         { "glPopMatrix", (uintptr_t)&glPopMatrix },
         { "glPushMatrix", (uintptr_t)&glPushMatrix },
         { "glQueryMatrixxOES", (uintptr_t)&ret0 },
-        { "glReadPixels", (uintptr_t)&glReadPixels_soloader },
+        // Paridad con Asphalt-5-Vita: glReadPixels es un readback CPU del framebuffer
+        // (stall + copia lenta en GXM). No-op: el motor lo usa en efectos/feedback.
+        { "glReadPixels", (uintptr_t)&ret0 },
         { "glRenderbufferStorage", (uintptr_t)&glRenderbufferStorage_soloader },
         { "glRenderbufferStorageOES", (uintptr_t)&glRenderbufferStorage_soloader },
         { "glRotatef", (uintptr_t)&glRotatef },

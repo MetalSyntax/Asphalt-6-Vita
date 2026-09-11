@@ -33,14 +33,12 @@ elegí "Continuar con un port existente" apuntando a esta carpeta.
 - **Audio: sin implementar.** El `.so` no importa OpenSL ni OpenAL (0 símbolos de audio entre
   sus 272 indefinidos): `vox::DriverAndroid` maneja `android/media/AudioTrack` por JNI crudo
   (`FindClass` + `GetMethodID("<init>"/"play"/"write"/...)`), nada de eso está en `java.c`.
-- **Estado actual: arranca, se ve la pantalla de carga animada, y se cuelga al entrar al menú.**
-  El giro quedó acotado con hooks ENTER al **`Loading::DisplayFrame` final del constructor de
-  `MenuScene`** (se pasó `RemoveChildNodeType`, re-parenting, batching, `createAnimator` y
-  `CLightSceneNode`), con firma de espera de tiempo (`+9256 gettimeofday` cada 5 s, todo lo
-  demás en 0, hilo principal `CORRIENDO`). Bloqueantes: **Bug #015** (el giro) y **Bug #018**
-  (crash intermitente en `IDevice::run`, con guarda ya aplicada). Ver `port_progress.md`.
-  Pendiente de verificar en consola: corrida 020 con los hooks de segundo nivel
-  (`IDevice::run`, `RenderFX::Update`/`Render`, los dos `endScene`).
+- **Estado actual: ¡Llega al menú principal!** Tras resolver los cuelgues durante la carga
+  (Bugs #015-#021) y el abort por excepción C++ con idioma no inicializado al primer arranque
+  (Bug #022 en `StringManager`), el juego supera el guardado de perfil, carga la UI Flash
+  (`gameswf`) y alcanza el menú principal (`GS_MenuMain`), presentando frames continuamente.
+  Pendiente: verificación interactiva de controles físicos/touch e implementación de audio (`AudioTrack`).
+
 
 ## Depuración: qué hay disponible antes de inventar nada
 

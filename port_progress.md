@@ -4,24 +4,28 @@
 > escribieron aunque después se hayan demostrado equivocadas -- saber qué hipótesis se
 > descartó, y por qué, vale tanto como el fix. Lo que está vigente hoy está acá arriba.
 
-## Estado actual — 2026-09-05
+## Estado actual — 2026-09-11
 
-**Arranca, se ve la pantalla de carga animada, y se cuelga al entrar al menú principal.**
-Determinista: el corte cae en el mismo punto en las 5 corridas con log comparable
-(009, 011, 012, 013, 014); la 010 ya lo mostraba igual según el Bug #014. No es
-un crash -- el hilo testigo sigue latiendo, no se genera `.psp2dmp`: es el hilo principal el
-que se traba. Bloqueante actual: **Bug #015**.
+**¡El juego ya llega hasta el menú principal con renderizado y presentación activa!**
+Con la resolución del Bug #022 (fallback de idioma inglés en `StringManager::GetLanguageString`
+y protección contra `std::string(NULL)`), el motor supera "First time launch the app", guarda
+exitosamente `pn.dat`/`timespent.dat`, inicializa `FlashFXHandler` y la interfaz Flash (`gameswf`),
+y entra por completo al menú principal (`GS_MenuMain`), presentando frames de forma continua.
+
+Próximos objetivos: interactividad completa del menú (verificar touch/mapeo de botones físicos)
+y emulación de audio (`android/media/AudioTrack`).
 
 | Área | Estado |
 |---|---|
 | Carga del `.so`, relocación, resolución de símbolos | funciona (272/272 importados resueltos) |
 | Tabla JNI / ciclo de vida `GLGame`+`GameRenderer` | funciona |
 | Gráficos (vitaGL, GLES2, GLSL en caliente) | funciona: 66 shaders / 33 programas sin errores |
-| Presentación de frames (`swapEGLBuffers`) | funciona (Bug #013) |
+| Presentación de frames (`swapEGLBuffers`) | funciona, presentando frames continuamente en el menú |
 | Assets (`fopen` sobre `ux0:data/asphalt6/data/`) | funciona |
-| Input táctil | implementado, sin verificar en el menú (no se llega) |
+| Menú principal (`MenuScene`, `OnLoad3DScene`, `GS_MenuMain`) | **funciona: llega al menú principal** (Bugs #015-#022 resueltos) |
+| Input táctil | implementado, pendiente de prueba interactiva en el menú |
 | Audio | **nada implementado** -- hay que emular `android/media/AudioTrack` por JNI |
-| Menú principal en adelante | **bloqueado, Bug #015** |
+| "First time launch" (guardado de `pn.dat`/`timespent.dat` en adelante) | funciona (Bug #022 resuelto) |
 
 ### Correcciones a lo que dicen las Fases 1-2 de más abajo
 
@@ -44,7 +48,8 @@ que se traba. Bloqueante actual: **Bug #015**.
 | #012 | **Causa raíz** de toda la cadena `smart_ptr`: los assets con nombre sí estaban, ocultos | resuelto |
 | #013 | **Causa raíz** de la pantalla negra: el motor presenta por el callback JNI `swapEGLBuffers`, no por EGL | resuelto |
 | #014 | Hipótesis: `scenesPerFrame=1` en los render targets de sceGxm | **descartada** en #015 |
-| #015 | Cuelgue entrando al menú, acotado a `MenuScene::MenuScene` | **abierto** |
+| #015-#021 | Cuelgue entrando al menú (`MenuScene`, bucle sin cota en `OnLoad3DScene`, `std::sort` sin strict weak ordering) | resueltos |
+| #022 | `abort()` por `std::logic_error` en `StringManager::SetLanguage(NULL)` tras primer arranque | resuelto |
 
 ## Fase 1: Configuración y Preparación (Completada — 2026-08-23)
 - Repo creado desde soloader-boilerplate, `.gitignore` anti-DMCA.
@@ -70,13 +75,20 @@ que se traba. Bloqueante actual: **Bug #015**.
 - [x] Ejecutar el `.vpk` en hardware real y triagear los crashes de arranque (Bugs #001-#013,
       todos con `.psp2dmp` real -- ver las entradas de abajo).
 
-## Fase 5: Llegar al menú principal (En progreso)
+## Fase 5: Llegar al menú principal (Completada — 2026-09-11)
 - [x] Que se vea algo en pantalla (Bug #013: `swapEGLBuffers`).
 - [x] Instrumentación para diagnosticar cuelgues, no sólo crashes (Bug #015: hilo testigo con
       estado de kernel por hilo, anillo de migas, y los logs de `[vitaGL]`/`[FalsoJNI]`/`[ALOG]`
       unificados en el archivo que se baja por FTP).
-- [ ] Bug #015: identificar y arreglar el cuelgue dentro de `MenuScene::MenuScene`.
-- [ ] Verificar el input táctil ya en el menú.
+- [x] Bugs #015-#021: identificar y arreglar el cuelgue dentro de `MenuScene::MenuScene`.
+- [x] Bug #022: arreglar el crash al guardar `pn.dat` / "First time launch the app" (`StringManager` idioma NULL) permitiendo llegar al menú interactivo.
+- [x] **¡Llegada confirmada al menú principal!**
+
+## Fase 6: Navegación del menú, entrada a carrera y audio (En progreso)
+- [ ] Verificar input táctil y mapear controles físicos (botones / analógicos de PS Vita).
+- [ ] Implementar subsistema de audio (`vox::DriverAndroid` / `android/media/AudioTrack`).
+- [ ] Probar transición de inicio de carrera y renderizado 3D en pista.
+
 
 ### Sesión 2026-08-31: tabla JNI + ciclo de vida GLGame/GameRenderer
 
@@ -1416,3 +1428,653 @@ verificación pendiente es desplegar el `eboot.bin` de este commit, correr y tra
 triagea con `so-crash-triage` como siempre. Archivos que quedan fuera del commit a
 propósito: `logs/` y `*.psp2dmp` (gitignored), `compile_commands.json` y los `Makefile`
 de `lib/vitaGL/samples/` (generados).
+
+### Bug #015 (cont.) — log 021: sin crash (la guarda de `run` funciona), mismo giro de espera de tiempo — 2026-09-10
+
+**Log:** `logs/asphalt6_021.log` (1306 líneas, Debug). El usuario la dejó 60+ s colgada
+(`swap #12 hace 61833 ms` al final).
+
+**Lo nuevo: ya no hay crash.** No se generó `.psp2dmp` y el juego llega al mismo muro de
+siempre (66 shaders / 33 programas, texturas del menú 3D, 13 frames, último hito `swap
+#12`). La guarda de `hook_run` (Bug #018, forzar camino de cola vacía) aguantó una corrida
+completa hasta el menú — el crash intermitente del 019/020 quedó atrás.
+
+**El giro es el mismo del 018, byte por byte:** principal `CORRIENDO`, `+0 reservas +0
+strstr +0 strcmp` y `+~9k gettod` por latido sin parar, workers sanos, anillo del principal
+congelado con la misma cola (`createAnimator` → `CLightSceneNode` → `DisplayFrame` y nada
+después durante 46 s). Sigue siendo una espera activa que solo pregunta la hora.
+
+**Lo que el 021 SÍ discrimina (y el 018 no podía): los 5 hooks de segundo nivel nunca
+dispararon.** Ni una `ENTRA IDevice::run` / `RenderFX::Update` / `RenderFX::Render` /
+`endScene` en todo el log, con el `DisplayFrame` final entrado hace 46 s.
+
+**Verificación estática (capstone sobre el `.so` local, modo ARM):** `DisplayFrame`
+(`0x4A4128`) es lineal hasta la llamada a `run` (`bl 0x85A004` en `0x4A41A8`): dos chequeos
+de flags, `counter++`, UNA llamada a `getRealTime`, comparan `< 100` y retornan o siguen a
+`run`. No hay ningún bucle antes de `run`, y el camino vacío de `run` (el que fuerza la
+guarda: `cmp r3,ip / beq 0x85A074` → dos llamadas virtuales → epílogo) tampoco sondea el
+reloj. La primera palabra de `run` es la esperada (`ldr ip,[r0,#0xC0]`), así que el hook
+debería instalarse. Conclusión: el giro **no** está entre `DisplayFrame` y `run` — o bien
+`DisplayFrame` retornó y el giro está en código posterior sin instrumentar (epílogo del
+constructor de `MenuScene` → `Loading::Stop` → `ResumeAllSounds`, todos sin hooks), o bien
+el `eboot` desplegado es anterior a los hooks de segundo nivel. El 021 no distingue ambas;
+el 022 sí (ver abajo).
+
+**Instrumentación agregada para zanjarlo en UNA corrida (build Debug verificado,
+`asphalt6.vpk` regenerado):**
+
+- `bc_clock_site()` (estaba declarado en `breadcrumb.h` pero sin implementar ni usar):
+  `gettimeofday_soloader` guarda `__builtin_return_address(0/1/2)` en atómicos sin
+  syscalls — ra1 es el llamador de `Timer::getRealTime`, es decir, el bucle. `bc_dump`
+  lo imprime como `sitio de reloj: bucle en libasphalt6.so+0x…` (o fuera del `.so`).
+- `hook_trace` ahora loguea cada hook instalado (`[patch] hook en +0x…`): el 022 prueba
+  por sí mismo que los 12 hooks están vivos y descarta "build viejo" sin adivinar.
+
+**Cómo leer el próximo log (022):** buscar `sitio de reloj` en el volcado — ese offset en
+`out_ghidra.c` es la función del giro, fin de la cacería. Si además no hay líneas `[patch]
+hook en +0x85A004…`, el build desplegado no traía los hooks y hay que redesplegar.
+
+**Pendiente:** desplegar `eboot.bin`, correr, bajar `asphalt6_022.log`.
+
+### Bug #015 (cont.) — log 022: los hooks de segundo nivel están vivos pero `run` no se entra; el reloj lo quema un worker — 2026-09-10
+
+**Log:** `logs/asphalt6_022.log` (1114 líneas, Debug). Mismo muro (13 frames, `swap #12`,
+`+~9k gettod` por latido con todo lo demás en 0, principal `CORRIENDO`).
+
+**Tres cosas que el 022 deja confirmadas:**
+
+1. **Los 12 hooks están vivos** (`[patch] hook en +0x…` x12 al arrancar, del `4423C8` al
+   `7ED3B0`): queda descartado "build viejo". Y aun así, **ni una `ENTRA IDevice::run` /
+   `RenderFX` / `endScene` en toda la corrida**, con el `DisplayFrame` final entrado hace
+   13+ s. `DisplayFrame` (verificado lineal hasta `run` en el 021) no llega a `run` en
+   microsegundos ni vuelve a entrar: **retornó por un early-exit de flags** (`ab0==0` /
+   `ab9!=0`, el limitador de 100 ms no aguanta 13 s) y el giro está aguas abajo, en código
+   sin instrumentar (epílogo del ctor → `DoStateChange` → `Loading::Stop` →
+   `ResumeAllSounds` / máquina de estados). La conclusión del 018 ("giro DENTRO del
+   `DisplayFrame` final") queda corregida: es DESPUÉS de su retorno.
+2. **El `+9k gettod/s` no es el hilo principal sondeando el Timer.** El sitio de reloj
+   dice `ra0 = libasphalt6.so+0x85B0A8`, y el disasm muestra que ahí no hay ningún wrapper
+   de reloj: es el `gettimeofday` que `CCondition::wait` (`0x85B068`) llama para calcular el
+   `abstime` antes del `timedwait`. Verificado de paso: `0x857DA0` = `Timer::getRealTime`
+   (lineal), `0x857DE0` = `getMicroSeconds` (lineal), `0x3c538c` = PLT de `gettimeofday`.
+   O sea, el flood de reloj son queries de `cond_timedwait` — ruido de worker (el anillo
+   del principal no tiene ni un `cond_wait` fresco del principal). El giro del principal
+   no toca NADA instrumentado: ni reloj-Timer, ni mutex, ni malloc, ni hooks.
+3. **Mapa de los `DisplayFrame` del ctor** (barrido de `bl 0x4A4128` en C1/C2): C2 tiene 4
+   (`0x441D18`, `0x4421BC`, `0x442520`, `0x4429C4`; C1 comparte cola). Los dos intermedios
+   van seguidos de `movw/movt 'lght'` + `bl RemoveChildNodeType`; los dos últimos van
+   seguidos del epílogo (`pop {…,pc}`) = `DisplayFrame` final + retorno del ctor.
+
+**Instrumentación agregada para el 023** (build Debug verificado, `asphalt6.vpk`
+regenerado): hook ENTER en `getRealTime` (`0x857DA0`, verbatim) — dice si el principal
+sondea el Timer; hooks `AfterDF` tras el `bl` final en los dos caminos del ctor
+(`0x4421C0`/`0x4429C8`, emulación con doble indirección como `hook_anim`, r3 scratch tras
+retorno void) — si disparan, `DisplayFrame` retornó y el giro es `Stop`/audio/estados;
+`bc_clock_site` ahora guarda también el tid (el contador es global y mezclaba hilos) y el
+volcado imprime `sitio de reloj: tid=… consulta desde libasphalt6.so+0x…`.
+
+**Regresión previa incluida en este build** (sin commitear, del análisis del dump 020):
+`hook_run` usa r2 (no r12/ip) como scratch del salto final — con r12 se pisaba el `ip`
+forzado y el `beq` de cola vacía nunca se tomaba.
+
+**Cómo leer el 023:** `ENTRA AfterDF` fresca ⇒ retorno confirmado, a por `Stop`/
+`ResumeAllSounds`; `ENTRA getRealTime` fresca del principal ⇒ sondea el Timer (el ra dice
+qué bucle); ninguna de las dos + `sitio de reloj` de un worker ⇒ el principal gira en un
+flag volátil/atómico sin syscalls y el paso siguiente es hookear `Loading::Stop`.
+
+**Pendiente:** desplegar `eboot.bin`, correr, bajar `asphalt6_023.log`.
+
+### Bug #019 — crash en el epílogo del ctor de `MenuScene`: drop de `std::string` con data NULL — 2026-09-10
+
+**Log:** `logs/asphalt6_023.log` (termina abrupto en `link prog=33`, sin volcado del
+testigo: crash, no cuelgue).
+**Dump:** `logs/asphalt6-psp2core-1789012910-0x0002d7282f-eboot.bin.psp2dmp` (+
+`.analysis.txt` / `.triage_summary.md` generados con `psvita-toolkit analyze --so-base
+0x98000000`).
+
+**Síntoma:** data abort en el hilo principal con PC en `libasphalt6.so + 0xA6C39C`
+(`__exchange_and_add + 0x44`: `ldr r5,[r6]` con `r6 = 0xFFFFFFFC` (-4), `r8 = -1` = drop).
+
+**Causa raíz (disasm + pila, sin adivinar).** La pila del dump trae la cadena completa:
+`hook_dfret2` → retorno a `MenuScene::MenuScene + 0x7D8` (= `0x442BA0`). Ahí hay
+(`0x442B94`):
+
+```
+add r0, r4, #8   ; r0 = &refcount (Rep+8)
+mvn r1, #0       ; -1 = drop
+bl __exchange_and_add   ; ← crash, r0 = -4
+0x442BA0: cmp r0, #0    ; = la dirección de retorno de la pila, match exacto
+```
+
+Es el cleanup gnustl de un `basic_string` de pila del ctor (`Rep = data-12`, refcount en
+`Rep+8`, `GlitchFree(Rep)` si llega a 0 — mismo idioma en el pseudo-C del tail de C2).
+`&refcount = -4` ⇒ `Rep = -12` ⇒ **`data = NULL`**. La pila además trae `r4 = 0xFFFFFFF4`
+(-12) en `0x81540ce0**, cerrando la aritmética. El chequeo previo (`data-12 !=
+*sentinela`) no filtra NULL (`-12 != sentinela` → entra al drop igual).
+
+**Descartado que lo cause `hook_dfret2`:** el hook preserva todo (push/pop balanceado,
+r3/r4 recargados con los mismos valores que el código original, `sp` intacto) y el NULL
+vive en `[sp,#0xB4]`, slot escrito antes del `DisplayFrame`. El hook solo observó: de paso
+confirma lo predicho en el 022 — **`DisplayFrame` SÍ retornó esta corrida** (el `AfterDF`
+disparó) y el flujo llegó al epílogo del ctor. Esta corrida pasó el punto donde 021/022 se
+colgaban: la rama es no-determinista (heap/estado por corrida).
+
+**Fix aplicado** (`source/patch.c`, filosofía del Bug #012: guarda en runtime, sin tocar
+el `.so`): hooks `StrDrop` en los dos caminos del epílogo (`0x442B94` y su gemelo
+`0x44238C`, mismo idioma verificado en disasm). Emulan `add`+`mvn`, pero si
+`data (= r0+4) < 4 KB` saltan al camino "nada que liberar" (`0x4429E0`/`0x4421D8`: `mov
+r0,r6` + epílogo, que no usa ningún registro que el stub toque) avisando en vivo
+(`[patch] StrDrop: data=…`). Sin falsos positivos: el heap real vive en `0x81xxxxxx`+.
+Verificación de dos palabras en `hook_trace` como siempre. Build verificado con
+`psvita-toolkit build --preset debug` (limpio, `asphalt6.vpk` regenerado).
+
+**Cómo leer el 024:** línea `[patch] StrDrop` ⇒ la guarda mordió (y el juego sigue: puede
+reaparecer el cuelgue del Bug #015 aguas abajo — `Stop`/audio/estados — o avanzar al
+menú). Sin esa línea + crash nuevo ⇒ triagear el dump nuevo.
+
+**Pendiente:** desplegar `eboot.bin`, correr, bajar `asphalt6_024.log` (+ `.psp2dmp` si
+hay).
+
+### Bug #019 — REGRESIÓN: el hook `AfterDF` emula `ldr r4,[sp,#0xb4]` con el inmediato transpuesto — 2026-09-10
+
+**Log:** `logs/asphalt6_023.log` (crash, no cuelgue: corta en `link prog=33` sin volcado del
+testigo). **Dump:** `logs/asphalt6-psp2core-1789012910-0x0002d7282f-eboot.bin.psp2dmp`.
+
+**Lo que el 023 sí confirma antes del crash:** los **15** hooks se instalan
+(`[patch] hook en +0x…`, incluidos los tres nuevos `857DA0`/`4421C0`/`4429C8`).
+
+**Síntoma:** data abort con `PC = 0x98a6c39c` → base real `0x98000000` → offset `0xA6C39C` =
+`__gnu_cxx::__exchange_and_add + 0x44`, que es literalmente `ldr r5, [r6]` con
+**`R6 = 0xFFFFFFFC`**. `LR` cae en nuestro propio `bc_push` (residuo de la instrumentación:
+el `.so` llama a `pthread_mutex_lock` → wrapper → `bc_enter` → `bc_push`, y `__exchange_and_add`
+hace sus atómicos por mutex — el `0xA6C394` que aparecía como dirección de retorno en el anillo
+del principal en TODOS los logs anteriores es exactamente ese `bl pthread_mutex_lock`).
+
+**Causa raíz (aritmética exacta, no hipótesis):** el stub `hook_dfret1`/`hook_dfret2` emula la
+segunda de las dos palabras pisadas como `.word 0xe59d4b40`, pero la instrucción real del `.so`
+es `e59d40b4` — **inmediato transpuesto**: `ldr r4,[sp,#0xb40]` (2880) en vez de
+`ldr r4,[sp,#0xb4]` (180). El marco del ctor mide 196 bytes, así que r4 cargó basura (`0`) de
+2.7 KB más arriba de la pila. Después el código original del ctor sigue tal cual:
+`sub r4,r4,#12` → `0xFFFFFFF4`, el `cmp` contra `&_S_empty_rep_storage` no coincide, toma el
+`bne` y llama `__exchange_and_add(r4 + 8, -1)` = **`0xFFFFFFFC`** → data abort. Es el
+`std::string` que el ctor libera justo después del `DisplayFrame` final (pseudo-C
+`out_ghidra.c:58601-58610`), o sea el hook se comió su propio sitio.
+
+**Fix aplicado (dos partes):**
+
+1. `source/patch.c`: `.word 0xe59d40b4` en los dos stubs `AfterDF`.
+2. **Blindaje de la clase entera de bug:** `hook_trace()` ahora verifica también la **segunda**
+   palabra del objetivo (`expect2`) antes de instalar, con la palabra real declarada al lado de
+   cada hook (bloque `W2_*`, auditado con `objdump` para los 15 sitios). Antes solo miraba la
+   primera, y los 8 bytes pisados son DOS instrucciones: la segunda se escribe a mano en el stub
+   y esa mano ya falló dos veces, las dos con crash en consola en vez de un mensaje (Bug #017 =
+   `ldr` PC-relativo sin doble indirección; este = inmediato transpuesto). Ahora un encoding mal
+   escrito o un `.so` distinto se cazan al arrancar y ese hook no se instala.
+3. El hook de `getRealTime` sale de `so_patch()` (el stub queda definido): el 022 ya atribuyó el
+   flood de reloj al `cond_timedwait` de un worker de vox, y como empuja una miga por llamada
+   inundaría el anillo de 32 del principal, borrando el contexto `DisplayFrame`/`CLightSceneNode`/
+   `AfterDF` que hay que leer.
+
+Build Debug verificado (limpio, sin warnings de no-usado) y `eboot.bin` desplegado.
+
+**Cómo leer el 024** (la pregunta del 022 sigue abierta): `ENTRA AfterDF` fresca ⇒ el
+`DisplayFrame` final retornó y el giro es aguas abajo (epílogo del ctor → `DoStateChange` →
+`Loading::Stop` → `ResumeAllSounds`); sin `AfterDF` y con el `DisplayFrame` entrado hace
+segundos ⇒ el giro está dentro de `DisplayFrame` después de todo, y el siguiente paso es hookear
+sus early-exits.
+
+**Pista adicional que dejó el 021 y que conviene tener a mano** (leída del pseudo-C, sin
+confirmar en consola todavía): `GS_MenuMain::OnLoad3DScene` tiene una búsqueda lineal **sin
+cota** justo después de `SortCars()` — `while (*p != carId) p++;` sobre el array de
+`GetCarCount()` autos (`out_ghidra.c` ~22255). Si el auto por defecto no está en ese array
+(y `BaseCarManager::GetPackFile` está parcheado a "no encontrado" para TODOS los autos desde el
+Bug #005), ese bucle recorre memoria para siempre: puros loads y un `cmp`, sin malloc, sin
+strcmp, sin syscalls — que es EXACTAMENTE la firma del giro del principal (el flood de reloj es
+de un worker, no suyo). Es el sospechoso #1 si el 024 confirma que el giro es aguas abajo del
+ctor. La última actividad de memoria del anillo caliente del 021 encaja: `_M_insert_aux` de un
+`std::vector<int>` creciendo (= `SortCars`) y nada después.
+
+### Bug #020 — CAUSA RAÍZ del cuelgue del menú: búsqueda lineal SIN COTA en `GS_MenuMain::OnLoad3DScene` — 2026-09-10
+
+**Log:** `logs/asphalt6_024.log` (1132 líneas, Debug). **Sin crash y sin `.psp2dmp`**: el fix del
+encoding de `AfterDF` (Bug #019) aguantó y la guarda `StrDrop` ni tuvo que morder (no aparece
+la línea). El juego llega al mismo muro: 66 shaders / 33 programas, **13 frames**, último hito
+`swap #12`, y de ahí 47 s sin avanzar.
+
+**Lo que el 024 cierra (era la pregunta abierta del 022):** el anillo del principal termina en
+`createAnimator` → `CLightSceneNode` → `ENTRA DisplayFrame` → **`ENTRA AfterDF`** y nada más
+durante 15,9 s. O sea: **el `DisplayFrame` final del ctor de `MenuScene` retornó** y el giro
+está aguas abajo, en código sin instrumentar. Queda confirmada la corrección que el 022 ya
+había anticipado sobre la conclusión del 018.
+
+**Causa raíz (disasm, no hipótesis).** `GS_MenuMain::OnLoad3DScene` (`_ZN11GS_MenuMain13OnLoad3DSceneEv`,
+`0x3EED98`, 1780 bytes, sacado del `.dynsym` real) tiene esto justo después de `SortCars()`:
+
+```
+3ef004  bl Game::GetCarMgr
+3ef008  bl BaseCarManager::GetCarCount
+3ef00c  lsl r0, r0, #2
+3ef010  bl operator new[]          ; <-- SIN inicializar
+3ef014  str r0, [r5, #0x44]        ; this->carArray = array
+3ef018  mov r0, r5
+3ef01c  bl GS_MenuMain::SortCars   ; 0x3EFDD8
+...
+3ef04c  ldr r3, [r0, #0x20]        ; profile->carId
+3ef050  cmn r3, #1
+3ef054  beq 0x3ef364               ; == -1 -> al bloque de abajo
+...
+3ef364  ldr r2, [r5, #0x3c]        ; this->raceCar
+3ef368  cmp r2, #0
+3ef36c  beq 0x3ef058
+3ef370  ldr r3, [r5, #0x44]        ; array
+3ef374  ldr r1, [r2, #0x44]        ; aguja = raceCar->carIdx
+3ef378  ldr r2, [r3]
+3ef37c  cmp r2, r1
+3ef380  beq 0x3ef390
+3ef384  ldr r2, [r3, #4]!          ; <-- BUCLE
+3ef388  cmp r2, r1
+3ef38c  bne 0x3ef384               ; <-- SIN COTA
+3ef390  mov r3, #0
+3ef394  str r3, [r5, #0x48]
+3ef398  b 0x3ef058
+```
+
+**La firma calza byte por byte con lo observado:** el bucle son puros `ldr` + `cmp`, sin
+malloc, sin `strcmp`/`strstr`, sin mutex, sin syscalls y sin ninguna de las 15 funciones
+hookeadas — que es exactamente lo que el testigo reporta latido tras latido
+(`+0 reservas +0 strstr +0 strcmp`, principal `CORRIENDO` al 100 %, `cpu=+38,6 s` en 40 s de
+pared). Por eso ningún hook lo vio nunca. El `+~9k gettod` es ruido del `cond_timedwait` de un
+worker de vox, ya atribuido en el 022 (`sitio de reloj: tid=0x4001021F`, que no es el principal).
+
+**Por qué el array no contiene la aguja.** `SortCars()` (`0x3EFDD8`) llena `array[0..n-1]` con
+`EventManager::GetUnlockList()` — la lista de autos **desbloqueados**. Con perfil nuevo esa
+lista viene vacía, el `operator new[]` no inicializa nada, y la búsqueda recorre el heap para
+siempre. Peor: `SortCars` ya había hecho `profile->carId = GetCarInfo(array[0], 0)` sobre esa
+misma basura, y si eso devuelve -1 el perfil sigue en -1 — que es justo la condición
+(`0x3ef054`) para entrar al bloque del bucle.
+
+**El bucle es código muerto del build original de Gameloft:** el puntero que calcula (`r3`) se
+**descarta** en `0x3EF390` (`mov r3,#0`), y `r1`/`r2` están muertos después (`0x3EF058` los
+reasigna). El único efecto de todo el bloque es `this->0x48 = 0`. Escribieron la búsqueda del
+índice y después hardcodearon 0.
+
+**Fix aplicado** (`source/patch.c`, filosofía del Bug #012: guarda en runtime, sin tocar el
+`.so`). Dos guardas independientes, ambas demostrablemente equivalentes al original:
+
+1. **`CarSeed`** (`0x3EF014`, emula `str r0,[r5,#0x44]` + `mov r0,r5`): siembra
+   `array[0] = raceCar->carIdx` **antes** de `SortCars`. Efecto doble: (a) `SortCars` calcula
+   `profile->carId = GetCarInfo(<auto por defecto>)` — un id válido en lugar de basura, que es
+   exactamente lo que corresponde a un perfil nuevo; (b) con `profile->carId != -1`, el
+   `beq 0x3ef364` **no se toma** y el bloque del bucle ni se ejecuta. Solo escribe si hay
+   RaceCar (`this->0x3c != 0`), y eso **garantiza** que el array mide ≥ 4 bytes: el RaceCar
+   solo se construye si `GetCarIdxFromId()` dio un índice válido (`0x3EEEB4`: `cmn r8,#1` /
+   `beq`), o sea `GetCarCount() >= 1`. Si la lista de desbloqueos no estaba vacía, `SortCars`
+   pisa `array[0]` igual y la siembra es inocua.
+2. **`CarFind`** (`0x3EF378`, no reanuda: salta a `0x3EF390`): red de seguridad por si (1) no
+   alcanza. Es equivalencia exacta, no heurística — ver arriba por qué el resultado del bucle
+   se descarta.
+
+Ambas con verificación de las dos palabras en `hook_trace` (`W_STR_R0_44`/`W2_MOV_R0R5` y
+`W_LDR_R2R3`/`W2_CMP_R2R1`, leídas del `.so` desplegado) y aviso en vivo al log. Build Debug
+verificado limpio; los stubs generados se auditaron con capstone sobre `build/asphalt6.elf`
+(`r12` scratch confirmado: llega de tres `bl` seguidos; flags muertos hasta el `bl SortCars`).
+
+**Nota sobre el paralelo con Asphalt-5-Vita:** el muro de A5 en este punto era otro
+(`GS_TrailerMovie` esperando un flag que en Android limpia una `Activity` — Bug #4 de A5 — y
+después `CMatrix::Mult` con el "short vector" de VFPv2 que el Cortex-A9 no implementa — Bug #6
+de A5). Ninguno de los dos aplica acá: A6 ya renderiza 13 frames y su carga de assets no pasa
+por el `GLResLoader` de JNI que A5 reimplementó, sino por `CFileSystem` + el mapa de
+ofuscación. Lo que sí se trajo de A5 es el método: acotar con el log real y poner la guarda en
+runtime en vez de tocar el `.so`.
+
+**Cómo leer el 025:**
+- `[patch] CarSeed: array[0]=…` ⇒ la siembra corrió. Si además **no** aparece `CarFind`, el
+  bloque del bucle se saltó solo (camino previsto) y el juego debería pasar al menú.
+- `[patch] CarFind: …` ⇒ la siembra no alcanzó (`GetCarInfo` devolvió -1 igual): el bucle se
+  omitió por la red de seguridad y hay que revisar por qué el perfil sigue en -1.
+- Ninguna de las dos + mismo cuelgue ⇒ el giro no es este bucle; siguiente sospechoso es el
+  epílogo del ctor (`DoStateChange` → `Loading::Stop` → `ResumeAllSounds`).
+- Crash nuevo aguas abajo ⇒ probablemente el efecto de tener `BaseCarManager::GetPackFile`
+  parcheado a "no encontrado" para TODOS los autos (Bug #005) ahora que sí se pide un auto.
+  Ese parche binario es el siguiente candidato a revertir: el Bug #012 demostró que los assets
+  **no** faltaban (`Audi_RS3_2010.car` es uno de los `fileNNNNNN.dat` con la firma alterada).
+
+**Pendiente:** desplegar `eboot.bin`, correr, bajar `asphalt6_025.log`.
+
+### Bug #020 — RESULTADO del log 025: el bucle no era el culpable, pero las guardas acotaron el giro
+
+**Log:** `logs/asphalt6_025.log` (1535 líneas, Debug). Los 17 hooks se instalan (`+0x3EF014` y
+`+0x3EF378` incluidos). Mismo muro: 13 frames, `swap #12`, 87 s sin avanzar.
+
+**Lo que aportó:** el anillo del principal ahora termina en
+`DisplayFrame → AfterDF → StrDrop → pthread_mutex_lock → **ENTRA CarSeed**` y nada más durante
+44 s. O sea `OnLoad3DScene` **sí** se entra, la asignación del array pasa, y el giro está entre
+`0x3EF014` y el siguiente deref. `CarFind` no disparó (coherente: sin RaceCar, el `cmp r2,#0`
+de `0x3EF368` ya salteaba el bloque). El `while` sin cota era real pero **no** era este cuelgue.
+
+**Corrección sobre el Bug #020:** la hipótesis era correcta en la mecánica (búsqueda lineal sin
+cota sobre datos de auto vacíos) pero apuntaba al bucle equivocado. El bucle real está una
+llamada más adentro. Las dos guardas se dejan puestas: son equivalencias exactas, sin costo, y
+`CarSeed` es ahora la miga que acotó el giro.
+
+### Bug #021 — CAUSA RAÍZ del cuelgue del menú: `std::sort` con un comparador que no es strict weak ordering — 2026-09-10
+
+**Cadena completa, cerrada con disasm (sin adivinar).**
+
+`SortCars` → `EventManager::GetUnlockList` (`0x498110`) ordena la lista de desbloqueos con
+`std::sort` (`0x49AD44` = `__introsort_loop`, `0x49AEDC` = `__final_insertion_sort`). El
+comparador es `SceneHelper::CompareStars(int,int)` (`0x462A84`):
+
+```
+00462a90..00462ad0  a -> GetCarIdxFromId -> GetCarInfo(idx, 0x39)   ; estrellas
+00462ad4  cmp   r4, r0
+00462ad8  movgt r0, #0      ; a >  b -> false
+00462adc  movle r0, #1      ; a <= b -> TRUE     <-- devuelve true en IGUALES
+```
+
+`comp(x,x) == true` **no es un strict weak ordering**. El `__unguarded_linear_insert` de
+libstdc++ no lleva chequeo de límite — confía en que algún elemento corte
+`while (comp(val, *(i-1))) --i;`. Con `comp` dando true en iguales y **todos** los elementos
+iguales, se sale del array por delante y recorre el heap para siempre: puros loads más una
+llamada hoja por vuelta. **Sin malloc, sin strcmp, sin strstr, sin syscalls, principal al
+100 % de CPU** — la firma exacta que el testigo venía reportando desde el log 015.
+
+**Por qué todos iguales — y acá se cierra el círculo con el Bug #005.**
+`BaseCarManager::InitCarMng` (`0x48D3DC`) fija el conteo de autos hardcodeado (`0x48D41C`:
+43 o 9, nunca 0) y después, por cada auto, llama **dos veces** a `GetPackFile`
+(`0x48D658` y `0x48D6F8`) para leer sus datos. Con el parche binario del Bug #005
+(`GetPackFile` → `mov r0,#0; bx lr`) las dos devolvían NULL, el `subs r4,r0,#0 / beq` salteaba
+la lectura, y **los 43 autos quedaban con todos los campos en cero** — incluido el `0x39`
+(estrellas) que lee el comparador. El bug de Gameloft es **latente** en Android (datos reales,
+estrellas distintas, siempre hay un elemento que corta); nuestro parche lo convirtió en cuelgue
+garantizado. También explica `raceCar == NULL`: con todos los ids en 0,
+`GetCarIdxFromId(m_defaultCarID)` devuelve -1 y el RaceCar del menú nunca se construye.
+
+**Fix aplicado — tres piezas, en orden causal:**
+
+1. **`Stars`** (`0x462AD4`, hook que no reanuda: salta al epílogo `0x462AE0`): `cmp` +
+   `movlt r0,#1` / `movge r0,#0`. Convierte `<=` en `<`: mismo orden para elementos distintos,
+   y ahora sí es un strict weak ordering, así que el sort termina con **cualquier** dato. Sin
+   `bc_enter` a propósito (el sort lo llama O(n log n) veces e inundaría el anillo de 32).
+2. **`PackFile`** (`0x48DA84`) + **reversión del parche binario del Bug #005**. Se restauraron
+   los 8 bytes originales de `GetPackFile` en `libasphalt6.so` (`0x48D9D8`,
+   `f0412de9007052e2`) en las dos copias, y se sacó la entrada del
+   `libasphalt6.so.binary_patches.json`. El deref sin chequeo que crasheaba en el #005
+   (`0x48DA90: ldr r3,[r4]` con `r4 = createAndOpenFile() = NULL`) queda cubierto por una
+   guarda en runtime que salta al camino de "no encontrado" que la propia función ya tiene
+   (`0x48DB84`: `mov r4,#0` + epílogo propio). **Estrictamente mejor que el parche binario:**
+   los autos cuyo pack sí resuelve ahora cargan de verdad, en vez de deshabilitarlos todos.
+   El parche de `autoStartGame` (`0x3E4600`, Bug #006) se dejó intacto.
+3. **`MenuCar`** (`0x3EF020`): red de seguridad aguas abajo. Si aun así no hay auto por
+   defecto, `this->raceCar` queda NULL y `0x3EF028: ldr r3,[r3,#0x28]` aborta. El bloque solo
+   hace `raceCar->node->setName("SelectableMenuCar")`, así que con NULL se saltea entero a
+   `0x3EF040`. Emula un `ldr` PC-relativo con doble indirección (Bug #017).
+
+`CarSeed` ahora loguea **siempre** (`raceCar=` y `array=`), que es lo que al 025 le faltó para
+distinguir "array NULL" de "sin RaceCar". Build Debug limpio; los 4 stubs auditados con
+capstone sobre `build/asphalt6.elf`; las 6 palabras de los sitios nuevos verificadas contra el
+`.so` ya revertido en las dos copias.
+
+**IMPORTANTE para desplegar:** esta vez hay que subir **dos** archivos, porque el `.so` cambió:
+- `build/eboot.bin` → `ux0:/app/ASPHALT06/eboot.bin`
+- `ux0_data/asphalt6/lib/armeabi-v7a/libasphalt6.so` → `ux0:/data/asphalt6/lib/armeabi-v7a/`
+
+El `deploy --eboot` del toolkit **no** sube datos de juego (mismo tropiezo que el Bug #005).
+
+**Cómo leer el 026:**
+- `[patch] PackFileNull: …` ⇒ ese pack no resolvió; si aparecen ~86 líneas, ningún auto carga y
+  el problema de datos sigue (candidato: los 92 `fileNNNNNN.dat` faltantes, 865–956).
+- **Sin** `PackFileNull` ⇒ los autos cargan de verdad por primera vez.
+- `[patch] CarSeed: raceCar=0x0…` ⇒ sigue sin auto por defecto; `MenuCarNull` debería aparecer
+  justo después y el juego seguir igual (sin el auto 3D del menú, pero sin colgarse ni abortar).
+- `[patch] CarSeed: raceCar=0x8…` ⇒ hay auto: el camino completo del menú está vivo.
+- Si el giro persiste con la misma firma pese al fix de `Stars`, el siguiente sospechoso es el
+  otro `std::sort` del mismo archivo (`GS_MenuMain` ~`0x3FFEB4`) o `TrackScene::SortCarsByCollectedItems`
+  (`0x47268C`), que puede tener el mismo idioma de comparador.
+
+**Pendiente:** subir los dos archivos, correr, bajar `asphalt6_026.log`.
+
+### Bug #022 — `abort()` por excepción C++ sin capturar tras "First time launch" — 2026-09-10
+
+**Log:** `logs/asphalt6_026.log` — confirma que el fix del Bug #021 funcionó de punta a
+punta: **cero** `PackFileNull`, `CarSeed`/`MenuCarNull` no aparecen (hay auto por defecto real),
+y el testigo reporta **frames presentándose** (`[wd] 23 frames (+2 en 5s) | ... | último hito:
+swap #22`) — el giro del menú (Bugs #015-#021) está resuelto. El juego sigue de largo,
+carga ~200 `.wav`/`.vxn` de audio (todos `fopen(...): 0x0` porque `vox::DriverAndroid` los pide
+por nombre relativo sin `ux0:data/asphalt6/data/`, sin implementación de audio — no fatal,
+el motor tolera la ausencia), llega a:
+```
+[INFO] [ALOG][XXX] First time launch the app
+[DEBUG] [ALOG][HDVD] EventTracking: Adding Event with ID 14475
+[DEBUG] fopen(ux0:data/asphalt6/data/timespent.dat, w): 0x817707f0
+...
+[ERROR] [ALOG][XXX] Launch game by PN: 0
+[DEBUG] [ALOG][HDVD] EventTracking: Adding Event with ID 14489
+[DEBUG] stat(pn.dat): -1
+[DEBUG] fopen(ux0:data/asphalt6/data/pn.dat, w): 0x817707f0
+...
+[DEBUG] fopen(ux0:data/asphalt6/data/pn.dat, wb): 0x817707f0
+...
+[ERROR] [FalsoJNI] [WARN]...[methodVoidCall] method ID 0 not found!
+[FATAL] Abort called from address 0x98a71e70
+```
+
+**Dump:** `logs/asphalt6-psp2core-1789020077-0x0000962489-eboot.bin.psp2dmp` — analizado con
+`psvita-toolkit analyze --so-base 0x98000000`. El hilo en crash es el **principal**
+(`ASPHALT06`), razón de parada "Undefined instruction" con `PC` dentro de `_kill_r` del propio
+loader — **no es el bug real**: es el mecanismo con el que `so_util`/vitasdk generan el
+`.psp2dmp` al recibir el `SIGABRT` de un `abort()` real (`raise` → `kill` → trampa
+intencional), confirmado porque la pila, justo antes, tiene (en orden):
+
+```
+abort (asphalt6+0x9be41)
+exit_soloader (source/reimpl/sys.c:161)          <- nuestro hook de abort()
+__gnu_cxx::__verbose_terminate_handler()+0x48    <- libasphalt6.so+0xa71e70
+__cxxabiv1::__terminate(void(*)())+0xc
+std::terminate()+0x18
+__cxa_rethrow+0x50
+__gnu_cxx::__verbose_terminate_handler()+0xf8
+__cxxabiv1::__terminate(void(*)())+0x28
+__cxxabiv1::__pbase_type_info::~__pbase_type_info()+0x34
+```
+
+O sea: **una excepción C++ real quedó sin capturar** en algún punto del código nativo del
+motor (hay un `throw;` explícito que la propaga, ve `__cxa_rethrow`), lo que dispara
+`std::terminate()` → el terminate handler por defecto → `abort()`. **No es un NULL deref**:
+ninguno de los parches de "saltar al camino feliz" de los Bugs #005-#021 aplica acá — hace
+falta saber CUÁL excepción y desde dónde, no adivinar otro salto binario.
+
+**Por qué no se puede leer el tipo/mensaje de la excepción todavía:** el mensaje que
+`__gnu_cxx::__verbose_terminate_handler()` imprime normalmente (`terminate called after
+throwing an instance of '%s'` / `  what():  %s`) sale por `fprintf(stderr, ...)` /
+`write(2, ...)` — un camino que este loader **no** redirige a `[ALOG]` (a diferencia de
+`__android_log_print`, que sí pasa por nuestro logger). Se perdió sin dejar rastro en el log.
+
+**`__cxa_rethrow`/`__cxa_throw`/`__cxa_begin_catch`/`__cxa_end_catch` están definidos DENTRO
+de `libasphalt6.so`** (confirmado con `objdump -T`: `DF .text`, no `UND`) — o sea, el motor
+trae su propio libstdc++/libsupc++ estático, no los importa de nuestro `dynlib.c`. Se buscaron
+los call-sites de `bl __cxa_rethrow` con `arm-vita-eabi-objdump -d` (sin `-M force-thumb`: esta
+zona es ARM real, igual que el área de `basename@plt` ya documentada) — aparecen **100+**
+sitios (patrón `catch(...) { ...; throw; }`, común en código C++ genérico/RAII), demasiados
+para triangular a mano cuál corresponde a esta corrida sin más información.
+
+**Fix aplicado — diagnóstico, NO el fix final** (`source/patch.c`, Bug #022): en vez de
+adivinar con otro parche binario, se hookeó la entrada de `__cxa_throw` (offset `0xA6FEBC`,
+`ldr ip,[pc,#144]` + `push {r4,r5,r6,r7,fp,lr}`) con el mismo mecanismo ENTER-only de
+`hook_trace()`/`hook_addr()` que los Bugs #015-#021 — **una sola función real** por la que
+pasa TODO `throw` del binario (confirmado: no importada, así que cualquier excepción, sea
+cual sea el catch/rethrow en el que termine, se origina ahí). El hook llama a
+`cxa_throw_log()`, que loguea `tinfo->name()` (offset `+4` del `std::type_info`, layout real
+de Itanium C++ ABI — vtable en `+0`, `const char* __name` en `+4`) mangled, y reanuda la
+función sin tocarle ningún comportamiento (doble indirección para el `ldr ip,[pc,#144]`
+inicial, igual que `createAnimator`/`DisplayFrame`/`CLightSceneNode`; `r3` confirmado como
+scratch libre por disasm — nada antes de su primera reasignación en la función real lee el
+`r3` previo al hook). Build verificado con `psvita-toolkit build` (compila y linkea limpio,
+`asphalt6.vpk` regenerado) — el deploy no se pudo completar esta sesión porque la consola no
+tenía el FTP de VitaShell activo (`Connection refused` en `192.168.3.15:1337`).
+
+**Pendiente:** abrir VitaShell en la consola (SELECT para activar FTP), correr
+`psvita-toolkit deploy --eboot`, jugar hasta el mismo punto ("First time launch the app") y
+bajar el log nuevo. La línea `[patch] __cxa_throw: tinfo=... type='...'` que aparezca justo
+antes del `[FATAL] Abort` va a decir la clase C++ real lanzada (mangled) — con eso, buscar el
+`throw` correspondiente en el pseudo-C de Ghidra (grep por el nombre demangleado o por
+`__cxa_throw` cerca de la lógica de "first time launch"/`pn.dat`/tracking) para el fix real
+en la próxima sesión.
+
+**Actualización — log 027, el diagnóstico funcionó:** mismo punto exacto (justo después de
+guardar `pn.dat`), mismo `abort()`. La línea nueva confirma:
+```
+[ERROR] [FalsoJNI] [WARN]...[methodVoidCall] method ID 0 not found!
+[ERROR] [patch] __cxa_throw: tinfo=0x98bdd380 type='St11logic_error' (Bug #022, diagnostico)
+[FATAL] Abort called from address 0x98a71e70
+```
+`tinfo=0x98bdd380` resuelve exacto contra `_ZTISt11logic_error` (`nm`) — es un
+**`std::logic_error` plano**, no una subclase (`out_of_range`/`length_error`/
+`invalid_argument` tienen su propio `type_info`, en otra dirección). Se buscaron los
+call-sites de `bl __cxa_throw` (`arm-vita-eabi-objdump -d`, sin `-M force-thumb`: zona ARM
+real) → **49** en total, todos dentro del rango `0xa4xxxx`-`0xa70xxx` (la porción estática de
+libstdc++/libsupc++, no código de juego disperso). El que corresponde a `logic_error` es
+`0xa44eac`, dentro de `_ZSt19__throw_logic_errorPKc` (`0xa44e4c`-`0xa44f18`, confirmado por
+rango entre símbolos consecutivos en `nm`). Pero **ese helper lo llaman 57 sitios distintos**
+en TODO el binario (buscado con `grep bl.*__throw_logic_error` sobre el disasm completo) —
+patrón consistente con el chequeo de NULL que `basic_string(const char*)` hace inline en cada
+sitio donde se construye un `std::string` desde un `char*` (mensaje típico de libstdc++:
+`"basic_string::_M_construct null not valid"`) — demasiados sitios para auditar a mano sin
+más información.
+
+**Extensión aplicada al mismo hook** (`source/patch.c`, todavía Bug #022, sigue siendo
+diagnóstico): además del `type_info`, ahora también lee el **mensaje** de la excepción ya
+construida. Cuando `__cxa_throw` es llamado, el objeto ya está construido (el compilador hace
+`__cxa_allocate_exception` + placement-new + `__cxa_throw`), así que `r0` (primer arg de
+`__cxa_throw`) apunta a un `std::logic_error` real: `{ vtable_ptr; __cow_string _M_msg; }`
+(`__cow_string` es el string COW liviano que libstdc++ usa SIEMPRE para el mensaje de las
+excepciones estándar, sin importar `_GLIBCXX_USE_CXX11_ABI`) — mismo truco de offset `+4` que
+ya usábamos para `type_info->__name`, ahora sobre `exc_obj` en vez de `tinfo`. `r0`/`r1` ya
+llegan en el orden correcto para pasarlos directo a `cxa_throw_log(exc_obj, tinfo)` por AAPCS,
+sin mover nada. Build verificado (`psvita-toolkit build`, compila y linkea limpio) y
+**desplegado** (`psvita-toolkit deploy --eboot`, FTP ya activo esta vez).
+
+**Pendiente:** correr de nuevo hasta el mismo punto y bajar el log. La línea
+`[patch] __cxa_throw: type='St11logic_error' msg='...'` va a decir el mensaje literal — si es
+`"basic_string::_M_construct null not valid"` (lo más probable dado el patrón de 57 sitios),
+el siguiente paso es cazar CUÁL de los 57 sitios corre en este flujo exacto (breadcrumb/hook
+adicional sobre el caller inmediato, `LR` en el momento del throw) para poder arreglar el NULL
+en el origen real (probablemente un `jstring`/`char*` que nuestro `java.c` devuelve `NULL` y
+que el motor envuelve en un `std::string` sin chequear, en algún callback de "first time
+launch"/tracking/PN que todavía no está registrado).
+
+**Actualización — log 028, mensaje real distinto al adivinado:** mismo punto exacto
+(`ux0:data/asphalt6/data/pn.dat` recién escrito). El mensaje real es
+`msg='basic_string::_S_construct NULL not valid'` (no `_M_construct` — el hook del mensaje
+funcionó igual, el nombre exacto del assert cambia el símbolo a buscar):
+```
+[ERROR] [FalsoJNI] [WARN]...[methodVoidCall] method ID 0 not found!
+[ERROR] [patch] __cxa_throw: type='St11logic_error' msg='basic_string::_S_construct NULL not valid' (Bug #022, diagnostico)
+[FATAL] Abort called from address 0x98a71e70
+```
+Con el mensaje exacto se ubicó `std::string::_S_construct<char const*>` (`0xA6A660`, símbolo real
+vía `nm -CD`) — el choke point compartido que tira ese assert (confirmado por disasm:
+`cmp r0,#0` (beg) `; beq ...; cmp r5,#0` (end) `; bl __throw_logic_error` en
+`0xa6a680`-`0xa6a6fc`). Pero por sí solo sigue siendo un choke point de decenas de sitios (4
+wrappers de `std::string` puro le llaman: el ctor `(const char*, allocator)` en `0xA6A7E8`/
+`0xA6A828`, `append(const char*)` en `0xA6AE20`, `assign(const char*)` en `0xA6BAEC`,
+`operator=(const char*)` en `0xA6BB54` — **ojo**, no confundir con
+`glitch::core::SAllocator`, que tiene su propio `_S_construct` en `0x475F08` y no aplica acá).
+
+Descartadas 3 de las 4 por firma de crash incompatible: `append`/`assign`/`operator=` hacen
+`bl strlen@plt` con el `char*` de entrada **sin chequeo de NULL antes** — si el motor les
+pasara NULL, el crash sería un data abort dentro de `strlen` (SIGSEGV), no un
+`std::logic_error` vía `__cxa_throw`. Solo el ctor `(const char*, allocator)` tiene el camino
+especial: `subs r5,r1,#0; ...; mvneq r1,#0` — cuando el `char*` de entrada es NULL, fuerza
+`end=-1` (centinela) ANTES de llamar a `_S_construct`, produciendo EXACTAMENTE la combinación
+`beg=NULL/end!=0` que dispara el throw observado. De los dos símbolos del ctor (`C1`/`C2`,
+idénticos), solo `C1` (`0xA6A7E8`) tiene llamadores reales en el `.so` (`C2` en `0xA6A828`: 0
+sitios) — confirmado con `grep 'bl.*a6a828'`/`'bl.*a6a7e8'` sobre el disasm ARM completo
+(291 llamadores de `C1`, ninguno de `C2`).
+
+**Fix aplicado — todavía diagnóstico, no el fix final** (`source/patch.c`, Bug #022, hook
+`hook_sconstruct` sobre `OFF_SCONSTRUCT = 0xA6A7E8`): hookea la ENTRADA del ctor (antes de que
+su propio `push {r4,r5,r6,lr}` pise nada), chequea `r1` (el `const char*` de entrada) y, si es
+NULL, loguea `LR` — que en ESE punto exacto todavía es la dirección de retorno real en código
+del JUEGO (el llamador que armó el `std::string` con un `char*` NULL), no un frame intermedio
+de libstdc++. Con `r1 != 0` (los otros ~290 llamadores legítimos) el costo es un `cmp`+`bne`
+y nada más — no hay `bc_enter` ni llamada a ninguna función C en el camino caliente. Ninguna
+de las dos palabras pisadas (`push {r4,r5,r6,lr}` + `subs r5,r1,#0`) es PC-relativa, así que
+se emulan verbatim, sin doble indirección. Build verificado (`psvita-toolkit build`, compila y
+linkea limpio, Debug).
+
+**Actualización — log 030, llamador y causa raíz confirmados al 100%:**
+El log `logs/asphalt6_030.log` reportó la dirección exacta del llamador gracias al hook diagnóstico:
+```
+[ERROR] [patch] std::string(NULL): llamador=libasphalt6.so+0x5A6E94 (Bug #022, diagnostico)
+[ERROR] [patch] __cxa_throw: type='St11logic_error' msg='basic_string::_S_construct NULL not valid' (Bug #022, diagnostico)
+[FATAL] Abort called from address 0x98a71e70
+```
+
+1. **Desensamblado de `0x5A6E94`:**
+   Pertenece a `_ZN13StringManager11SetLanguageEPKc` (`StringManager::SetLanguage(const char* lang)` en `0x5A6E78`).
+   En `0x5A6E90`:
+   ```arm
+   5a6e90: bl a6a7e8 <_ZNSsC1EPKcRKSaIcE> ; std::string(fp, r1, &allocator)
+   5a6e94: ldr r3, [pc, #308]
+   ```
+   Recibe `r1` (`lang`) y construye un `std::string` sin verificar `NULL`. Al ser `r1 == 0`, libstdc++ tira `std::logic_error`.
+
+2. **¿Quién llamó a `StringManager::SetLanguage` con `NULL`?**
+   Rastreando `StringManager::SetLanguage` y los métodos de `FlashFXHandler`:
+   En `GS_MenuMain::StateUpdate` (`0x3F43EC` - `0x3F43FC`):
+   ```arm
+   3f43ec: ldr r7, [r3, #36] ; vtable slot 0x24: FlashFXHandler::SetLanguage
+   3f43f0: bl  4e94f0 <_ZN13StringManager17GetLanguageStringEv>
+   3f43f4: mov r1, r0
+   3f43f8: mov r0, r5
+   3f43fc: blx r7
+   ```
+   `GS_MenuMain::StateUpdate` llama a `StringManager::GetLanguageString()` (`0x4E94F0`) y pasa el resultado directamente como segundo argumento a `FlashFXHandler::SetLanguage`.
+
+3. **¿Por qué `GetLanguageString()` devuelve `NULL`?**
+   `StringManager::GetLanguageString()` busca el idioma actual `m_languageId` en su mapa de idiomas soportados (1="english", 2="french", 3="italian", 4="german", 5="spanish", 6="japanese", 7="korean", 8="russian", 9="brazilian").
+   En el primer arranque ("First time launch the app"), el perfil del jugador no existe y `m_languageId == 0`.
+   Como el ID 0 no está en la tabla, `GetLanguageString()` retorna `0` (`NULL`).
+   `GS_MenuMain::StateUpdate` pasa este `NULL` a `FlashFXHandler::SetLanguage`, que invoca `StringManager::SetLanguage(NULL)` -> `std::string(NULL)` -> `abort()`.
+
+**Fix aplicado (`source/patch.c`):**
+1. Hook en `StringManager::GetLanguageString` (`0x4E94F0`): Si el motor retorna `NULL` (idioma 0 no inicializado), se loguea y se retorna `"english"` como fallback por defecto.
+2. Hook de defensa en profundidad en `StringManager::SetLanguage` (`0x5A6E78`): Si `lang == NULL`, se reemplaza `r1` por `"english"`.
+3. Sanitizador global en `std::string::string(const char*, const allocator&)` (`0xA6A7E8`): Si algún otro componente del motor intenta construir un `std::string` desde `NULL`, se sustituye por `""` (`s_empty_str`) en vez de dejar que `_S_construct` arroje `std::logic_error` y cause un `abort()`.
+
+Build verificado (`psvita-toolkit build`, compila y linkea limpio).
+
+
+### Sesión 2026-09-11: quick wins de FPS por paridad con Asphalt-5-Vita (sin probar en hardware todavía)
+
+**Contexto:** el juego llega al menú/title casi perfecto pero con FPS bajos (log 031: 3-8
+frames por latido de 5 s en menú, ~5 fps durante carga de pista). Diff completo contra el
+port hermano `Asphalt-5-Vita` (mismo motor/familia Gameloft, fluido): A5 renderiza a un FBO
+offscreen de 720x432 y hace upscale-blit (40% menos píxeles que 960x544), y además elimina
+todos los stalls/readbacks que A6 todavía pagaba. El downsample NO se porta tal cual: A5 es
+GLES1.1 sin FBOs propios del motor, A6 es GLES2 con RTT de menú (`MenuRenderTarget`) y
+post-procesado -- un FBO-ciego rompería el menú. Queda como fase 2 (variante FBO-aware).
+
+**Cambios aplicados (build Debug OK con `psvita-toolkit build`; Release falla en link por
+causa pre-existente en `source/patch.c` no tocada por esta sesión:
+`undefined reference to s_tr_menucar/g_skip_menucar/s_empty_str` -- símbolos `static`
+referenciados solo desde asm inline que el link de Release descarta):**
+1. `dynlib.c`: `glFinish` -> `ret0` (bloquea hasta GPU idle, el stall más caro), `glReadPixels`
+   -> `ret0` (readback CPU), `glCopyTexImage2D/SubImage2D` -> stubs rápidos nuevos (dummy
+   1x1 / no-op, igual que A5). `glFlush` (no bloqueante) se deja real.
+2. `glutil.c/.h`: `glTexImage2D_soloader` remapea internalformats S3TC/DXT a `GL_RGBA`
+   (evita el encoder DXT por software de vitaGL, igual que A5); `glBindFramebuffer`,
+   `glFramebufferTexture2D`, `glCheckFramebufferStatus` pasan de `gl_info` (sceIoWrite a la
+   SD por llamada, también en Release -- el menú hace RTT cada frame) a `gl_trace`
+   (solo con `-DTRACE_GL_CALLS`).
+3. `main.c`: `sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT)` por frame (paridad con
+   Bug #26 de A5: evita dim/suspend por idle en menús).
+
+**Pendiente:** medir en consola real (log + FPS). Siguiente candidato si sigue bajo:
+variante FBO-aware del downsample (solo fb 0 al offscreen, blit con shader GLES2).
+Dato aparte del dump `1789103434` (casi-carrera): data abort en
+`TrackScene::LoadLevelGeometry()+0x284` (`ldr r3,[r4]`, r4=NULL) tras
+`fopen(IPAD2a_Bahamas.bdae): 0x0` x2 -- asset de pista faltante, misma familia que
+Bugs #005/#021 (probablemente uno de los `file000865-956.dat` ausentes). No se toca en
+esta sesión (un bug a la vez); registrar como próximo bug cuando se confirme el flujo.

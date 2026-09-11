@@ -81,6 +81,12 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
 void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                               GLsizei width, GLsizei height, GLenum format, GLenum type,
                               const void *pixels);
+// Paridad con Asphalt-5-Vita: stubs rápidos que evitan readbacks CPU del framebuffer.
+void glCopyTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
+                               GLint x, GLint y, GLsizei width, GLsizei height,
+                               GLint border);
+void glCopyTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                  GLint x, GLint y, GLsizei width, GLsizei height);
 void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
                                      GLsizei width, GLsizei height, GLint border,
                                      GLsizei imageSize, const void *data);

@@ -311,17 +311,22 @@ GLint glGetAttribLocation_soloader(GLuint program, const GLchar *name) {
  * render-to-texture (`T_SWFManager::SWFRelease3DRenderTargets`/`On3DLoad`), y en vitaGL cada
  * FBO crea su propio render target de sceGxm -- un recurso escaso y un candidato clásico a
  * cuelgue de GPU. Son llamadas raras, así que se registran siempre.
+ *
+ * NOTA FPS (paridad con Asphalt-5-Vita, que va fluido): estos tres wrappers usaban
+ * gl_info() (l_error, un sceIoWrite a la SD por llamada, también en Release). El menú
+ * hace RTT cada frame (MenuRenderTarget), así que eran 2-3 escrituras a archivo POR FRAME.
+ * Pasan a gl_trace() (solo con -DTRACE_GL_CALLS, compilado fuera por default).
  */
 void glBindFramebuffer_soloader(GLenum target, GLuint framebuffer) {
     BC_SCOPE("glBindFramebuffer");
-    gl_info("[gl] glBindFramebuffer fb=%u", (unsigned)framebuffer);
+    gl_trace("[gl] glBindFramebuffer fb=%u", (unsigned)framebuffer);
     glBindFramebuffer(target, framebuffer);
 }
 
 void glFramebufferTexture2D_soloader(GLenum target, GLenum attachment,
                                      GLenum textarget, GLuint texture, GLint level) {
     BC_SCOPE("glFramebufferTexture2D");
-    gl_info("[gl] glFramebufferTexture2D attach=0x%x tex=%u level=%d",
+    gl_trace("[gl] glFramebufferTexture2D attach=0x%x tex=%u level=%d",
             (unsigned)attachment, (unsigned)texture, (int)level);
     glFramebufferTexture2D(target, attachment, textarget, texture, level);
 }
@@ -329,7 +334,7 @@ void glFramebufferTexture2D_soloader(GLenum target, GLenum attachment,
 GLenum glCheckFramebufferStatus_soloader(GLenum target) {
     BC_SCOPE("glCheckFramebufferStatus");
     GLenum st = glCheckFramebufferStatus(target);
-    gl_info("[gl] glCheckFramebufferStatus -> 0x%x%s", (unsigned)st,
+    gl_trace("[gl] glCheckFramebufferStatus -> 0x%x%s", (unsigned)st,
             st == GL_FRAMEBUFFER_COMPLETE ? " (COMPLETE)" : " (INCOMPLETO!)");
     return st;
 }
@@ -386,7 +391,52 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
                            GLsizei width, GLsizei height, GLint border,
                            GLenum format, GLenum type, const void *pixels) {
     BC_SCOPE("glTexImage2D");
+    /*
+     * Paridad con Asphalt-5-Vita (probado en hardware): glTexImage2D() con un
+     * internalformat S3TC/DXT y datos de píxeles SIN comprimir deja el write_cb de
+     * vitaGL en NULL, lo que manda el upload por gpu_alloc_compressed_texture() ->
+     * dxt_compress() -- un encoder DXT por software, sincrónico, bloque por bloque
+     * 4x4, en el hilo que llama. No hay encoder DXT por hardware en el SGX543; el
+     * costo es inherente a ese camino. Remapear a GL_RGBA mantiene válidos los datos
+     * fuente (el caller ya entrega raw según `format`/`type`) a cambio de unos KB
+     * extra de VRAM en esa textura. Los assets PVRTC del juego (vía
+     * glCompressedTexImage2D) no pasan por aquí y no se tocan.
+     */
+    switch (internalformat) {
+        case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:
+        case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
+        case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:
+        case GL_COMPRESSED_SRGB_S3TC_DXT1:
+        case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1:
+        case GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5:
+        case GL_COMPRESSED_SRGB:
+        case GL_COMPRESSED_SRGB_ALPHA:
+            internalformat = GL_RGBA;
+            break;
+        default:
+            break;
+    }
     glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+}
+
+/*
+ * Paridad con Asphalt-5-Vita: glCopyTexImage2D/glCopyTexSubImage2D implican un
+ * readback CPU del framebuffer (lento en vitaGL/GXM). El motor los usa para efectos
+ * (el menú tiene cadena de post-procesado con blur/threshold); degradan el efecto a
+ * una textura dummy / no-op en vez de frenar el frame. Mismo trade-off aceptado en A5.
+ */
+void glCopyTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
+                               GLint x, GLint y, GLsizei width, GLsizei height,
+                               GLint border) {
+    BC_SCOPE("glCopyTexImage2D");
+    // Textura dummy 1x1 para satisfacer a la GPU sin el costo del readback.
+    glTexImage2D(target, level, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+}
+
+void glCopyTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                  GLint x, GLint y, GLsizei width, GLsizei height) {
+    BC_SCOPE("glCopyTexSubImage2D");
+    // No-op a propósito: evita el readback lento.
 }
 
 void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,

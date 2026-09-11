@@ -93,6 +93,193 @@ void hooked_RenderFX_Find_pt() {
 #define OFF_RFX_RENDER     0x687CDCu // RenderFX::Render (push+mov)
 #define OFF_ENDSCENE_GL    0x913CA8u // CCommonGLDriver::endScene (push+ldr)
 #define OFF_ENDSCENE_IV    0x7ED3B0u // IVideoDriver::endScene (push+sub sp)
+// Tercer nivel (log 022): los 5 de segundo nivel estan vivos pero `run` nunca
+// se entra tras el DisplayFrame final, y el `ra0` del sitio de reloj apunta a
+// CCondition::wait (un worker), no al hilo principal. Estos tres distinguen:
+// getRealTime dice si el principal sondea el Timer; AfterDF (retorno del
+// DisplayFrame FINAL en los dos caminos del ctor, 0x4421C0/0x4429C8: `ldr
+// r3,[pc,#-0x1d0]` + `ldr r4,[sp,#0xb4]`, epilogo con `pop {...,pc}`) dice si
+// DisplayFrame RETORNO (giro aguas abajo: Stop/audio/estados) o no volvio.
+#define OFF_REALTIME       0x857DA0u // glitch::os::Timer::getRealTime (str+sub)
+#define OFF_AFTERDF1       0x4421C0u // tras DisplayFrame final, camino 1 (ldr+ldr)
+#define OFF_AFTERDF2       0x4429C8u // tras DisplayFrame final, camino 2 (ldr+ldr)
+// Bug #019 (log/dump 023): cleanup de std::string con data NULL en el epilogo
+// del ctor de MenuScene (los dos caminos): `sub r4,r4,#0xc` (Rep = data-12),
+// `bne` al drop, `add r0,r4,#8` (&refcount) + `mvn r1,#0` +
+// `bl __exchange_and_add` -> data abort con &refcount = -4 (data NULL).
+// La guarda salta al camino "nada que liberar" (0x4421D8/0x4429E0: `mov r0,r6`
+// + epilogo + `pop {...,pc}`) cuando data < 4 KB. Sin falsos positivos: el heap
+// real vive en 0x81xxxxxx/0x82xxxxxx.
+#define OFF_STRDROP1       0x44238Cu // drop camino 1 (add+mvn)
+#define OFF_STRDROP2       0x442B94u // drop camino 2 (add+mvn)
+
+/*
+ * Bug #020 (log 024): el giro del menu es un `while (*p != carIdx) p++;` SIN COTA
+ * en GS_MenuMain::OnLoad3DScene (0x3EED98), justo despues de SortCars():
+ *
+ *   3ef364  ldr r2,[r5,#0x3c]   ; this->raceCar
+ *   3ef368  cmp r2,#0
+ *   3ef36c  beq 0x3ef058        ; sin auto: el bloque entero se saltea
+ *   3ef370  ldr r3,[r5,#0x44]   ; array = new int[GetCarCount()]  (SIN inicializar)
+ *   3ef374  ldr r1,[r2,#0x44]   ; aguja = raceCar->carIdx
+ *   3ef378  ldr r2,[r3]
+ *   3ef37c  cmp r2,r1
+ *   3ef380  beq 0x3ef390
+ *   3ef384  ldr r2,[r3,#4]!     ; <-- bucle
+ *   3ef388  cmp r2,r1
+ *   3ef38c  bne 0x3ef384        ; <-- sin cota
+ *   3ef390  mov r3,#0
+ *   3ef394  str r3,[r5,#0x48]
+ *
+ * Firma exacta del cuelgue observado: puros `ldr`+`cmp`, sin malloc, sin
+ * strcmp/strstr, sin mutex, sin syscalls, principal CORRIENDO al 100% -- que es
+ * literalmente lo que el testigo reporta (`+0 reservas +0 strstr +0 strcmp`) y
+ * por eso ninguno de los 15 hooks anteriores lo vio.
+ *
+ * Por que el array no contiene la aguja: `SortCars()` (0x3EFDD8) solo llena
+ * array[0..n-1] con la lista de desbloqueos (`EventManager::GetUnlockList`). Con
+ * perfil nuevo esa lista viene vacia, el `operator new[]` no inicializa nada, y
+ * la busqueda recorre el heap para siempre. Ademas SortCars ya habia hecho
+ * `profile->carId = GetCarInfo(array[0], 0)` sobre esa misma basura: si eso
+ * devuelve -1, el perfil sigue en -1 y por eso se entra al bloque.
+ *
+ * DOS guardas independientes, ambas demostrablemente equivalentes al original:
+ *
+ * 1. CARSEED (0x3EF014, tras `str r0,[r5,#0x44]`): siembra `array[0] =
+ *    raceCar->carIdx` antes de SortCars. Efecto: (a) SortCars calcula
+ *    `profile->carId = GetCarInfo(<auto por defecto>)` -- un id valido en vez de
+ *    basura, que es justo lo que corresponde a un perfil nuevo; (b) con
+ *    profile->carId != -1 el `beq 0x3ef364` de 0x3ef054 NO se toma y el bloque
+ *    del bucle ni se ejecuta. Solo escribe si hay RaceCar (this->0x3c != 0), y
+ *    eso GARANTIZA que el array mide >= 4 bytes: el RaceCar solo se construye si
+ *    `GetCarIdxFromId()` dio un indice valido, o sea GetCarCount() >= 1. Si la
+ *    lista de desbloqueos NO estaba vacia, SortCars pisa array[0] igual y la
+ *    siembra es inocua.
+ *
+ * 2. CARFIND (0x3EF378): red de seguridad por si (1) no alcanza. Salta derecho a
+ *    0x3EF390. Es equivalencia exacta, no una heuristica: el puntero que el bucle
+ *    calcula (r3) se DESCARTA -- 0x3ef390 lo pisa con 0 -- y r1/r2 estan muertos
+ *    despues. El unico efecto del bloque es `this->0x48 = 0`, que es lo que
+ *    0x3EF390 hace. El bucle es codigo muerto del build original de Gameloft.
+ */
+#define OFF_CARSEED        0x3EF014u // OnLoad3DScene: str r0,[r5,#0x44] + mov r0,r5
+#define OFF_CARFIND        0x3EF378u // OnLoad3DScene: ldr r2,[r3] + cmp r2,r1
+
+/*
+ * Bug #021 (log 025) — CAUSA RAIZ REAL del giro. El 025 la acoto sola: la ultima
+ * miga del principal es `ENTRA CarSeed` (0x3EF014) y despues nada por 44 s, o sea
+ * el giro esta entre esa miga y el siguiente deref. Lo unico sustancial ahi es
+ * `bl SortCars` -> `EventManager::GetUnlockList` -> `std::sort`.
+ *
+ * `SceneHelper::CompareStars(int,int)` (0x462A84) es el comparador de ese sort:
+ *
+ *   00462ad4  cmp   r4, r0      ; r4 = estrellas(a), r0 = estrellas(b)
+ *   00462ad8  movgt r0, #0      ; a >  b -> false
+ *   00462adc  movle r0, #1      ; a <= b -> TRUE   <-- devuelve true en IGUALES
+ *
+ * Eso NO es un strict weak ordering (`comp(x,x)` da true). El
+ * `__unguarded_linear_insert` de libstdc++ no tiene chequeo de limite: confia en
+ * que algun elemento corte el `while (comp(val, *(i-1))) --i;`. Con `comp` dando
+ * true en iguales y TODOS los elementos iguales, se sale del array por delante y
+ * recorre el heap para siempre: puros loads + una llamada hoja por vuelta, sin
+ * malloc, sin strcmp, sin syscalls. Exactamente la firma observada.
+ *
+ * Por que son todos iguales: `CompareStars` lee `GetCarInfo(idx, 0x39)`
+ * (estrellas), y `BaseCarManager::InitCarMng` (0x48D3DC) llena esos datos leyendo
+ * el pack de cada auto con DOS llamadas a `GetPackFile` (0x48D658/0x48D6F8). Con
+ * el parche binario del Bug #005 (`mov r0,#0; bx lr`) las dos devolvian NULL, el
+ * `beq` saltaba la lectura y los 43 autos quedaban en cero. El bug de Gameloft es
+ * latente en Android (datos reales, estrellas distintas); nuestro parche lo
+ * convirtio en cuelgue garantizado.
+ *
+ * Tres correcciones, en orden causal:
+ *
+ * 1. STARS (0x462AD4): `cmp` + `movlt r0,#1` / `movge r0,#0` y salto al epilogo
+ *    (0x462AE0). Convierte `<=` en `<`: mismo orden para elementos distintos, y
+ *    ahora si es un strict weak ordering, asi que el sort termina con CUALQUIER
+ *    dato. Sin bc_enter a proposito: el sort lo llama O(n log n) veces y
+ *    inundaria el anillo de 32 del principal.
+ *
+ * 2. PACKFILE (0x48DA84) + REVERSION del parche binario del Bug #005. Se
+ *    restauraron los 8 bytes originales en `GetPackFile` (0x48D9D8) para que los
+ *    autos carguen de verdad, y el deref sin chequeo que crasheaba en el #005
+ *    (`0x48DA90: ldr r3,[r4]` con r4 = createAndOpenFile() = NULL) queda cubierto
+ *    por una guarda en runtime que salta al camino de "no encontrado" que la
+ *    propia funcion ya tiene (0x48DB84: `mov r4,#0` + epilogo propio). Esto es
+ *    estrictamente mejor que el parche binario: los autos cuyo pack SI resuelve
+ *    ahora cargan, en vez de deshabilitarlos todos.
+ *
+ * 3. MENUCAR (0x3EF020): red de seguridad aguas abajo. Si aun asi no hay auto por
+ *    defecto, `this->raceCar` queda NULL y `0x3EF028: ldr r3,[r3,#0x28]` aborta.
+ *    El bloque solo hace `raceCar->node->setName("SelectableMenuCar")`, asi que
+ *    con raceCar NULL se salta entero a 0x3EF040. Emula un `ldr` PC-relativo:
+ *    doble indireccion (Bug #017).
+ */
+#define OFF_STARS          0x462AD4u // SceneHelper::CompareStars: cmp + movgt
+#define OFF_PACKFILE       0x48DA84u // BaseCarManager::GetPackFile: add r1,sp + mov r5,#0
+#define OFF_MENUCAR        0x3EF020u // OnLoad3DScene: ldr r3,[r5,#0x3c] + ldr r1,[pc]
+
+/*
+ * Bug #022 (log 026) — diagnostico, no fix. El giro del menu (Bugs #015-#021) ya
+ * quedo resuelto: el log 026 llega a "First time launch the app", guarda
+ * timespent.dat/pn.dat y ABORTA con `__gnu_cxx::__verbose_terminate_handler`
+ * en la pila (confirmado con el .psp2dmp de esa corrida: `__cxa_rethrow` ->
+ * `std::terminate` -> `__cxxabiv1::__terminate` -> el terminate handler ->
+ * `abort()` -> nuestro `abort_soloader`). O sea: una excepcion C++ real quedo
+ * sin capturar -- NO es un NULL deref (nada que "adivinar" con un parche de
+ * salto como los Bugs #005-#021). El mensaje de `__verbose_terminate_handler`
+ * (`terminate called after throwing an instance of '%s'`) se pierde: va por
+ * `fprintf(stderr,...)`/`write(2,...)`, que este loader no redirige a
+ * `[ALOG]` como sí hace con `__android_log_print`.
+ *
+ * `__cxa_throw(void* obj, std::type_info* tinfo, void(*dtor)(void*))` es la
+ * ÚNICA función por la que pasa TODO `throw` real del binario (confirmado:
+ * está definida DENTRO de libasphalt6.so -- libstdc++/libsupc++ estático, no
+ * importada de nuestro dynlib -- así que un solo hook acá ve el origen de
+ * cualquier excepción, sin importar en qué catch/rethrow termine). Se
+ * engancha su entrada (ENTER-only, como el resto de esta tabla) solo para
+ * loguear `tinfo->name()` (offset +4 del `std::type_info` real, confirmado
+ * con el layout de Itanium C++ ABI) antes de reanudar sin tocarle el
+ * comportamiento -- así el PRÓXIMO log dice qué tipo se lanzó, en vez de
+ * tener que adivinar con más parches binarios a ciegas.
+ *
+ * Primera palabra (`ldr ip,[pc,#144]`) es PC-relativa: doble indireccion como
+ * en createAnimator/DisplayFrame/CLightSceneNode (`g_emu_cxathrow` precalculado
+ * con el text_base real). Segunda palabra es el push real de la función. r3
+ * es scratch seguro para el salto final -- confirmado por disasm que nada
+ * antes de su primera reasignación (`ldr r3,[pc,#96]` mas adelante en la
+ * función) lee el r3 previo al hook.
+ */
+#define OFF_CXA_THROW      0xA6FEBCu // __cxa_throw: ldr ip,[pc,#144] + push
+#define LIT_CXA_THROW      0xA6FF54u // literal del ldr ip,[pc,#144] (start+8+0x90)
+
+/*
+ * Bug #022 (log 028) -- segundo nivel de diagnostico. El 027/028 confirmaron
+ * type='St11logic_error' msg='basic_string::_S_construct NULL not valid', el
+ * mensaje EXACTO que tira `std::string::_S_construct<char const*>` (0xA6A660)
+ * cuando `beg==NULL` (confirmado por disasm: `cmp r0,#0; beq ...; cmp r5,#0
+ * (=end); ... bl __throw_logic_error` en 0xa6a680-0xa6a6fc). Ese `_S_construct`
+ * es un choke point COMPARTIDO por decenas de sitios (via 4 wrappers de
+ * std::string puro -- NO glitch::core::SAllocator, que tiene su propio
+ * `_S_construct` en 0x475f08 y no aplica aca), demasiados para auditar a mano.
+ *
+ * Pero el ctor `std::string(const char*, allocator)` (0xA6A7E8/0xA6A828, C1/C2)
+ * hace algo mas especifico: `subs r5,r1,#0; ...; mvneq r1,#0` -- cuando el
+ * `const char*` de ENTRADA (r1) es NULL, fuerza `end=-1` (centinela) ANTES de
+ * llamar a `_S_construct`, produciendo EXACTAMENTE la combinacion
+ * beg=NULL/end!=0 que dispara el throw. O sea: hookear la ENTRADA de este ctor
+ * y mirar r1 ahi (antes de que el `subs` lo transforme) da la condicion real
+ * SIN falsos positivos, y el LR en ese punto (todavia no pisado por el `push
+ * {r4,r5,r6,lr}` original) es la direccion de retorno REAL en codigo del
+ * juego -- el llamador que armo el std::string con un char* NULL, sin tener
+ * que auditar los 291 sitios que llaman a este ctor.
+ *
+ * Ninguna de las dos palabras pisadas es PC-relativa (`push` normal + `subs`
+ * con inmediato): sin doble indireccion, se emulan verbatim.
+ */
+#define OFF_SCONSTRUCT     0xA6A7E8u // std::string(const char*, allocator) C1: push+subs
+#define OFF_GETLANG        0x4E94F0u // StringManager::GetLanguageString()
+#define OFF_SETLANG        0x5A6E78u // StringManager::SetLanguage(const char*)
 
 #define W_PUSH9  0xe92d4ff0u // push {r4-r9, sl, fp, lr}
 #define W_PUSH6a 0xe92d41f0u // push {r4-r8, lr}
@@ -102,12 +289,70 @@ void hooked_RenderFX_Find_pt() {
 #define W_LDR_IP 0xe590c0c0u // ldr ip, [r0, #192] (IDevice::run)
 #define W_PUSH3  0xe92d4030u // push {r4, r5, lr}   (RenderFX::Render)
 #define W_PUSH1  0xe92d4010u // push {r4, lr}       (endScene x2)
+#define W_STR_LR 0xe52de004u // str lr, [sp, #-4]!  (getRealTime)
+#define W_LDR_R3c 0xe51f31d0u // ldr r3, [pc, #-464] (retorno DisplayFrame final)
+#define W_ADD_R0 0xe2840008u // add r0, r4, #8 (drop de string, Bug #019)
+#define W_STR_R0_44 0xe5850044u // str r0, [r5, #68]  (siembra del array de autos)
+#define W_LDR_R2R3  0xe5932000u // ldr r2, [r3]      (busqueda sin cota de autos)
+#define W_CMP_R4R0  0xe1540000u // cmp r4, r0        (CompareStars)
+#define W_ADD_R1SP  0xe28d1018u // add r1, sp, #24   (GetPackFile)
+#define W_LDR_R3_3C 0xe595303cu // ldr r3, [r5, #60] (OnLoad3DScene: raceCar)
+#define W_LDR_IP_90 0xe59fc090u // ldr ip, [pc, #144] (__cxa_throw)
+#define W_PUSH_CXA  0xe92d48f0u // push {r4,r5,r6,r7,fp,lr} (__cxa_throw)
+#define W_PUSH456LR 0xe92d4070u // push {r4,r5,r6,lr} (std::string ctor const char*)
+#define W_SUBS_R5R1 0xe2515000u // subs r5, r1, #0    (std::string ctor const char*)
+
+/*
+ * SEGUNDA palabra de cada objetivo, verificada en hook_trace().
+ *
+ * Por que existe esto: hook_trace() solo miraba la PRIMERA palabra, y los 8
+ * bytes que el trampolin pisa son DOS instrucciones -- la segunda se emula a
+ * mano en el stub. Esa mano ya falló dos veces, y las dos veces el sintoma fue
+ * un crash en consola en vez de un mensaje: Bug #017 (un `ldr` PC-relativo
+ * emulado sin la doble indireccion) y el log 023 (`ldr r4,[sp,#0xb4]` escrito
+ * como `0xe59d4b40`, o sea `[sp,#0xb40]` -- inmediato transpuesto: r4 quedo en
+ * basura, el ctor calculo `0-12+8` y `__exchange_and_add(0xFFFFFFFC)` abortó).
+ * Con la palabra real declarada al lado del stub, un encoding mal escrito o un
+ * .so distinto se cazan al arrancar y ese hook simplemente no se instala.
+ *
+ * Valores tomados del `.so` real con objdump (auditados uno por uno).
+ */
+#define W2_LDR_SL    0xe59fa410u // ldr sl, [pc, #1040]  (MenuScene C1/C2)
+#define W2_MOV_R6R0  0xe1a06000u // mov r6, r0           (RemoveChildNodeType)
+#define W2_ADD_R6    0xe2816004u // add r6, r1, #4       (CustomBatchGrid C2)
+#define W2_PUSH_ANIM 0xe92d4070u // push {r4-r6, lr}     (createAnimator)
+#define W2_VLDR_S14  0xed9f7a7au // vldr s14, [pc, #488] (CLightSceneNode C1)
+#define W2_LDR_R3_D0 0xe59030d0u // ldr r3, [r0, #208]   (IDevice::run: se REEMPLAZA a proposito)
+#define W2_VPUSH_D8  0xed2d8b02u // vpush {d8}           (RenderFX::Update)
+#define W2_MOV_R4R0  0xe1a04000u // mov r4, r0           (RenderFX::Render)
+#define W2_LDR_R3R0  0xe5903000u // ldr r3, [r0]         (CCommonGLDriver::endScene)
+#define W2_SUB_SP8   0xe24dd008u // sub sp, sp, #8       (IVideoDriver::endScene)
+#define W2_SUB_SP12  0xe24dd00cu // sub sp, sp, #12      (getRealTime)
+#define W2_LDR_R4SP  0xe59d40b4u // ldr r4, [sp, #180]   (retorno DisplayFrame final)
+#define W2_MVN_R1    0xe3e01000u // mvn r1, #0            (drop de string, Bug #019)
+#define W2_MOV_R0R5  0xe1a00005u // mov r0, r5           (siembra del array de autos)
+#define W2_CMP_R2R1  0xe1520001u // cmp r2, r1           (busqueda sin cota de autos)
+#define W2_MOVGT_R0  0xc3a00000u // movgt r0, #0         (CompareStars: se REEMPLAZA)
+#define W2_MOV_R5_0  0xe3a05000u // mov r5, #0           (GetPackFile)
+#define W2_LDR_R1PC  0xe59f1434u // ldr r1, [pc, #1076]  (OnLoad3DScene: PC-relativo)
+#define W2_LDR_R3_48 0xe5903030u // ldr r3, [r0, #48]    (StringManager::GetLanguageString)
+#define W2_SUB_SP68  0xe24dd044u // sub sp, sp, #68      (StringManager::SetLanguage)
 
 static uint32_t g_resume_c1, g_resume_c2, g_resume_rm, g_resume_grid,
                 g_resume_anim, g_resume_light, g_resume_frame,
                 g_resume_run, g_resume_update, g_resume_render,
-                g_resume_endgl, g_resume_endiv;
-static uint32_t g_emu_c1, g_emu_c2, g_emu_anim, g_emu_light, g_emu_frame;
+                g_resume_endgl, g_resume_endiv,
+                g_resume_rt, g_resume_dfret1, g_resume_dfret2,
+                g_resume_strdrop1, g_resume_strdrop2,
+                g_skip_strdrop1, g_skip_strdrop2,
+                g_resume_carseed, g_resume_carfind, g_skip_carfind,
+                g_resume_stars, g_skip_stars,
+                g_resume_packfile, g_skip_packfile,
+                g_resume_menucar, g_skip_menucar, g_emu_menucar,
+                g_resume_cxathrow, g_resume_sconstruct,
+                g_resume_getlang, g_resume_setlang;
+static uint32_t g_emu_c1, g_emu_c2, g_emu_anim, g_emu_light, g_emu_frame,
+                g_emu_dfret1, g_emu_dfret2, g_emu_cxathrow;
 
 static const char s_tr_c1[] = "MenuScene::MenuScene";
 static const char s_tr_rm[] = "RemoveChildNodeType";
@@ -120,6 +365,20 @@ static const char s_tr_update[] = "RenderFX::Update";
 static const char s_tr_render[] = "RenderFX::Render";
 static const char s_tr_endgl[] = "endScene-GL";
 static const char s_tr_endiv[] = "endScene-IV";
+static const char s_tr_rt[] = "getRealTime";
+static const char s_tr_dfret[] = "AfterDF";
+static const char s_tr_strdrop[] = "StrDrop";
+static const char s_tr_carseed[] = "CarSeed";
+static const char s_tr_carfind[] = "CarFind";
+static const char s_tr_packfile[] = "PackFileNull";
+static const char s_tr_menucar[] = "MenuCarNull";
+
+// Bug #019: aviso en vivo cuando la guarda omite un drop (raro: una vez por
+// corrida como mucho, sin costo de timing).
+void strdrop_skipped(uint32_t data, uint32_t site) {
+    l_error("[patch] StrDrop: data=0x%08X en camino %u, drop omitido (Bug #019)",
+            (unsigned)data, (unsigned)site);
+}
 
 // Plantilla push+push (RemoveChildNodeType, CustomBatchGrid C2): los 8 bytes
 // desplazados se copian tal cual porque ninguno es PC-relativo.
@@ -273,6 +532,19 @@ static void hook_frame(void) {
 // el camino `beq` es el normal. Entrar al drenado con punteros basura = data
 // abort en `ldm lr!,{r0-r3}` (log 019). El despacho directo (touch) no toca la
 // cola y sigue funcionando.
+//
+// REGRESION (Bug #018, log 020): la primera version de este stub usaba r12
+// como scratch para el salto final (`ldr r12,3f; ldr pc,[r12]`), pero r12 ES
+// ip -- lo pisaba justo despues de forzar `r3 = ip`, asi que en la reanudacion
+// (`cmp r3,ip` real, dentro del .so) ip ya no valia lo mismo que r3 (valia la
+// DIRECCION de `g_resume_run`) y el `beq` nunca se tomaba: el giro seguia
+// entrando al drenado igual, ahora dereferenciando esa direccion en vez del
+// puntero real de la cola (mismo sintoma exacto: `ldm lr!,{r0-r3}` con LR/R7
+// apuntando justo a `g_resume_run`/`+0x18`, confirmado byte a byte contra el
+// dump de la 020). Fix: usar r2 como scratch para el salto (confirmado por
+// disasm que el camino de salida del `beq`, offsets 0x74-0xa0 de la funcion,
+// no lee r2 en ningun punto) y dejar r12/ip intacto desde el `mov r3,ip` hasta
+// el `cmp r3,ip` real de la reanudacion.
 __attribute__((naked, target("arm")))
 static void hook_run(void) {
     __asm__ volatile(
@@ -283,8 +555,8 @@ static void hook_run(void) {
         "pop {r0-r3, r12, lr}\n"
         "ldr ip, [r0, #192]\n"
         "mov r3, ip\n"       // Bug #018: cola siempre vacia (NO el ldr original)
-        "ldr r12, 3f\n"
-        "ldr pc, [r12]\n"
+        "ldr r2, 3f\n"       // r2 (NO r12): no pisar el ip recien forzado
+        "ldr pc, [r2]\n"
         "1: .word s_tr_run\n"
         "3: .word g_resume_run\n"
     );
@@ -358,19 +630,461 @@ static void hook_endiv(void) {
     );
 }
 
+// Tercer nivel (log 022): getRealTime es verbatim (str+sub, nada PC-relativo).
+__attribute__((naked, target("arm")))
+static void hook_realtime(void) {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "ldr r0, 1f\n"
+        "mov r1, #0\n"
+        "bl bc_enter\n"
+        "pop {r0-r3, r12, lr}\n"
+        ".word 0xe52de004\n" // str lr, [sp, #-4]!
+        ".word 0xe24dd00c\n" // sub sp, sp, #12
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"
+        "1: .word s_tr_rt\n"
+        "3: .word g_resume_rt\n"
+    );
+}
+
+// Retorno del DisplayFrame final (los dos caminos del ctor): el `ldr r3`
+// PC-relativo se emula con doble indireccion (r3 es scratch tras un retorno
+// void) y el `ldr r4,[sp,#0xb4]` va verbatim.
+__attribute__((naked, target("arm")))
+static void hook_dfret1(void) {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "ldr r0, 1f\n"
+        "mov r1, #0\n"
+        "bl bc_enter\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 2f\n"
+        "ldr r12, [r12]\n"   // r12 = direccion del literal
+        "ldr r3, [r12]\n"    // ldr r3, [pc, #-464] (el VALOR, doble indireccion)
+        ".word 0xe59d40b4\n" // ldr r4, [sp, #0xb4] (OJO: 0x0b4, no 0xb40 -- ver cabecera)
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"
+        "1: .word s_tr_dfret\n"
+        "2: .word g_emu_dfret1\n"
+        "3: .word g_resume_dfret1\n"
+    );
+}
+
+__attribute__((naked, target("arm")))
+static void hook_dfret2(void) {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "ldr r0, 1f\n"
+        "mov r1, #0\n"
+        "bl bc_enter\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 2f\n"
+        "ldr r12, [r12]\n"   // r12 = direccion del literal
+        "ldr r3, [r12]\n"    // ldr r3, [pc, #-464] (el VALOR, doble indireccion)
+        ".word 0xe59d40b4\n" // ldr r4, [sp, #0xb4] (OJO: 0x0b4, no 0xb40 -- ver cabecera)
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"
+        "1: .word s_tr_dfret\n"
+        "2: .word g_emu_dfret2\n"
+        "3: .word g_resume_dfret2\n"
+    );
+}
+
+// Bug #019: guarda del drop de string (los dos caminos del epilogo del ctor).
+// Emula `add r0,r4,#8` + `mvn r1,#0`, pero si data (= r0+4) cae bajo 4 KB es un
+// puntero bogus (NULL visto en el dump 023: &refcount = -4) y se salta al camino
+// "nada que liberar" avisando en vivo. r12 es scratch en el borde (las 8
+// palabras originales no lo leen) y los flags mueren en el `bl`/salto.
+__attribute__((naked, target("arm")))
+static void hook_strdrop1(void) {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "ldr r0, 1f\n"
+        "mov r1, #0\n"
+        "bl bc_enter\n"
+        "pop {r0-r3, r12, lr}\n"
+        "add r0, r4, #8\n"     // emu: r0 = &refcount
+        "add r12, r0, #4\n"    // r12 = data candidata
+        "cmp r12, #0x1000\n"
+        "blo 2f\n"
+        "mvn r1, #0\n"         // emu: drop real
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"
+        "2:\n"
+        "mov r0, r12\n"        // arg1 = data bogus
+        "mov r1, #1\n"         // arg2 = camino 1
+        "bl strdrop_skipped\n"
+        "ldr r12, 4f\n"
+        "ldr pc, [r12]\n"
+        "1: .word s_tr_strdrop\n"
+        "3: .word g_resume_strdrop1\n"
+        "4: .word g_skip_strdrop1\n"
+    );
+}
+
+__attribute__((naked, target("arm")))
+static void hook_strdrop2(void) {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "ldr r0, 1f\n"
+        "mov r1, #0\n"
+        "bl bc_enter\n"
+        "pop {r0-r3, r12, lr}\n"
+        "add r0, r4, #8\n"     // emu: r0 = &refcount
+        "add r12, r0, #4\n"    // r12 = data candidata
+        "cmp r12, #0x1000\n"
+        "blo 2f\n"
+        "mvn r1, #0\n"         // emu: drop real
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"
+        "2:\n"
+        "mov r0, r12\n"        // arg1 = data bogus
+        "mov r1, #2\n"         // arg2 = camino 2
+        "bl strdrop_skipped\n"
+        "ldr r12, 4f\n"
+        "ldr pc, [r12]\n"
+        "1: .word s_tr_strdrop\n"
+        "3: .word g_resume_strdrop2\n"
+        "4: .word g_skip_strdrop2\n"
+    );
+}
+
+// Bug #020: avisos en vivo (una vez por carga de menu, sin costo de timing).
+void carseed_applied(uint32_t race_car, uint32_t array) {
+    l_error("[patch] CarSeed: raceCar=0x%08X array=0x%08X (Bug #020/#021)",
+            (unsigned)race_car, (unsigned)array);
+}
+
+void packfile_null(void) {
+    l_error("[patch] PackFileNull: createAndOpenFile devolvio NULL, retorno limpio (Bug #021)");
+}
+
+void menucar_null(void) {
+    l_error("[patch] MenuCarNull: no hay auto por defecto, se saltea setName (Bug #021)");
+}
+
+void carfind_skipped(void) {
+    l_error("[patch] CarFind: busqueda sin cota omitida -- la siembra no alcanzo (Bug #020)");
+}
+
+/*
+ * Bug #020, guarda 1: siembra array[0] = raceCar->carIdx antes de SortCars().
+ * Emula `str r0,[r5,#0x44]` + `mov r0,r5`. r12 es scratch en el borde (viene de
+ * tres `bl` seguidos) y los flags mueren en el `bl SortCars` de 0x3EF01C.
+ */
+__attribute__((naked, target("arm")))
+static void hook_carseed(void) {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "ldr r0, 1f\n"
+        "mov r1, #0\n"
+        "bl bc_enter\n"
+        "pop {r0-r3, r12, lr}\n"
+        "str r0, [r5, #0x44]\n"   // emu: this->carArray = new[]
+        "ldr r12, [r5, #0x3c]\n"  // RaceCar* (0 si no se construyo)
+        "cmp r12, #0\n"
+        "cmpne r0, #0\n"
+        "beq 2f\n"                // sin array o sin RaceCar: nada que sembrar
+        "ldr r12, [r12, #0x44]\n" // aguja = raceCar->carIdx
+        "str r12, [r0]\n"         // array[0] = aguja (>=4 bytes garantizados)
+        "2:\n"
+        "push {r0-r3, r12, lr}\n" // log SIEMPRE: distingue array NULL de raceCar NULL
+        "mov r1, r0\n"
+        "ldr r0, [r5, #0x3c]\n"
+        "bl carseed_applied\n"
+        "pop {r0-r3, r12, lr}\n"
+        "mov r0, r5\n"            // emu: r0 = this (arg de SortCars)
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"
+        "1: .word s_tr_carseed\n"
+        "3: .word g_resume_carseed\n"
+    );
+}
+
+/*
+ * Bug #020, guarda 2: saltea la busqueda sin cota. NO reanuda -- salta a
+ * 0x3EF390 (`mov r3,#0` + `str r3,[r5,#0x48]`), que es el unico efecto real del
+ * bloque: el puntero que el bucle calcula se descarta ahi mismo. r5 queda
+ * intacto (bc_enter preserva r4-r11 por AAPCS).
+ */
+__attribute__((naked, target("arm")))
+static void hook_carfind(void) {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "ldr r0, 1f\n"
+        "mov r1, #0\n"
+        "bl bc_enter\n"
+        "bl carfind_skipped\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"
+        "1: .word s_tr_carfind\n"
+        "2: .word g_skip_carfind\n"
+    );
+}
+
+/*
+ * Bug #021, guarda 1: convierte CompareStars en un strict weak ordering.
+ * Reemplaza `cmp r4,r0` + `movgt r0,#0` (y saltea el `movle r0,#1` de 0x462ADC)
+ * saltando directo al epilogo 0x462AE0 (`pop {r4,r5,r6,pc}`). r12 es scratch: la
+ * funcion esta por hacer su pop. SIN bc_enter: el sort lo llama O(n log n) veces.
+ */
+__attribute__((naked, target("arm")))
+static void hook_stars(void) {
+    __asm__ volatile(
+        "cmp r4, r0\n"
+        "movlt r0, #1\n"          // a <  b -> true
+        "movge r0, #0\n"          // a >= b -> false (antes: true en iguales)
+        "ldr r12, 1f\n"
+        "ldr pc, [r12]\n"
+        "1: .word g_skip_stars\n"
+    );
+}
+
+/*
+ * Bug #021, guarda 2: NULL de createAndOpenFile() en GetPackFile (el crash del
+ * Bug #005, ahora que el parche binario se revirtio). Emula `add r1,sp,#0x18` +
+ * `mov r5,#0`; si r4 es NULL salta al camino de "no encontrado" que la propia
+ * funcion ya tiene (0x48DB84), que hace su propio epilogo.
+ */
+__attribute__((naked, target("arm")))
+static void hook_packfile(void) {
+    __asm__ volatile(
+        "add r1, sp, #0x18\n"     // emu
+        "mov r5, #0\n"            // emu
+        "cmp r4, #0\n"
+        "bne 2f\n"
+        "push {r0-r3, r12, lr}\n"
+        "ldr r0, 1f\n"
+        "mov r1, #0\n"
+        "bl bc_event\n"
+        "bl packfile_null\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 4f\n"
+        "ldr pc, [r12]\n"         // -> 0x48DB84 (mov r4,#0 + epilogo propio)
+        "2:\n"
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"
+        "1: .word s_tr_packfile\n"
+        "3: .word g_resume_packfile\n"
+        "4: .word g_skip_packfile\n"
+    );
+}
+
+/*
+ * Bug #021, guarda 3: raceCar NULL en OnLoad3DScene. El bloque solo hace
+ * raceCar->node->setName("SelectableMenuCar"); con raceCar NULL se saltea entero
+ * a 0x3EF040. La segunda palabra emulada es `ldr r1,[pc,#0x434]`: DOBLE
+ * indireccion (global -> direccion del literal -> valor), ver Bug #017.
+ */
+__attribute__((naked, target("arm")))
+static void hook_menucar(void) {
+    __asm__ volatile(
+        "ldr r3, [r5, #0x3c]\n"   // emu: r3 = this->raceCar
+        "cmp r3, #0\n"
+        "beq 2f\n"
+        "ldr r12, 3f\n"           // emu: ldr r1,[pc,#0x434] (doble indireccion)
+        "ldr r12, [r12]\n"
+        "ldr r1, [r12]\n"
+        "ldr r12, 4f\n"
+        "ldr pc, [r12]\n"         // resume 0x3EF028
+        "2:\n"
+        "push {r0-r3, r12, lr}\n"
+        "ldr r0, 1f\n"
+        "mov r1, #0\n"
+        "bl bc_event\n"
+        "bl menucar_null\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 5f\n"
+        "ldr pc, [r12]\n"         // -> 0x3EF040
+        "1: .word s_tr_menucar\n"
+        "3: .word g_emu_menucar\n"
+        "4: .word g_resume_menucar\n"
+        "5: .word g_skip_menucar\n"
+    );
+}
+
+/*
+ * Bug #022: log del tipo Y MENSAJE reales de CUALQUIER excepcion C++ lanzada
+ * por el .so. `exc_obj`/`tinfo` son el primer/segundo argumento de
+ * `__cxa_throw` (r0/r1 a la entrada, ya en el orden correcto para pasarlos
+ * directo a esta funcion en C -- ver AAPCS).
+ *
+ * El log 027 confirmo `type='St11logic_error'` -- un `std::logic_error` PLANO
+ * (no una subclase como `out_of_range`/`length_error`/`invalid_argument`, que
+ * tienen su propio `type_info`), y hay **57** sitios en el .so que llaman a
+ * `_ZSt19__throw_logic_errorPKc` (grep sobre el disasm ARM completo) --
+ * demasiados para adivinar cual sin mas datos. Pero el objeto excepcion YA
+ * esta construido cuando se llama a `__cxa_throw` (el compilador hace
+ * `__cxa_allocate_exception` + placement-new + `__cxa_throw`), asi que
+ * `exc_obj` apunta a un `std::logic_error` real: `{ vtable_ptr;
+ * __cow_string _M_msg; }` (layout confirmado por la ABI de Itanium C++ mas
+ * `__cow_string`, el string COW liviano que libstdc++ usa SIEMPRE para el
+ * mensaje de las excepciones estandar, independiente de `_GLIBCXX_USE_CXX11_ABI`).
+ * O sea: mismo offset +4 que el `type_info->__name` de abajo, pero leido
+ * sobre `exc_obj` en vez de `tinfo` -- el mensaje literal (p. ej.
+ * "basic_string::_M_construct null not valid") dice EXACTAMENTE cual de los
+ * 57 sitios disparo, sin tener que auditarlos a mano.
+ */
+void cxa_throw_log(void *exc_obj, void *tinfo) {
+    const char *type_name = "?";
+    if (tinfo) {
+        const char *n = *(const char **)((uint8_t *)tinfo + 4);
+        if (n) type_name = n;
+    }
+    const char *msg = "?";
+    if (exc_obj) {
+        const char *m = *(const char **)((uint8_t *)exc_obj + 4);
+        if (m) msg = m;
+    }
+    l_error("[patch] __cxa_throw: type='%s' msg='%s' (Bug #022, diagnostico)", type_name, msg);
+}
+
+__attribute__((naked, target("arm")))
+static void hook_cxa_throw(void) {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        // r0 = exc_obj, r1 = tinfo: ya son los dos primeros args de __cxa_throw,
+        // en el orden correcto para cxa_throw_log(exc_obj, tinfo) por AAPCS.
+        "bl cxa_throw_log\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 1f\n"
+        "ldr r12, [r12]\n"      // r12 = direccion del literal (doble indireccion)
+        "ldr ip, [r12]\n"       // ip = VALOR (ldr ip,[pc,#144] original)
+        ".word 0xe92d48f0\n"    // push {r4,r5,r6,r7,fp,lr}
+        "ldr r3, 2f\n"          // r3: scratch confirmado libre (ver comentario arriba)
+        "ldr pc, [r3]\n"
+        "1: .word g_emu_cxathrow\n"
+        "2: .word g_resume_cxathrow\n"
+    );
+}
+
+static const char s_english_str[] = "english";
+static const char s_empty_str[] = "";
+
+/*
+ * Bug #022 (log 030) — FIX REAL de la excepcion C++ en "First time launch".
+ *
+ * El hook de diagnostico de sconstruct confirmo:
+ *   [patch] std::string(NULL): llamador=libasphalt6.so+0x5A6E94
+ *
+ * El llamador es StringManager::SetLanguage (0x5A6E78) llamado con lang == NULL.
+ * Fue invocado desde GS_MenuMain::StateUpdate (0x3F43F0), que hace:
+ *   uVar20 = StringManager::GetLanguageString();
+ *   FlashFXHandler::SetLanguage(uVar20);  // slot 0x24
+ *
+ * Con perfil nuevo (o first launch), m_languageId vale 0. GetLanguageString (0x4E94F0)
+ * busca en su mapa (solo contiene IDs 1="english", 2="french", ..., 9="korean").
+ * Al no encontrar el 0, devuelve NULL (0). StateUpdate pasa ese NULL a
+ * FlashFXHandler::SetLanguage -> StringManager::SetLanguage -> std::string(NULL)
+ * -> __cxa_throw(std::logic_error) -> abort().
+ *
+ * Triple solucion:
+ * 1. StringManager::GetLanguageString: si no encuentra idioma, devuelve "english" (ID 1).
+ * 2. StringManager::SetLanguage: si recibe lang == NULL, lo sustituye por "english".
+ * 3. std::string ctor (OFF_SCONSTRUCT): si recibe NULL, lo sustituye por "" para que
+ *    ningun otro sitio de libstdc++ lance logic_error.
+ */
+
+const char *getlang_fallback(void *this_ptr) {
+    l_error("[patch] GetLanguageString: id=%d no encontrado en mapa, fallback a 'english' (Bug #022)",
+            this_ptr ? *(int *)this_ptr : -1);
+    return s_english_str;
+}
+
+__attribute__((naked, target("arm")))
+static const char *orig_GetLanguageString(void *this_ptr) {
+    __asm__ volatile(
+        ".word 0xe92d4070\n"    // emu: push {r4,r5,r6,lr}
+        ".word 0xe5903030\n"    // emu: ldr r3, [r0, #48]
+        "ldr r12, 1f\n"
+        "ldr pc, [r12]\n"
+        "1: .word g_resume_getlang\n"
+    );
+}
+
+static const char *hooked_GetLanguageString(void *this_ptr) {
+    const char *res = orig_GetLanguageString(this_ptr);
+    if (!res) {
+        return getlang_fallback(this_ptr);
+    }
+    return res;
+}
+
+void setlang_null_warn(void) {
+    l_error("[patch] StringManager::SetLanguage(NULL) recibido, fallback a 'english' (Bug #022)");
+}
+
+__attribute__((naked, target("arm")))
+static void hook_setlang(void) {
+    __asm__ volatile(
+        "cmp r1, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "bl setlang_null_warn\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r1, 2f\n"             // r1 = "english"
+        "1:\n"
+        ".word 0xe92d4ff0\n"       // emu: push {r4-r9, sl, fp, lr}
+        ".word 0xe24dd044\n"       // emu: sub sp, sp, #68
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"          // jump to 0x5a6e80
+        "2: .word s_english_str\n"
+        "3: .word g_resume_setlang\n"
+    );
+}
+
+void sconstruct_null_log(uint32_t lr) {
+    l_error("[patch] std::string(NULL): llamador=libasphalt6.so+0x%X, sustituido por \"\" (Bug #022)",
+            (unsigned)(lr - (uint32_t)so_mod.text_base));
+}
+
+__attribute__((naked, target("arm")))
+static void hook_sconstruct(void) {
+    __asm__ volatile(
+        "cmp r1, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "mov r0, lr\n"          // arg = direccion de retorno real del juego
+        "bl sconstruct_null_log\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r1, 3f\n"          // r1 = "" (evita que _S_construct lance logic_error)
+        "1:\n"
+        ".word 0xe92d4070\n"    // emu: push {r4,r5,r6,lr}
+        ".word 0xe2515000\n"    // emu: subs r5,r1,#0
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"
+        "2: .word g_resume_sconstruct\n"
+        "3: .word s_empty_str\n"
+    );
+}
+
 // Engancha text_base+off con stub tras verificar la primera palabra del prologo.
 // emu_lit_off = offset del literal que cargaba el ldr PC-relativo (0 si no hay).
-static void hook_trace(uint32_t off, uint32_t expect1, void (*stub)(void),
-                       uint32_t emu_lit_off, uint32_t *resume_out, uint32_t *emu_out) {    uint32_t w = *(volatile uint32_t *)(so_mod.text_base + off);
+static void hook_trace(uint32_t off, uint32_t expect1, uint32_t expect2,
+                       void (*stub)(void),
+                       uint32_t emu_lit_off, uint32_t *resume_out, uint32_t *emu_out) {
+    uint32_t w = *(volatile uint32_t *)(so_mod.text_base + off);
     if (w != expect1) {
         l_error("[patch] sin hook en +0x%X: primera palabra 0x%08X != 0x%08X esperada",
                 (unsigned)off, (unsigned)w, (unsigned)expect1);
+        return;
+    }
+    // Las dos palabras pisadas se emulan en el stub: si la segunda no es la que
+    // el stub cree, no instalar (ver el bloque W2_* arriba: esto es lo que
+    // convierte un encoding mal escrito en una linea de log y no en un crash).
+    uint32_t w2 = *(volatile uint32_t *)(so_mod.text_base + off + 4);
+    if (w2 != expect2) {
+        l_error("[patch] sin hook en +0x%X: segunda palabra 0x%08X != 0x%08X esperada",
+                (unsigned)off, (unsigned)w2, (unsigned)expect2);
         return;
     }
     *resume_out = (uint32_t)(so_mod.text_base + off + 8);
     if (emu_lit_off && emu_out)
         *emu_out = (uint32_t)(so_mod.text_base + emu_lit_off);
     hook_addr((uintptr_t)(so_mod.text_base + off), (uintptr_t)stub);
+    l_error("[patch] hook en +0x%X", (unsigned)off);
 }
 
 void so_patch(void) {
@@ -379,17 +1093,67 @@ void so_patch(void) {
 
     // Rastreo del tramo MenuScene (ver comentario arriba): si el .so no es el
     // esperado, hook_trace lo reporta y sigue sin parchear ese punto.
-    hook_trace(OFF_MENUSCENE_C1, W_PUSH9, hook_c1, 0x4427E4u, &g_resume_c1, &g_emu_c1);
-    hook_trace(OFF_MENUSCENE_C2, W_PUSH9, hook_c2, 0x441FDCu, &g_resume_c2, &g_emu_c2);
-    hook_trace(OFF_REMOVECHILD, W_PUSH6a, hook_rm, 0, &g_resume_rm, NULL);
-    hook_trace(OFF_GRID_CTOR, W_PUSH8, hook_grid, 0, &g_resume_grid, NULL);
-    hook_trace(OFF_CREATEANIM, W_LDR_R3a, hook_anim, 0x50A184u, &g_resume_anim, &g_emu_anim);
-    hook_trace(OFF_CLIGHT_CTOR, W_PUSH9, hook_light, 0x744980u, &g_resume_light, &g_emu_light);
-    hook_trace(OFF_DISPLAYFRAME, W_LDR_R3b, hook_frame, 0x4A4244u, &g_resume_frame, &g_emu_frame);
+    hook_trace(OFF_MENUSCENE_C1, W_PUSH9, W2_LDR_SL, hook_c1, 0x4427E4u, &g_resume_c1, &g_emu_c1);
+    hook_trace(OFF_MENUSCENE_C2, W_PUSH9, W2_LDR_SL, hook_c2, 0x441FDCu, &g_resume_c2, &g_emu_c2);
+    hook_trace(OFF_REMOVECHILD, W_PUSH6a, W2_MOV_R6R0, hook_rm, 0, &g_resume_rm, NULL);
+    hook_trace(OFF_GRID_CTOR, W_PUSH8, W2_ADD_R6, hook_grid, 0, &g_resume_grid, NULL);
+    hook_trace(OFF_CREATEANIM, W_LDR_R3a, W2_PUSH_ANIM, hook_anim, 0x50A184u, &g_resume_anim, &g_emu_anim);
+    hook_trace(OFF_CLIGHT_CTOR, W_PUSH9, W2_VLDR_S14, hook_light, 0x744980u, &g_resume_light, &g_emu_light);
+    hook_trace(OFF_DISPLAYFRAME, W_LDR_R3b, W_PUSH6a, hook_frame, 0x4A4244u, &g_resume_frame, &g_emu_frame);
     // Segundo nivel dentro de DisplayFrame (giro con +1850 gettod/s, log 018).
-    hook_trace(OFF_IDEV_RUN, W_LDR_IP, hook_run, 0, &g_resume_run, NULL);
-    hook_trace(OFF_RFX_UPDATE, W_PUSH9, hook_update, 0, &g_resume_update, NULL);
-    hook_trace(OFF_RFX_RENDER, W_PUSH3, hook_render, 0, &g_resume_render, NULL);
-    hook_trace(OFF_ENDSCENE_GL, W_PUSH1, hook_endgl, 0, &g_resume_endgl, NULL);
-    hook_trace(OFF_ENDSCENE_IV, W_PUSH1, hook_endiv, 0, &g_resume_endiv, NULL);
+    hook_trace(OFF_IDEV_RUN, W_LDR_IP, W2_LDR_R3_D0, hook_run, 0, &g_resume_run, NULL);
+    hook_trace(OFF_RFX_UPDATE, W_PUSH9, W2_VPUSH_D8, hook_update, 0, &g_resume_update, NULL);
+    hook_trace(OFF_RFX_RENDER, W_PUSH3, W2_MOV_R4R0, hook_render, 0, &g_resume_render, NULL);
+    hook_trace(OFF_ENDSCENE_GL, W_PUSH1, W2_LDR_R3R0, hook_endgl, 0, &g_resume_endgl, NULL);
+    hook_trace(OFF_ENDSCENE_IV, W_PUSH1, W2_SUB_SP8, hook_endiv, 0, &g_resume_endiv, NULL);
+    /*
+     * Tercer nivel (log 022): ¿retornó el DisplayFrame final del ctor? Si estas
+     * dos disparan, el giro es aguas abajo (epílogo del ctor -> DoStateChange ->
+     * Loading::Stop -> ResumeAllSounds), no dentro de DisplayFrame.
+     *
+     * El hook de `getRealTime` (OFF_REALTIME/hook_realtime, que sigue definido)
+     * queda FUERA a proposito: el 022 ya atribuyó el flood de reloj al
+     * `cond_timedwait` de un worker de vox, así que su pregunta ya está
+     * contestada -- y como empuja una miga por llamada, inundaría el anillo de
+     * 32 del hilo principal y borraría justamente el contexto (DisplayFrame /
+     * CLightSceneNode / AfterDF) que hay que leer en el próximo volcado.
+     */
+    hook_trace(OFF_AFTERDF1, W_LDR_R3c, W2_LDR_R4SP, hook_dfret1, 0x441FF8u, &g_resume_dfret1, &g_emu_dfret1);
+    hook_trace(OFF_AFTERDF2, W_LDR_R3c, W2_LDR_R4SP, hook_dfret2, 0x442800u, &g_resume_dfret2, &g_emu_dfret2);
+    // Bug #019 (dump 023): drop de string con data NULL en el epilogo del ctor.
+    g_skip_strdrop1 = (uint32_t)(so_mod.text_base + 0x4421D8u);
+    hook_trace(OFF_STRDROP1, W_ADD_R0, W2_MVN_R1, hook_strdrop1, 0, &g_resume_strdrop1, NULL);
+    g_skip_strdrop2 = (uint32_t)(so_mod.text_base + 0x4429E0u);
+    hook_trace(OFF_STRDROP2, W_ADD_R0, W2_MVN_R1, hook_strdrop2, 0, &g_resume_strdrop2, NULL);
+    /*
+     * Bug #020 (log 024): el `while (*p != carIdx) p++;` sin cota de
+     * OnLoad3DScene. Ver el bloque de comentario de OFF_CARSEED/OFF_CARFIND.
+     * Las dos guardas son independientes: si la siembra alcanza, CarFind no
+     * llega a dispararse nunca (y el log lo dice).
+     */
+    hook_trace(OFF_CARSEED, W_STR_R0_44, W2_MOV_R0R5, hook_carseed, 0, &g_resume_carseed, NULL);
+    g_skip_carfind = (uint32_t)(so_mod.text_base + 0x3EF390u);
+    hook_trace(OFF_CARFIND, W_LDR_R2R3, W2_CMP_R2R1, hook_carfind, 0, &g_resume_carfind, NULL);
+    /*
+     * Bug #021 (log 025): el giro real es el std::sort de GetUnlockList con un
+     * comparador que no es strict weak ordering, sobre datos de auto todos en
+     * cero por el parche binario del Bug #005 (ya revertido). Ver el bloque de
+     * comentario de OFF_STARS/OFF_PACKFILE/OFF_MENUCAR.
+     */
+    g_skip_stars = (uint32_t)(so_mod.text_base + 0x462AE0u);
+    hook_trace(OFF_STARS, W_CMP_R4R0, W2_MOVGT_R0, hook_stars, 0, &g_resume_stars, NULL);
+    g_skip_packfile = (uint32_t)(so_mod.text_base + 0x48DB84u);
+    hook_trace(OFF_PACKFILE, W_ADD_R1SP, W2_MOV_R5_0, hook_packfile, 0, &g_resume_packfile, NULL);
+    g_skip_menucar = (uint32_t)(so_mod.text_base + 0x3EF040u);
+    hook_trace(OFF_MENUCAR, W_LDR_R3_3C, W2_LDR_R1PC, hook_menucar, 0x3EF460u, &g_resume_menucar, &g_emu_menucar);
+
+    /*
+     * Bug #022: Excepcion C++ al entrar al menu ("First time launch" -> std::string(NULL)).
+     * Diagnostico confirmado con logs 028 y 030: GetLanguageString devolvio NULL con perfil
+     * nuevo y StateUpdate intento construir std::string(NULL) via FlashFXHandler::SetLanguage.
+     */
+    hook_trace(OFF_CXA_THROW, W_LDR_IP_90, W_PUSH_CXA, hook_cxa_throw, LIT_CXA_THROW, &g_resume_cxathrow, &g_emu_cxathrow);
+    hook_trace(OFF_SCONSTRUCT, W_PUSH456LR, W_SUBS_R5R1, hook_sconstruct, 0, &g_resume_sconstruct, NULL);
+    hook_trace(OFF_GETLANG, W_PUSH456LR, W2_LDR_R3_48, (void (*)(void))&hooked_GetLanguageString, 0, &g_resume_getlang, NULL);
+    hook_trace(OFF_SETLANG, W_PUSH9, W2_SUB_SP68, hook_setlang, 0, &g_resume_setlang, NULL);
 }

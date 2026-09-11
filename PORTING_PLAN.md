@@ -5,21 +5,22 @@
 > "Correcciones a la detección automática" abajo). Lo confirmado a mano está marcado como tal;
 > la bitácora con el detalle de cada bug es `port_progress.md`.
 
-## Estado actual (2026-09-07)
+## Estado actual (2026-09-11)
 
-Arranca en consola real, carga el motor, muestra la **pantalla de carga animada**, compila los
-66 shaders / 33 programas del menú... y se **cuelga al entrar al menú principal**. El giro
-quedó acotado con hooks ENTER al **`Loading::DisplayFrame` final del constructor de
-`MenuScene`** (logs 016→018 descartaron re-parenting, batching, animator y luces), con firma
-de espera de tiempo (`+9256 gettimeofday` cada 5 s, resto en 0). No es un crash: el proceso
-sigue vivo, es el hilo principal el que gira. Bloqueantes: Bug #015 (el giro) y Bug #018
-(crash intermitente en `IDevice::run` drenando una cola de eventos que nadie llena en este
-port — con guarda ya aplicada en `hook_run`). Ver `port_progress.md`.
+**¡El juego ya llega hasta el menú principal!**
+Arranca en consola real, carga el motor, muestra la pantalla de carga animada, compila los
+shaders en caliente, supera el guardado del perfil ("First time launch the app" / Bug #022),
+inicializa la interfaz en Flash (`gameswf`) y alcanza el menú principal (`GS_MenuMain`),
+presentando frames de manera continua y fluida (`swapEGLBuffers`).
 
 Lo que ya funciona: carga del `.so` y relocación, tabla JNI, ciclo de vida
 `GLGame`/`GameRenderer`, vitaGL + compilación de shaders en caliente, presentación de frames
-vía el callback `swapEGLBuffers`, lectura de assets por `fopen`, e input táctil.
-Lo que no: audio (nada implementado) y todo lo que viene después del menú.
+vía el callback `swapEGLBuffers`, lectura de assets por `fopen`, superación de la inicialización
+de idioma y llegada completa al menú (`GS_MenuMain`).
+
+Lo que falta: verificación interactiva del input táctil / mapeo a botones físicos de PS Vita,
+emulación de audio (`android/media/AudioTrack`), e inicio de carrera.
+
 
 ## Correcciones a la detección automática
 

@@ -107,6 +107,32 @@ void bc_spin_time(void);
 unsigned bc_spin_time_count(void);
 
 /**
+ * @brief Guarda DE DONDE vino la ultima consulta de reloj (es decir, quien gira).
+ *
+ * El log 021 dejo el Bug #015 reducido a: el hilo principal quema CPU al 100%
+ * leyendo gettimeofday ~1854 veces/s (unos 540 us de trabajo entre lecturas) y
+ * no toca NADA mas envuelto -- ni malloc, ni strcmp/strstr, ni mutex, ni
+ * usleep/yield, ni GL, ni archivos, ni ninguno de los 12 hooks. El contador
+ * dice QUE clase de giro es, pero no en que funcion.
+ *
+ * `glitch::os::Timer::getRealTime()` es un wrapper hoja (gettimeofday, luego
+ * `tv_sec*1000 + tv_usec/1000`), asi que el llamador REAL -- el bucle -- esta
+ * en la pila: ra0 es ese wrapper del motor y ra1/ra2 los dos marcos de arriba,
+ * cosechados de los LR que apilaron. Con el offset se busca la funcion en el
+ * pseudo-C y se termina la caceria.
+ */
+void bc_clock_site(uint32_t ra0, uint32_t ra1, uint32_t ra2);
+
+/** Ultimo sitio de consulta de reloj capturado (cada campo en 0 si no hubo). */
+void bc_clock_site_get(uint32_t *ra0, uint32_t *ra1, uint32_t *ra2);
+
+/** Hilo que hizo la ultima consulta de reloj (0 si no hubo). */
+int bc_clock_site_tid(void);
+
+/** ¿La direccion cae dentro del .text del .so del juego? (ver bc_set_base) */
+int bc_in_so(uint32_t addr);
+
+/**
  * @brief Vuelca el anillo entero al log, del mas viejo al mas nuevo.
  * @param why Motivo, para poder ubicar el volcado en el log.
  */

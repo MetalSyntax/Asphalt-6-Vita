@@ -91,8 +91,14 @@ clock_t clock_soloader(void) {
  */
 int gettimeofday_soloader(struct timeval *tv, void *tz) {
     // Contador para el testigo (ver bc_spin_time): una espera activa de tiempo
-    // con un reloj que no avanzara seria invisible sin esto.
+    // con un reloj que no avanzara seria invisible sin esto. Además se guarda
+    // DE DONDE vino la consulta (ver bc_clock_site): si el juego gira
+    // preguntando la hora, el volcado del testigo dice en qué función.
+    // ra0 = Timer::getRealTime (hoja), ra1 = el bucle, ra2 = el marco de arriba.
     bc_spin_time();
+    bc_clock_site((uint32_t)(uintptr_t)__builtin_return_address(0),
+                  (uint32_t)(uintptr_t)__builtin_return_address(1),
+                  (uint32_t)(uintptr_t)__builtin_return_address(2));
     if (tv) {
         uint64_t proctime = sceKernelGetProcessTimeWide();
         tv->tv_sec = proctime / 1000000;
