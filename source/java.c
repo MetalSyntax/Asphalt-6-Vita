@@ -7,6 +7,7 @@
 
 #include "utils/glutil.h"
 #include "utils/logger.h"
+#include "video.h"
 
 /*
  * JNI Methods
@@ -193,6 +194,34 @@ jint GLGame_getResourceLength(jmethodID id, va_list args) { return 0; }
 jobject GLGame_getSoundRaw(jmethodID id, va_list args) { return NULL; }
 jint GLGame_getResourceLengthSoundRaw(jmethodID id, va_list args) { return 0; }
 
+/*
+ * Java_com_gameloft_android_ANMP_GloftA6HP_GLMediaPlayer_nativeInit() resuelve
+ * ~40 jmethodID de audio/video contra la clase "GLMediaPlayer" (confirmado con
+ * Ghidra: playMusic/playSound/setVolumeMusic/... más loadMovie/isMediaPlaying).
+ * Solo implementamos loadMovie -- el resto es el bus de audio de vox::
+ * DriverAndroid (sin implementar, ver CLAUDE.md), y no crashean si quedan sin
+ * registrar (safe default de FalsoJNI).
+ *
+ * `nativeLoadMovie(const char*)` (exportado, `libasphalt6.so`) es quien arma
+ * el jstring y llama `CallStaticVoidMethod(GLMediaPlayer.class, loadMovie,
+ * jstr)` -- lo llamamos nosotros mismos desde main.c (en Android real lo
+ * dispara la Activity antes de crear la GLSurfaceView; acá no hay VM/Activity
+ * real que lo haga por su cuenta).
+ */
+void GLMediaPlayer_loadMovie(jmethodID id, va_list args) {
+    jstring name = va_arg(args, jstring);
+    const char *cname = name ? jni->GetStringUTFChars(&jni, name, NULL) : NULL;
+    video_play(cname ? cname : "intro.mp4");
+    if (name && cname) jni->ReleaseStringUTFChars(&jni, name, (char *) cname);
+}
+
+// nativeIsMediaPlaying() del .so retorna 0 hardcodeado sin siquiera llamar a
+// este método (confirmado en el pseudo-C) -- se registra igual para evitar el
+// ruido de "method ID not found" si algún otro camino llega a invocarlo.
+jboolean GLMediaPlayer_isMediaPlaying(jmethodID id, va_list args) {
+    return JNI_FALSE;
+}
+
 NameToMethodID nameToMethodId[] = {
     { 10, "nativeIsXperia", METHOD_TYPE_BOOLEAN },
     { 11, "nativeGetLanguageIndex", METHOD_TYPE_INT },
@@ -228,10 +257,15 @@ NameToMethodID nameToMethodId[] = {
     { 42, "getResourceLength", METHOD_TYPE_INT },
     { 43, "getSoundRaw", METHOD_TYPE_OBJECT },
     { 44, "getResourceLengthSoundRaw", METHOD_TYPE_INT },
+
+    // Resueltos por GLMediaPlayer_nativeInit (jni_GLMediaPlayer.c del motor).
+    { 60, "loadMovie", METHOD_TYPE_VOID },
+    { 61, "isMediaPlaying", METHOD_TYPE_BOOLEAN },
 };
 
 MethodsBoolean methodsBoolean[] = {
     { 10, GLGame_nativeIsXperia },
+    { 61, GLMediaPlayer_isMediaPlaying },
 };
 MethodsByte methodsByte[] = {};
 MethodsChar methodsChar[] = {};
@@ -273,6 +307,7 @@ MethodsVoid methodsVoid[] = {
     { 38, GLGame_Exit },
     { 50, GameRenderer_swapEGLBuffers },
     { 52, GameRenderer_setKeyboard },
+    { 60, GLMediaPlayer_loadMovie },
 };
 
 /*

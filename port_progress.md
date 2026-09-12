@@ -2073,8 +2073,334 @@ referenciados solo desde asm inline que el link de Release descarta):**
 
 **Pendiente:** medir en consola real (log + FPS). Siguiente candidato si sigue bajo:
 variante FBO-aware del downsample (solo fb 0 al offscreen, blit con shader GLES2).
-Dato aparte del dump `1789103434` (casi-carrera): data abort en
-`TrackScene::LoadLevelGeometry()+0x284` (`ldr r3,[r4]`, r4=NULL) tras
-`fopen(IPAD2a_Bahamas.bdae): 0x0` x2 -- asset de pista faltante, misma familia que
-Bugs #005/#021 (probablemente uno de los `file000865-956.dat` ausentes). No se toca en
-esta sesión (un bug a la vez); registrar como próximo bug cuando se confirme el flujo.
+
+### Bug #023 — Data Abort en `TrackScene::LoadLevelGeometry()` al entrar a la carrera ("IPAD2a_" asset crash) y optimizaciones de vitaGL — 2026-09-11
+
+**Logs / Dumps:**
+- `logs/asphalt6_032.log` (termina en carga de Bahamas con `[WARNING] fopen(ux0:data/asphalt6/data/IPAD2a_Bahamas.bdae, rb): 0x0`).
+- `logs/asphalt6-psp2core-1789104516-0x00037d2f01-eboot.bin.psp2dmp` (triageado con `vita-parse-core` y `so-crash-triage`).
+
+**Síntoma:**
+- Data abort exception (0x30004) en hilo `ASPHALT06` (principal).
+- PC: `0x9846b1bc` (offset `0x46B1BC` en `libasphalt6.so`), LR: `0x9846b1b8`, R4 = `0x00000000`.
+
+**Causa Raíz (Metodología `so-crash-triage`):**
+1. En `TrackScene::LoadLevelGeometry()` (`0x46AF38`), el motor comprueba el ID de la pista actual en `0x46AFD8`:
+   ```arm
+   46afd8: cmp   r3, #9    ; NewYork
+   46afdc: cmpne r3, #6    ; Monaco
+   46afe0: beq   46b114
+   46afe4: cmp   r3, #3    ; Havana
+   46afe8: beq   46b114
+   46afec: cmp   r3, #7    ; Moscow
+   46aff0: beq   46b114
+   ```
+2. Para New York, Monaco, Havana y Moscow salta a `0x46B114`, donde concatena directamente `<Track>.bdae` (5 bytes).
+3. Para cualquier otro circuito (como Bahamas, ID 1), el código toma el camino alternativo en `0x46B0B8` que antepone la cadena `"IPAD2a_"` (7 bytes), construyendo `"IPAD2a_Bahamas.bdae"`.
+4. El archivo `"IPAD2a_Bahamas.bdae"` es un remanente del motor iOS que no existe en el paquete de datos de Android (`file000000.dat` solo mapea `Bahamas.bdae` -> `file000554.dat`).
+5. Por ende, `fopen(ux0:data/asphalt6/data/IPAD2a_Bahamas.bdae)` falla devolviendo `NULL`.
+6. `CColladaDatabase::constructScene()` falla y retorna `NULL` (`r0 = 0`, guardado en `[fp, #12]`).
+7. En `0x46B1B8`, se carga `r4 = [fp, #12] = 0x0`.
+8. En `0x46B1BC`, se ejecuta `ldr r3, [r4]` (el inicio del `drop()` inlined del nodo devuelto), dereferenciando `0x0` y causando un Data Abort fatal.
+
+**Solución Aplicada (Defensa en 3 capas):**
+1. **Bypass del prefijo `IPAD2a_` en `source/patch.c`:**
+   En `0x46AFD8`, se reemplaza `cmp r3, #9` (`0xE3530009`) por un salto incondicional `b 0x46B114` (`0xEA00004D`). Con esto, TODOS los circuitos cargan directamente `<Track>.bdae` resolviendo a través del mapa de ofuscación a su respectivo archivo `.dat` (`file000554.dat` en el caso de Bahamas).
+2. **Guarda NULL en `TrackScene::LoadLevelGeometry` (`0x46B1B8`):**
+   Hook `hook_loadgeom` sobre `0x46B1B8`: si `r4 == NULL`, se emite una advertencia al log y se salta limpiamente a `0x46B1EC` (`~CColladaDatabase`), evitando el desreferenciamiento de NULL.
+3. **Fallback en `source/reimpl/io.c`:**
+   En `fopen_soloader`, `open_soloader` y `stat_soloader`, si una apertura falla y la ruta contiene `"IPAD2a_"`, se remueve automáticamente el prefijo y se reintenta la llamada.
+
+---
+
+### Optimizaciones de Rendimiento de vitaGL y Render Loop (`README VITAGL.md`)
+
+En respuesta al análisis de velocidad y la guía oficial de `README VITAGL.md`:
+1. **Configuración de Flags en `CMakeLists.txt` (`VITAGL_MAKE_FLAGS`):**
+   - `BUFFERS_SPEEDHACK=1`: Acelera drásticamente `glBufferSubData` escribiendo en memoria de GPU directamente en lugar de re-alocar búferes en cada frame dinámico.
+   - `NO_TILE_CLIPPER=1`: Desactiva el clipping temprano de tiles para scissor test, reduciendo la carga en la CPU ARM Cortex-A9.
+   - `NO_DMAC=1`: Reemplaza llamadas a `sceDmacMemcpy` (que pagan el costo de transición al kernel) por memcpy acelerado por NEON en espacio de usuario.
+   - `NO_TEX_COMBINER=1`: Deshabilita combinadores de texturas de fixed function pipeline no utilizados (el juego usa shaders GLSL).
+   - Se mantiene `DRAW_SPEEDHACK=2`, `HAVE_SHADER_CACHE=1`, `NO_DEBUG=1`, `NO_SPLASHSCREEN=1`, `SOFTFP_ABI=1`, `LOG_ERRORS=1`.
+2. **Optimización del Render Loop en `source/utils/glutil.c`:**
+   - Se eliminaron las llamadas de instrumentación pesada (`BC_SCOPE`, con llamadas al kernel `sceKernelGetProcessTimeLow()` y operaciones atómicas) dentro de funciones de llamada caliente (`glDrawArrays_soloader`, `glDrawElements_soloader`, `glUseProgram_soloader`, `glGetUniformLocation_soloader`, `glGetAttribLocation_soloader`), dejándolas activas únicamente bajo `#ifdef TRACE_GL_CALLS`. Esto ahorra miles de syscalls por segundo en el hilo de render.
+3. **Corrección en `vita.cmake` para empaquetado de VPK:**
+   - Se agregaron comillas y `UNIX_COMMAND` en `separate_arguments(VITA_PACK_VPK_FLAGS)` para que `vita-pack-vpk` soporte correctamente rutas con espacios (`PSVITA Develop`).
+
+**Estado de Compilación:**
+- Binarios `eboot.bin` y `asphalt6.vpk` compilados limpiamente al 100% con VitaSDK.
+
+### Bug #024 — Data Abort en `RenderFX::SetTextBufferingEnabled` (`0x682aa8`) por ausencia de `178hud.swf` — 2026-09-11
+
+**Logs / Dumps:**
+- `logs/asphalt6_033.log` (termina en `[WARNING] fopen(ux0:data/asphalt6/data/178hud.swf, rb): 0x0`, `smart_ptr.h: operator->: 132`).
+- `logs/asphalt6-psp2core-1789150269-0x00084b2edf-eboot.bin.psp2dmp` (triageado con `vita-parse-core` y `so-crash-triage`).
+
+**Síntoma:**
+- Data abort exception (0x30004) en hilo `ASPHALT06`.
+- PC: `0x98682aa8` (`_ZN8RenderFX23SetTextBufferingEnabledEb + 0x1C`), LR: `0x98682af0`, R3 = `0x00000000`.
+
+**Causa Raíz:**
+1. Al comenzar la carrera, `T_SWFManager::SWFLoad()` carga `"178hud.swf"`.
+2. `"178hud.swf"` no existía como archivo suelto en `ux0:data/asphalt6/data/`, por lo que `fopen` falló (`0x0`).
+3. `RenderFX::Load` falló y dejó el puntero `m_root` (`[r0, #60]`) en `NULL`.
+4. A continuación, `T_SWFManager::SWFLoad` invoca `RenderFX::SetTextBufferingEnabled(bool)`.
+5. En `0x682a8c`:
+   ```arm
+   682a8c: ldr   r3, [r0, #60]   ; r3 = m_root (NULL)
+   682a94: cmp   r3, #0
+   682aa4: beq   682ab4          ; salta a loguear el assert "smart_ptr.h: operator->: 132"
+   682aa8: strb  r5, [r3, #133]  ; <-- CRASH: desreferencia r3=0
+   ...
+   682aec: bl    __android_log_print
+   682af0: ldr   r3, [r4, #60]
+   682af4: b     682aa8          ; <-- tras el assert, salta incondicionalmente al store sobre NULL!
+   ```
+6. El compilador generó un assert que imprime el mensaje de advertencia pero luego reanuda la ejecución en la instrucción de escritura `strb` sobre NULL sin retornar, causando el Data Abort.
+
+**Asset Faltante Encontrado (`file000483.dat`):**
+- Se analizaron los 37 archivos SWF empaquetados en los `fileNNNNNN.dat` de `ux0_data/asphalt6/data/`.
+- `file000483.dat` contiene las cadenas del HUD de carrera (`Hud.tga`, `number_flipper_lap`, `Button_halfScreen`, `mc_end_label`, `He's Ahead of You!`, `He's Behind You!`, `gear_up`, `gear_down`, `camera`).
+- Header desofuscado: Magic `FWS`, versión 8, longitud 164,121 bytes (coincide exactamente con el tamaño del archivo).
+
+**Solución Aplicada:**
+1. **Instalación del Asset:**
+   Se desofuscó `file000483.dat` y se instaló en `ux0_data/asphalt6/data/178hud.swf`.
+   *(Nota: para transferir a la consola, se debe copiar `ux0_data/asphalt6/data/178hud.swf` a `ux0:data/asphalt6/data/178hud.swf`)*.
+2. **Guardas en `RenderFX` (`source/patch.c`):**
+   Se hookearon con código asm naked las funciones:
+   - `_ZN8RenderFX23SetTextBufferingEnabledEb` (`0x682a8c`)
+   - `_ZN8RenderFX24SetAutoLoadGlyphsEnabledEb` (`0x682b08`)
+   - `_ZN8RenderFX23SetRenderCachingEnabledEb` (`0x682b84`)
+   Si `m_root == NULL`, retornan de inmediato sin escribir en memoria ni crashear.
+
+**Estado:**
+- Compilación limpia al 100% de `eboot.bin` y `asphalt6.vpk`.
+
+### Bug #025 — Recurrencia del crash de carrera: `178hud.swf` nunca se transfirió a la consola, más un Data Abort nuevo en `_Unwind_Backtrace` — 2026-09-11
+
+**Logs / Dumps:**
+- `logs/asphalt6_034.log` (mismo patrón EXACTO del Bug #024: `[WARNING] fopen(ux0:data/asphalt6/data/178hud.swf, rb): 0x0` x2, `menufx.cpp: Load: 354`, luego CUATRO `smart_ptr.h: operator->: 132` en vez de crashear de una — señal de que las 3 guardas de `RenderFX` sí están activas en el build actual).
+- `logs/asphalt6-psp2core-1789160963-0x000e5c2ccd-eboot.bin.psp2dmp` (triageado con `psvita-toolkit analyze` + `so-crash-triage`).
+
+**Triangulación:**
+1. El Bug #024 dejó anotado explícitamente que faltaba transferir `ux0_data/asphalt6/data/178hud.swf` a `ux0:data/asphalt6/data/178hud.swf` en la consola — ese paso nunca se hizo.
+2. Se verificó por FTP directo contra `192.168.3.15:1337` (`LIST` de `ux0:/data/asphalt6/data`): el archivo real en consola **no** incluía `178hud.swf` (sí estaban `178igMenu.swf`, `178loading.swf`, `178quickrace.swf`). Confirmado: el asset nunca llegó a la consola pese a existir localmente en `ux0_data/`.
+3. Con el asset ausente, `T_SWFManager::SWFLoad("178hud.swf")` sigue fallando y `RenderFX::m_root` sigue en `NULL` — pero ahora las 3 guardas del Bug #024 absorben esos accesos (4 asserts no fatales en el log, contra 1 fatal antes del fix).
+4. El juego avanza más allá del punto del Bug #024 y crashea en un lugar nuevo:
+   - PC: `0x985f88bc` → `libasphalt6.so+0xa788bc`, dentro de `_Unwind_Backtrace` (prólogo, `push {r0-r9,sl,fp,ip}`), a 4 bytes de su entry point (`0xa788b8`).
+   - LR: `0x985f88b0`, dentro del epílogo de `_Unwind_ForcedUnwind` (`add sp, sp, #72`).
+   - R0/R4/R7/R8/R9 = `0x0`.
+   - Backtrace de pila apunta a `__muldf3+0x1c8` como retorno anterior — consistente con desenrollado de una excepción C++ real (no un simple `strb` sobre NULL como el #024), probablemente disparada más adelante en el mismo flujo de `SWFLoad`/render del HUD al no encontrar `m_root` válido en un sitio NO cubierto por las 3 guardas existentes.
+
+**Causa Raíz confirmada de ESTA corrida:** el archivo `178hud.swf` nunca se copió a la consola real — la corrida 034 repitió el escenario exacto del Bug #024 con el binario YA parcheado, así que las guardas hicieron su trabajo pero no eliminan la causa original (HUD ausente), solo evitan el primer crash de la cadena. El segundo crash (`_Unwind_Backtrace`) es una consecuencia de seguir operando varios frames con `m_root == NULL`, no un bug independiente confirmado todavía.
+
+**Acción tomada:**
+- Se subió `178hud.swf` (164.121 bytes, el mismo recuperado en el Bug #024 desde `file000483.dat`) por FTP a `ux0:/data/asphalt6/data/178hud.swf`. Verificado con `LIST` post-subida.
+- **No se tocó código.** El fix de código del Bug #024 (las 3 guardas de `RenderFX`) ya estaba correcto y desplegado; solo faltaba el asset.
+
+**Pendiente:** correr una carrera de nuevo con el asset ya presente y sacar un log fresco. Si `178hud.swf` carga bien, lo esperable es que ninguna de las 3 guardas se dispare y el crash de `_Unwind_Backtrace` no debería reproducirse (era downstream de `m_root == NULL`). Si el crash de `_Unwind_Backtrace` reaparece de todos modos, triagearlo como bug nuevo con el log/dump de esa corrida — no asumir la misma causa.
+
+### Feature — Reproducción del FMV de intro (`intro.mp4`) vía SceAvPlayer — 2026-09-11
+
+**Contexto:** `ux0_data/asphalt6/data/intro.mp4` (el intro real de Gameloft, 63s) nunca se reproducía —
+no había ningún camino de código que lo tocara. Investigación cruzada contra los ports hermanos
+"Prince of Persia" y "Dungeon Hunter 2" (mismo motor Gameloft que Asphalt 6 en el caso de DH2), que ya
+tienen esto resuelto y probado en consola real.
+
+**Hallazgo 1 — el archivo original no es reproducible tal cual:** `ffprobe` mostró que `intro.mp4`
+viene codificado en **MPEG-4 Part 2** (`mp4v`, Simple Profile, 854x480). El decodificador de hardware
+de la Vita (`SceAvPlayer`) **solo decodifica H.264+AAC**. Se recodificó con `ffmpeg`
+(`-c:v libx264 -profile:v main -level 3.1 -pix_fmt yuv420p -c:a copy`, mismos parámetros confirmados
+funcionando en el `intro.mp4` de Dungeon Hunter 2) manteniendo resolución/duración originales. El
+archivo original se conservó como `ux0_data/asphalt6/data/intro_orig_mpeg4.mp4` por si hace falta
+volver a codificar con otros parámetros.
+
+**Hallazgo 2 — el punto de enganche real (Ghidra sobre `libasphalt6.so`):**
+- `Java_...GLMediaPlayer_nativeInit` resuelve (junto con ~40 métodos de audio de `vox::DriverAndroid`,
+  sin implementar todavía) los jmethodID de `"loadMovie"` `"(Ljava/lang/String;)V"` y
+  `"isMediaPlaying"`.
+- `nativeLoadMovie(const char*)` es una función **exportada** (no un callback JNI que llame la VM): arma
+  un jstring con el nombre recibido y hace `CallStaticVoidMethod(GLMediaPlayer.class, loadMovie, jstr)`.
+  Igual que `GLGame_nativeInit`/`GameRenderer_nativeInit`/etc., en Android real la dispara la Activity
+  Java (acá no hay VM real que lo haga sola), así que se llama a mano desde `main.c`.
+- `nativeIsMediaPlaying()` retorna `0` hardcodeado sin pasar por JNI (confirmado en el pseudo-C) —
+  registrar `isMediaPlaying` es solo para evitar ruido de "method ID not found" si algún otro camino
+  llegara a invocarlo.
+
+**Implementación:**
+1. `source/video.cpp` / `source/video.h` (nuevos): reproducción por `SceAvPlayer` con conversión manual
+   YUV420p→RGB565 (tablas enteras BT.601 + NEON a mano) y dibujo por textura vitaGL, adaptado 1:1 del
+   mecanismo ya probado en consola real en Prince of Persia (mismo esquema que usa vitaGL, a diferencia
+   de Dungeon Hunter 2 que usa GLES2 puro). Incluye audio del video por un hilo y puerto
+   `SCE_AUDIO_OUT_PORT_TYPE_VOICE` dedicados (totalmente separados del audio del juego, que no existe
+   todavía). `video_play()` nunca cuelga: retorna al terminar el video, al saltearlo con Cruz/Start, o al
+   fallar abrir/decodificar.
+   - Nota de compatibilidad: el fork de vitaGL vendorizado acá NO tiene el enum `VGL_MEM_SLOW` que sí
+     tiene el de Prince of Persia (usa `VGL_MEM_PHYCONT`) — se ajustó al adaptar el código. Este mismo
+     fork además trae un helper `vglPhycontMemLazyInit()` y un sample completo en
+     `lib/vitaGL/samples/video_playback/` con una ruta MUCHO más simple (textura
+     `SCE_GXM_TEXTURE_FORMAT_YVU420P2_CSC1`, conversión YUV→RGB por hardware/GXM, sin CPU/NEON) pero que
+     requiere compilar vitaGL con `ENABLE_LEGACY_PIPELINE=1` (no activado hoy) y usar el pipeline
+     `vgl*`/`vglDrawObjects` en vez de las llamadas GL1 estándar -- se dejó pendiente como posible
+     optimización futura si el intro actual rinde mal, en vez de tocar flags de build para esto.
+2. `source/java.c`: agregado `GLMediaPlayer_loadMovie` (`jstring` → `video_play()`, IDs `60`/`61` en las
+   tablas `nameToMethodId`/`methodsVoid`/`methodsBoolean`) y `GLMediaPlayer_isMediaPlaying` (no-op,
+   `JNI_FALSE`).
+3. `source/main.c`: tras `gl_init()` (el allocator de framebuffers de video necesita GXM ya
+   inicializado), se resuelve y llama `GLMediaPlayer_nativeInit` (registra el jmethodID real de
+   `loadMovie` — si no corre antes, `nativeLoadMovie` llama con jmethodID `0` y FalsoJNI la descarta en
+   silencio), después `video_init()` (carga `SCE_SYSMODULE_AVPLAYER`), y por último se llama
+   `nativeLoadMovie("intro.mp4")` directamente.
+4. `CMakeLists.txt`: agregado `source/video.cpp` a `add_executable` y `SceAvPlayer_stub`/
+   `SceSysmodule_stub` a `target_link_libraries`.
+
+**Estado:** compila limpio (`psvita-toolkit build --preset debug`, sin warnings nuevos). **Sin probar en
+consola real todavía** -- la consola estaba offline/FTP inalcanzable al momento de este cambio. Falta
+desplegar `build/eboot.bin` + el `intro.mp4` ya recodificado y confirmar con un log fresco que el video
+se ve/oye bien y que el juego sigue de largo al menú al terminar.
+
+**Actualización 2026-09-11 (log 035):** primer log con el eboot ya desplegado. `178hud.swf` cargó bien
+(no hubo que redesplegar el asset, ya estaba). Pero **cero rastro de "video:" en todo el log de 9874
+líneas**, ni siquiera un `l_warn`/`l_error` -- ninguno de los ~40 métodos que `GLMediaPlayer_nativeInit`
+debería resolver (`loadMusic`, `playMusic`, `loadMovie`, etc.) aparece tampoco como "not found" en
+ningún lado, así que la función completa (no solo `loadMovie`) parece no haber corrido, pese a que su
+símbolo (`Java_..._GLMediaPlayer_nativeInit`) tiene el mismo tipo/binding que `GLGame_nativeInit` (que sí
+funciona) y su primera instrucción sigue el MISMO patrón "Ghidra muestra 0 argumentos" que
+`GLGame_nativeInit` ya usa sin problema -- descartada esa hipótesis. Se agregó logging explícito
+alrededor de `so_symbol()`/la llamada a `GLMediaPlayer_nativeInit` y a `nativeLoadMovie` en `main.c`
+(entrada + retorno de cada una) para que el próximo log confirme de una vez si el símbolo se resuelve y
+si la llamada realmente ejecuta o se salta. **Sin diagnóstico confirmado todavía**, pendiente de la
+próxima corrida.
+
+### Bug nuevo (sin confirmar) — Data Abort durante la carga de Bahamas, posible vtable de `CNullDriver` en un objeto que no debería tenerlo — 2026-09-11
+
+**Logs/Dumps:** `logs/asphalt6_035.log`, `logs/asphalt6-psp2core-1789177709-0x000c9a257b-eboot.bin.psp2dmp`.
+
+**Contexto confirmado:**
+- Pista **Bahamas**, "Launch Game by PN" (carrera rápida) -- misma pista del Bug #023.
+- El log corta justo después de warnings no fatales de audio sin implementar
+  (`sfx_ambience_beach.wav`, `vfx_intro_top3.wav`, `m_electro_7.wav`) -- el crash real ocurre
+  construyendo la escena 3D de la pista, más allá de todo lo ya probado.
+- `psvita-toolkit analyze`: Data Abort (0x30004), hilo ASPHALT06. PC dentro de
+  `glitch::video::CNullDriver::draw2DLine`/`getMaxUserClipPlanes` (offsets 0x7f4eb0-0x7f4ec8, funciones
+  no-op de 2-3 instrucciones). **El LR resuelto (`mpc_demux_init+0x64`) y la "secuencia de llamadas
+  reconstruida" del stack son basura de "símbolo más cercano"/escaneo ingenuo de pila -- verificado que
+  al menos una entrada ("CColladaDatabase::constructScene+0x1618") en realidad cae dentro de un template
+  de animación de materiales sin relación.** No confiar en esos dos datos sin re-verificar.
+
+**Ambigüedad de fondo (sin resolver):** ninguna interpretación (ARM ni Thumb) de la instrucción exacta
+en el PC reportado puede causar un Data Abort por sí sola (ninguna de las dos toca memoria). El dump no
+captura CPSR/bit Thumb del hilo (limitación confirmada de `vita-parse-core`), así que no se puede
+confirmar el modo real ni descartar que el PC necesite el ajuste de -8 típico de un data abort en ARM.
+
+**Hallazgo útil:** `glitch::CAndroidOSDevice::createDriver()` (0x701860) elige el driver por un campo de
+tipo del objeto device: `CNullDriver` es una opción **legítima y seleccionable** (no es basura), y su
+`createBuffer` (0x7f4ed0) hace `operator new`+`IBuffer::IBuffer(...)` real (no es un stub trivial) --
+pero el driver GLSL real (`CProgrammableGLDriver<CGLSLShaderHandler>`) tiene sus PROPIOS
+`createBuffer`/`getMaxUserClipPlanes` en direcciones totalmente distintas (0x914814/0x90e3b0). Hipótesis
+sin confirmar: un objeto que debería usar el driver GLSL real termina con el vtable de `CNullDriver`
+(puntero corrupto o de memoria liberada -- **R10 valía `0xdeadbeef`** en el crash, patrón típico de
+memoria envenenada/liberada).
+
+**Diagnóstico instalado (sin tocar comportamiento), `source/patch.c`:** 3 hooks nuevos que loguean el
+`this` (r0) de cada invocación real durante una corrida:
+- `hooked_CNullDriver_draw2DLine` / `hooked_CNullDriver_getMaxUserClipPlanes`: reemplazo 1:1 (son no-ops
+  triviales), logean y hacen exactamente lo mismo que el original.
+- `hooked_CNullDriver_createBuffer`: conserva el cuerpo real (emula sus 2 primeras palabras del
+  prólogo, `push {r4,r5,r6,r7,r8,sl,lr}` + `sub sp,sp,#12`, verificadas contra el binario antes de
+  instalar) y solo antepone el log.
+
+**Pendiente:** correr una carrera contra Bahamas de nuevo con este build y revisar el log en busca de
+líneas `[patch] CNullDriver::<método> this=0x...` -- confirmaría cuál(es) de los 3 métodos se invoca(n)
+de verdad y con qué `this`, para saber si el objeto es válido o corrupto y de dónde viene la llamada.
+Sin este dato, no hay fix propuesto todavía -- no adivinar la causa raíz sin esta confirmación.
+
+### Reemplazo del reproductor de video de intro: SceAvPlayer → FFmpeg por software — 2026-09-11
+
+**Motivo del cambio:** la implementación anterior (Bug/Feature de la sesión previa) recodificaba
+`intro.mp4` de MPEG-4 Part 2 a H.264 porque `SceAvPlayer` (decodificador de hardware de la Vita) solo
+soporta H.264+AAC. El usuario correctamente objetó: **un port que necesita modificar los archivos
+originales del juego no es un port real** -- nadie que arme este port desde su propia copia legal del
+APK podría reproducir ese paso de recodificación de la misma forma.
+
+**Solución adoptada:** se investigó cómo lo resuelven los ports hermanos. **Shadow Guardian NO aplica**
+como referencia -- se confirmó con `ffprobe` que su video (`logo.m4v`) YA viene en H.264 nativo, nunca
+tuvo este problema. El port que sí resuelve exactamente esto es **Asphalt-5-Vita** (mismo motor
+Gameloft, mismos assets `.mp4` en MPEG-4 Part 2 sin tocar): decodifica el archivo ORIGINAL enteramente
+por software vía FFmpeg (`libavcodec`+`libavutil`+`libswresample`), con un demuxer MP4/ISO-BMFF
+escrito a mano porque el build de `vdpm ffmpeg` para vitasdk **no incluye el demuxer `mov`** de
+`libavformat` (confirmado ahí con `ar t libavformat.a | grep mov`: solo está el muxer, no `mov.o`) --
+documentado en detalle en el header de `source/video.cpp` de ese port, con el log real del error
+(`avformat_open_input failed: Invalid data found...`) que llevó a ese diagnóstico.
+
+**Se adoptó ese mecanismo 1:1**, copiando y adaptando `source/video.cpp`/`video.h` de Asphalt-5-Vita
+(2090 líneas, ya endurecidas en consola real: 3 hilos -- decode/audio/render --, ring de frames,
+reloj de reproducción maestreado por el audio, NEON YUV420P→RGB565, `lowres=1` para decodificar a
+mitad de resolución por costo de CPU). Ajustes específicos para Asphalt 6:
+- `VIDEO_TARGET_W/H`: Asphalt 5 usa un FBO de downsample intermedio (`OFFSCREEN_W/H` en su
+  `glutil.h`) que Asphalt 6 **no tiene** -- `gl_init()` acá llama `vglInitExtended(0, 960, 544, ...)`
+  directo a la resolución real de pantalla. Se cambió a `960x544` fijo.
+- Comentarios actualizados para reflejar los datos reales de Asphalt 6 (`intro.mp4`: 854x480,
+  MPEG-4 Part 2 Simple Profile, un solo archivo, no 7) y aclarar que la advertencia sobre no usar un
+  shader GLSL custom para el dibujo del video (regresión confirmada en Asphalt 5, motor GLES1.1) es
+  una precaución heredada, no todavía confirmada en este port (cuyo motor es GLES2/GLSL puro, la
+  situación inversa) -- se mantiene el camino de pipeline fijo de vitaGL por las dudas, sin costo real
+  (es un draw de unos pocos frames, no un hot path).
+- `source/java.c`/`source/main.c`: **sin cambios** -- la interfaz (`video_init()`/`video_play(name)`)
+  es idéntica a la versión SceAvPlayer anterior, así que el enganche JNI (`GLMediaPlayer_loadMovie` →
+  `video_play()`, `nativeLoadMovie()` llamado a mano desde `main.c`) sigue igual.
+- `CMakeLists.txt`: se sacaron `SceAvPlayer_stub`/`SceSysmodule_stub` (ya no se usan) y se agregaron
+  `avformat`/`avcodec`/`avutil`/`swresample`/`mp3lame` (paquetes `vdpm ffmpeg` + `vdpm lame` de
+  vita-portlibs, ya instalados en este toolchain).
+- Se **restauró** `ux0_data/asphalt6/data/intro.mp4` a su formato original (MPEG-4 Part 2, se había
+  recodificado a H.264 en la sesión anterior) y se eliminó la copia recodificada -- el archivo que se
+  despliega a la consola es ahora el mismo, byte a byte, que trae el APK.
+
+**Estado:** compila y linkea limpio (`psvita-toolkit build --preset debug`, sin errores contra las
+libs de FFmpeg). El eboot.bin creció de ~630KB a ~1.55MB por el link estático de FFmpeg -- esperado,
+sin problema de espacio. **Sin probar en consola todavía** -- la consola estaba offline/FTP
+inalcanzable al momento de este cambio. Pendiente: desplegar y confirmar en un log real que el video
+decodifica y reproduce bien (buscar líneas `video: primer frame de video decodificado`, `video:
+loop exited!` con sus estadísticas de fps/tiempos por etapa), y ya que estamos, revisar en el mismo
+log si el misterio de la sesión anterior (`GLMediaPlayer_nativeInit` sin rastro alguno) se resuelve con
+el logging de diagnóstico ya agregado en `main.c`.
+
+### Log 038 — cuelgue antes del menú en `TrackingManager::updateSaveFile` (bucle de copia sin cota) — 2026-09-12
+
+**Log:** `logs/asphalt6_038.log` (Debug, 2900+ líneas). Llega lejos: intro saltada,
+66+ shaders, perfiles, `First time launch`, `pn.dat`/`timespent.dat` guardados, 3 POST
+fallidos a `ets.gameloft.com`, `tracking_data2.dat` rb + `tracking_data1.dat` wb
+abiertos con éxito, 140 frames presentados. Después, cuelgue duro en
+`nativeRender ENTRA #28` (40-70 s sin frames, principal `CORRIENDO` al 100%,
+`+0 reservas +0 strstr +0 strcmp`, `~9k gettod` por latido).
+
+**Diagnóstico (log + pseudo-C + disasm ARM con capstone, sin adivinar):**
+- El anillo del principal termina en `ENTRA nativeRender` → `ENTRA IDevice::run` →
+  `pthread_mutex_lock` (sale) → `fopen` ×2 (ambos con sale) y nada más. O sea,
+  trabado DENTRO de `run`, después de esos dos `fopen`, en código que no toca
+  nada instrumentado.
+- Esos dos `fopen` salen de `glot::TrackingManager::updateSaveFile()` (0x558624):
+  las direcciones de retorno del anillo (0x5586CC/0x5586E0) caen dentro de esa
+  función (confirmado por índice de símbolos), y el log muestra exactamente sus
+  dos archivos justo antes del corte.
+- El `+9k gettod` es ruido de un worker (`sitio de reloj: tid=0x40010223` desde
+  `CCondition::wait` en 0x85B0A8, ya atribuido en el Bug #015): el principal gira
+  en silencio, no sondea el Timer.
+- Disasm ARM real del bucle de copia (0x558814-0x558844): `restante = tamaño -
+  offset`; `while (restante > 0) { __n = fread(buf,1,0x19000,src);
+  fwrite(buf,1,__n,dst); restante -= __n; }` — **sin chequear `__n == 0`**.
+  Si `fread` devuelve 0 (EOF: `fseek` con SEEK_CUR más allá del fin, archivo
+  truncado, etc.), `restante` nunca baja: `fread(→0)` + `fwrite(0)` para siempre.
+  Puros loads, sin malloc/syscalls instrumentados — la firma exacta del 038.
+
+**Fix aplicado (`source/patch.c`, filosofía Bugs #020/#021: guarda en runtime):**
+hook en 0x558828 (`mov r1,#1` + `mov r3,r4`, ambas verbatim, r12 scratch libre):
+si `r0 (__n) == 0`, loguea `[patch] TrackCopy:` y salta a 0x558848 (salir del
+bucle al `fflush`). Con EOF no hay más que copiar; el tracking es analítica no
+crítica. Verificación de dos palabras en `hook_trace` como siempre. Build Debug
+verificado (`psvita-toolkit build --preset debug` limpio).
+
+**Cómo leer el próximo log (039):** línea `[patch] TrackCopy: fread devolvio 0...`
+⇒ la guarda mordió y el juego debería seguir al menú. Sin esa línea + mismo
+cuelgue ⇒ el giro no es este bucle; reabrir con el anillo del principal.

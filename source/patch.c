@@ -49,6 +49,104 @@ void hooked_RenderFX_Find_pt() {
     );
 }
 
+__attribute__((naked, target("arm")))
+void hooked_RenderFX_SetTextBufferingEnabled() {
+    __asm__ volatile(
+        "ldr r3, [r0, #60]\n"
+        "cmp r3, #0\n"
+        "bxeq lr\n"
+        "strb r1, [r3, #133]\n"
+        "bx lr\n"
+    );
+}
+
+__attribute__((naked, target("arm")))
+void hooked_RenderFX_SetAutoLoadGlyphsEnabled() {
+    __asm__ volatile(
+        "ldr r3, [r0, #60]\n"
+        "cmp r3, #0\n"
+        "bxeq lr\n"
+        "strb r1, [r3, #135]\n"
+        "bx lr\n"
+    );
+}
+
+__attribute__((naked, target("arm")))
+void hooked_RenderFX_SetRenderCachingEnabled() {
+    __asm__ volatile(
+        "ldr r3, [r0, #56]\n"
+        "cmp r3, #0\n"
+        "bxeq lr\n"
+        "strb r1, [r3, #152]\n"
+        "bx lr\n"
+    );
+}
+
+/*
+ * Diagnostico (bug nuevo tras #024/#025, log 035): Data Abort durante la carga
+ * de Bahamas ("Launch Game by PN") con PC dentro de glitch::video::
+ * CNullDriver::draw2DLine/getMaxUserClipPlanes (offsets 0x7f4eb0-0x7f4ec8), un
+ * driver "no-op" que glitch::CAndroidOSDevice::createDriver() SI puede elegir
+ * legitimamente (no es basura) -- pero ninguna instruccion en esa direccion
+ * exacta puede dar Data Abort por si sola (ni el ARM "add sp,sp,#8" ni el Thumb
+ * "beq.n" tocan memoria), y R10 valia 0xdeadbeef (patron de memoria liberada).
+ * Hipotesis sin confirmar: un objeto que deberia usar el driver GLSL real
+ * termina con el vtable de CNullDriver (puntero corrupto/liberado). Estos 3
+ * hooks loguean el `this` (r0) de cada llamada real durante una corrida contra
+ * Bahamas para confirmar CUALES de los 3 se invocan y con que `this` -- no
+ * cambian el comportamiento (draw2DLine/getMaxUserClipPlanes son no-ops
+ * triviales que se reemplazan 1:1; createBuffer conserva su cuerpo real
+ * emulando sus 2 primeras palabras, igual que los demas hook_trace() de este
+ * archivo).
+ */
+void cnulldriver_log_this(const char *method, uint32_t this_ptr) {
+    l_error("[patch] CNullDriver::%s this=0x%08X", method, (unsigned)this_ptr);
+}
+
+__attribute__((naked, target("arm")))
+void hooked_CNullDriver_draw2DLine() {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "mov r1, r0\n"
+        "ldr r0, 1f\n"
+        "bl cnulldriver_log_this\n"
+        "pop {r0-r3, r12, lr}\n"
+        "bx lr\n"
+        "1: .word s_cnd_draw2dline\n"
+    );
+}
+
+__attribute__((naked, target("arm")))
+void hooked_CNullDriver_getMaxUserClipPlanes() {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "mov r1, r0\n"
+        "ldr r0, 1f\n"
+        "bl cnulldriver_log_this\n"
+        "pop {r0-r3, r12, lr}\n"
+        "mov r0, #0\n"
+        "bx lr\n"
+        "1: .word s_cnd_getmaxclip\n"
+    );
+}
+
+__attribute__((naked, target("arm")))
+void hooked_CNullDriver_createBuffer() {
+    __asm__ volatile(
+        "push {r0-r3, r12, lr}\n"
+        "mov r1, r0\n"
+        "ldr r0, 1f\n"
+        "bl cnulldriver_log_this\n"
+        "pop {r0-r3, r12, lr}\n"
+        ".word 0xe92d45f0\n" // push {r4, r5, r6, r7, r8, sl, lr}
+        ".word 0xe24dd00c\n" // sub sp, sp, #12
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"
+        "1: .word s_cnd_createbuffer\n"
+        "2: .word g_resume_cnd_createbuffer\n"
+    );
+}
+
 /*
  * Rastreo ENTER-only del tramo final de MenuScene::MenuScene (log 016).
  *
@@ -281,6 +379,66 @@ void hooked_RenderFX_Find_pt() {
 #define OFF_GETLANG        0x4E94F0u // StringManager::GetLanguageString()
 #define OFF_SETLANG        0x5A6E78u // StringManager::SetLanguage(const char*)
 
+/*
+ * Bug #023: Al entrar a una carrera en circuitos que no sean NewYork(9),
+ * Monaco(6), Havana(3) o Moscow(7), TrackScene::LoadLevelGeometry (0x46AF38)
+ * antepone "IPAD2a_" al nombre de la pista (0x46B0B8), buscando p.ej. "IPAD2a_Bahamas.bdae".
+ * Ese asset no existe en el mapeo de Android (solo existe Bahamas.bdae -> file000554.dat),
+ * por lo que CColladaDatabase::constructScene() devuelve NULL (r0=0 -> [fp, #12]=0).
+ * En 0x46B1BC, "ldr r3, [r4]" intenta hacer drop() inlined del nodo desreferenciando r4=0,
+ * produciendo Data Abort (0x30004).
+ *
+ * Solucion doble:
+ * 1. Parche binario en 0x46AFD8: saltar incondicionalmente a 0x46B114 (b 0x46b114)
+ *    para que TODOS los circuitos carguen "<Track>.bdae" sin el prefijo "IPAD2a_".
+ * 2. Guarda en 0x46B1B8: si constructScene aun asi devuelve NULL (r4 == 0), omitir
+ *    el drop() y SetNodeFogLightingEnabled, saltando directamente a 0x46B1EC (~CColladaDatabase).
+ */
+#define OFF_LOADGEOM_IPAD2 0x46AFD8u // TrackScene::LoadLevelGeometry: cmp r3, #9
+#define W_CMP_R3_9         0xE3530009u
+#define B_LOADGEOM_SKIP_IPAD2 0xEA00004Du // b 0x46b114
+
+#define OFF_LOADGEOM_NODE  0x46B1B8u // ldr r4, [fp, #12] + ldr r3, [r4]
+#define W_LDR_R4FP12       0xE59B400Cu // ldr r4, [fp, #12]
+#define W2_LDR_R3R4        0xE5943000u // ldr r3, [r4]
+
+/*
+ * Log 038 — cuelgue antes del menú en `glot::TrackingManager::updateSaveFile`
+ * (0x558624): el hilo principal entra a `nativeRender` -> `IDevice::run`, hace
+ * los dos `fopen` de tracking (`tracking_data2.dat` rb + `tracking_data1.dat`
+ * wb, ambas con éxito en el log) y después gira al 100% sin malloc/strcmp/mutex
+ * ni ninguna otra llamada instrumentada. El disasm ARM real muestra el bucle
+ * de copia en 0x558814-0x558844:
+ *
+ *   558804  rsb r5, r5, fp    ; r5 = tamaño - offset (restante)
+ *   558810  ble 0x558848      ; si <= 0, salta (bien)
+ *   558814  ...               ; prepara fread(buf, 1, 0x19000, src)
+ *   558824  bl fread          ; r0 = __n
+ *   558828  mov r1, #1
+ *   55882c  mov r3, r4
+ *   558830  mov r2, r0
+ *   558834  rsb r5, r0, r5    ; restante -= __n
+ *   558838  mov r0, r6
+ *   55883c  bl fwrite
+ *   558840  cmp r5, #0
+ *   558844  bgt 0x558814      ; <-- sin chequear __n
+ *
+ * Si `fread` devuelve 0 (EOF/error: offset más allá del fin tras un `fseek`
+ * con SEEK_CUR, archivo truncado entre `ftell` y lectura, etc.), `r5` nunca
+ * baja y el bucle gira para siempre en `fread(->0)` + `fwrite(0)`: puros
+ * loads, sin malloc ni syscalls instrumentados — la firma exacta del 038.
+ * En Android es latente (archivos de tracking sanos); acá quedó expuesto tras
+ * los 3 POST fallidos a ets.gameloft.com + la rotación de tracking_data.
+ *
+ * Guarda: si `__n == 0`, se salta el resto de la copia a 0x558848 (el `fflush`
+ * del destino). Es equivalencia práctica, no heurística: con EOF no hay más
+ * bytes que copiar y el original solo "funcionaba" porque nunca llegaba a
+ * ese caso. Avisa en vivo para que el próximo log lo confirme.
+ */
+#define OFF_TRACKCOPY      0x558828u // updateSaveFile: mov r1,#1 + mov r3,r4 (tras fread)
+#define W_MOV_R1_1         0xE3A01001u // mov r1, #1
+#define W2_MOV_R3R4        0xE1A03004u // mov r3, r4
+
 #define W_PUSH9  0xe92d4ff0u // push {r4-r9, sl, fp, lr}
 #define W_PUSH6a 0xe92d41f0u // push {r4-r8, lr}
 #define W_PUSH8  0xe92d47f0u // push {r4-r9, sl, lr}
@@ -350,7 +508,10 @@ static uint32_t g_resume_c1, g_resume_c2, g_resume_rm, g_resume_grid,
                 g_resume_packfile, g_skip_packfile,
                 g_resume_menucar, g_skip_menucar, g_emu_menucar,
                 g_resume_cxathrow, g_resume_sconstruct,
-                g_resume_getlang, g_resume_setlang;
+                g_resume_getlang, g_resume_setlang,
+                g_resume_loadgeom, g_skip_loadgeom,
+                g_resume_trackcopy, g_skip_trackcopy,
+                g_resume_cnd_createbuffer;
 static uint32_t g_emu_c1, g_emu_c2, g_emu_anim, g_emu_light, g_emu_frame,
                 g_emu_dfret1, g_emu_dfret2, g_emu_cxathrow;
 
@@ -365,6 +526,9 @@ static const char s_tr_update[] = "RenderFX::Update";
 static const char s_tr_render[] = "RenderFX::Render";
 static const char s_tr_endgl[] = "endScene-GL";
 static const char s_tr_endiv[] = "endScene-IV";
+static const char s_cnd_draw2dline[] = "draw2DLine";
+static const char s_cnd_getmaxclip[] = "getMaxUserClipPlanes";
+static const char s_cnd_createbuffer[] = "createBuffer";
 static const char s_tr_rt[] = "getRealTime";
 static const char s_tr_dfret[] = "AfterDF";
 static const char s_tr_strdrop[] = "StrDrop";
@@ -372,6 +536,7 @@ static const char s_tr_carseed[] = "CarSeed";
 static const char s_tr_carfind[] = "CarFind";
 static const char s_tr_packfile[] = "PackFileNull";
 static const char s_tr_menucar[] = "MenuCarNull";
+static const char s_tr_trackcopy[] = "TrackCopy";
 
 // Bug #019: aviso en vivo cuando la guarda omite un drop (raro: una vez por
 // corrida como mucho, sin costo de timing).
@@ -1060,6 +1225,61 @@ static void hook_sconstruct(void) {
     );
 }
 
+void loadgeom_null_warn(void) {
+    l_error("[patch] TrackScene::LoadLevelGeometry: constructScene devolvio NULL, saltando drop (Bug #023)");
+}
+
+__attribute__((naked, target("arm")))
+static void hook_loadgeom(void) {
+    __asm__ volatile(
+        "ldr r4, [fp, #12]\n"
+        "cmp r4, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "bl loadgeom_null_warn\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"          // saltar a 0x46b1ec (~CColladaDatabase)
+        "1:\n"
+        ".word 0xe5943000\n"       // emu: ldr r3, [r4]
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"          // resume en 0x46b1c0
+        "2: .word g_resume_loadgeom\n"
+        "3: .word g_skip_loadgeom\n"
+    );
+}
+
+void trackcopy_empty(uint32_t remaining) {
+    l_error("[patch] TrackCopy: fread devolvio 0 con restante=%u, se omite el resto (log 038)",
+            (unsigned)remaining);
+}
+
+// Guarda del bucle de copia de updateSaveFile (log 038). A la entrada, r0 es
+// el retorno de fread (__n). Las dos palabras pisadas (`mov r1,#1` + `mov
+// r3,r4`) no tocan r0/r12, así que se emulan verbatim y r12 queda libre como
+// scratch para los saltos. Si __n == 0, no hay progreso posible: se salta a
+// 0x558848 (fflush del destino) en vez de girar para siempre.
+__attribute__((naked, target("arm")))
+static void hook_trackcopy(void) {
+    __asm__ volatile(
+        ".word 0xe3a01001\n"   // emu: mov r1, #1
+        ".word 0xe1a03004\n"   // emu: mov r3, r4
+        "cmp r0, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "mov r0, r5\n"         // arg = restante sin copiar
+        "bl trackcopy_empty\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"      // -> 0x558848 (salir del bucle)
+        "1:\n"
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"      // resume en 0x558830
+        "2: .word g_resume_trackcopy\n"
+        "3: .word g_skip_trackcopy\n"
+    );
+}
+
 // Engancha text_base+off con stub tras verificar la primera palabra del prologo.
 // emu_lit_off = offset del literal que cargaba el ldr PC-relativo (0 si no hay).
 static void hook_trace(uint32_t off, uint32_t expect1, uint32_t expect2,
@@ -1090,6 +1310,33 @@ static void hook_trace(uint32_t off, uint32_t expect1, uint32_t expect2,
 void so_patch(void) {
     hook_addr((uintptr_t)so_symbol(&so_mod, "_ZN7gameswf4root7advanceEfb"), (uintptr_t)&hooked_gameswf_root_advance);
     hook_addr((uintptr_t)(so_mod.text_base + 0x683af8), (uintptr_t)&hooked_RenderFX_Find_pt);
+
+    uintptr_t sym_tb = (uintptr_t)so_symbol(&so_mod, "_ZN8RenderFX23SetTextBufferingEnabledEb");
+    if (sym_tb) hook_addr(sym_tb, (uintptr_t)&hooked_RenderFX_SetTextBufferingEnabled);
+    uintptr_t sym_ag = (uintptr_t)so_symbol(&so_mod, "_ZN8RenderFX24SetAutoLoadGlyphsEnabledEb");
+    if (sym_ag) hook_addr(sym_ag, (uintptr_t)&hooked_RenderFX_SetAutoLoadGlyphsEnabled);
+    uintptr_t sym_rc = (uintptr_t)so_symbol(&so_mod, "_ZN8RenderFX23SetRenderCachingEnabledEb");
+    if (sym_rc) hook_addr(sym_rc, (uintptr_t)&hooked_RenderFX_SetRenderCachingEnabled);
+
+    // Diagnostico CNullDriver (ver comentario arriba de los hooked_CNullDriver_*):
+    // draw2DLine/getMaxUserClipPlanes se reemplazan 1:1 (son no-ops triviales);
+    // createBuffer conserva su cuerpo real, solo se le antepone el log.
+    uintptr_t sym_cnd_line = (uintptr_t)so_symbol(&so_mod, "_ZN6glitch5video11CNullDriver10draw2DLineERKNS_4core10position2dIiEES6_NS0_6SColorE");
+    if (sym_cnd_line) hook_addr(sym_cnd_line, (uintptr_t)&hooked_CNullDriver_draw2DLine);
+    uintptr_t sym_cnd_clip = (uintptr_t)so_symbol(&so_mod, "_ZNK6glitch5video11CNullDriver20getMaxUserClipPlanesEv");
+    if (sym_cnd_clip) hook_addr(sym_cnd_clip, (uintptr_t)&hooked_CNullDriver_getMaxUserClipPlanes);
+    uintptr_t sym_cnd_buf = (uintptr_t)so_symbol(&so_mod, "_ZN6glitch5video11CNullDriver12createBufferENS0_13E_BUFFER_TYPEENS0_14E_BUFFER_USAGEEjPvb");
+    if (sym_cnd_buf) {
+        uint32_t w1 = *(volatile uint32_t *)sym_cnd_buf;
+        uint32_t w2 = *(volatile uint32_t *)(sym_cnd_buf + 4);
+        if (w1 == 0xe92d45f0u && w2 == 0xe24dd00cu) {
+            g_resume_cnd_createbuffer = (uint32_t)(sym_cnd_buf + 8);
+            hook_addr(sym_cnd_buf, (uintptr_t)&hooked_CNullDriver_createBuffer);
+        } else {
+            l_error("[patch] sin hook en CNullDriver::createBuffer: prologo 0x%08X 0x%08X inesperado",
+                    (unsigned)w1, (unsigned)w2);
+        }
+    }
 
     // Rastreo del tramo MenuScene (ver comentario arriba): si el .so no es el
     // esperado, hook_trace lo reporta y sigue sin parchear ese punto.
@@ -1156,4 +1403,27 @@ void so_patch(void) {
     hook_trace(OFF_SCONSTRUCT, W_PUSH456LR, W_SUBS_R5R1, hook_sconstruct, 0, &g_resume_sconstruct, NULL);
     hook_trace(OFF_GETLANG, W_PUSH456LR, W2_LDR_R3_48, (void (*)(void))&hooked_GetLanguageString, 0, &g_resume_getlang, NULL);
     hook_trace(OFF_SETLANG, W_PUSH9, W2_SUB_SP68, hook_setlang, 0, &g_resume_setlang, NULL);
+
+    /*
+     * Bug #023: Crash previo a la carrera (TrackScene::LoadLevelGeometry).
+     * 1) Bypass del prefijo "IPAD2a_" para que todos los circuitos carguen <Track>.bdae.
+     * 2) Guarda NULL en el drop() del nodo retornado por constructScene().
+     */
+    uint32_t w_ipad2 = *(volatile uint32_t *)(so_mod.text_base + OFF_LOADGEOM_IPAD2);
+    if (w_ipad2 == W_CMP_R3_9) {
+        uint32_t b_skip = B_LOADGEOM_SKIP_IPAD2;
+        kuKernelCpuUnrestrictedMemcpy((void *)(so_mod.text_base + OFF_LOADGEOM_IPAD2), &b_skip, sizeof(b_skip));
+        l_info("[patch] TrackScene::LoadLevelGeometry: bypass IPAD2a_ instalado en +0x%X (b 0x46b114)",
+               (unsigned)OFF_LOADGEOM_IPAD2);
+    } else {
+        l_error("[patch] TrackScene::LoadLevelGeometry: sin bypass IPAD2a_ en +0x%X (palabra 0x%08X != 0x%08X)",
+                (unsigned)OFF_LOADGEOM_IPAD2, (unsigned)w_ipad2, (unsigned)W_CMP_R3_9);
+    }
+
+    g_skip_loadgeom = (uint32_t)(so_mod.text_base + 0x46B1ECu);
+    hook_trace(OFF_LOADGEOM_NODE, W_LDR_R4FP12, W2_LDR_R3R4, hook_loadgeom, 0, &g_resume_loadgeom, NULL);
+
+    // Log 038: bucle de copia sin cota en TrackingManager::updateSaveFile.
+    g_skip_trackcopy = (uint32_t)(so_mod.text_base + 0x558848u);
+    hook_trace(OFF_TRACKCOPY, W_MOV_R1_1, W2_MOV_R3R4, hook_trackcopy, 0, &g_resume_trackcopy, NULL);
 }

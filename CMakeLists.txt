@@ -139,7 +139,12 @@ set(VITAGL_LIB ${VITAGL_DIR}/libvitaGL.a)
 # via vitaShaRK). Su macro `vgl_log` está parcheada en
 # lib/vitaGL/source/utils/debug_utils.h para caer en NUESTRO archivo de log (implementación
 # en source/utils/glutil.c) en vez de en sceClibPrintf, que en retail no se puede leer.
-set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2")
+# Optimizaciones añadidas (README VITAGL.md):
+# - BUFFERS_SPEEDHACK=1: copias rapidas de vertex buffers evitando reallocations en glBufferSubData
+# - NO_TILE_CLIPPER=1: desactiva clipping de tiles para scissor testing, reduciendo carga de CPU
+# - NO_DMAC=1: usa memcpy rapido con NEON en vez de syscalls a sceDmacMemcpy
+# - NO_TEX_COMBINER=1: elimina overhead de texture combiners (el juego usa shaders GLSL)
+set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2 BUFFERS_SPEEDHACK=1 NO_TEX_COMBINER=1 NO_DMAC=1 NO_TILE_CLIPPER=1")
 separate_arguments(VITAGL_MAKE_ARGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS}")
 
 # Forzar rebuild completo de vitaGL cuando VITAGL_MAKE_FLAGS cambie (la regla

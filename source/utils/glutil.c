@@ -254,22 +254,28 @@ void glLinkProgram_soloader(GLuint program) {
 }
 
 void glUseProgram_soloader(GLuint program) {
+#ifdef TRACE_GL_CALLS
     BC_SCOPE("glUseProgram");
     gl_trace("[gl] glUseProgram program=%u", (unsigned)program);
+#endif
     glUseProgram(program);
 }
 
 void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
+#ifdef TRACE_GL_CALLS
     BC_SCOPE("glDrawArrays");
     gl_trace("[gl] glDrawArrays mode=0x%x first=%d count=%d",
              (unsigned)mode, (int)first, (int)count);
+#endif
     glDrawArrays(mode, first, count);
 }
 
 void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+#ifdef TRACE_GL_CALLS
     BC_SCOPE("glDrawElements");
     gl_trace("[gl] glDrawElements mode=0x%x count=%d type=0x%x idx=%p",
              (unsigned)mode, (int)count, (unsigned)type, indices);
+#endif
     glDrawElements(mode, count, type, indices);
 }
 
@@ -291,19 +297,27 @@ void glFlush_soloader(void) {
 }
 
 GLint glGetUniformLocation_soloader(GLuint program, const GLchar *name) {
+#ifdef TRACE_GL_CALLS
     BC_SCOPE("glGetUniformLocation");
     GLint loc = glGetUniformLocation(program, name ? name : "");
     gl_trace("[gl] glGetUniformLocation prog=%u name='%.64s' -> %d",
              (unsigned)program, name ? name : "(null)", (int)loc);
     return loc;
+#else
+    return glGetUniformLocation(program, name ? name : "");
+#endif
 }
 
 GLint glGetAttribLocation_soloader(GLuint program, const GLchar *name) {
+#ifdef TRACE_GL_CALLS
     BC_SCOPE("glGetAttribLocation");
     GLint loc = glGetAttribLocation(program, name ? name : "");
     gl_trace("[gl] glGetAttribLocation prog=%u name='%.64s' -> %d",
              (unsigned)program, name ? name : "(null)", (int)loc);
     return loc;
+#else
+    return glGetAttribLocation(program, name ? name : "");
+#endif
 }
 
 /*

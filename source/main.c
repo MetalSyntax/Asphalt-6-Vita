@@ -4,6 +4,7 @@
 #include "utils/logger.h"
 #include "utils/touch.h"
 #include "utils/watchdog.h"
+#include "video.h"
 
 #include <stdlib.h>
 
@@ -33,6 +34,16 @@ so_module so_mod;
 extern void java_init_static_strings(void);
 
 int main() {
+    // Canario de arranque: garantiza que TODA corrida cree su asphalt6_NNN.log y
+    // avance next.idx antes de tocar código que pueda crashear (so_util cargando
+    // el .so, JNI_OnLoad, etc.). Sin esto, un data abort temprano deja el .psp2dmp
+    // pero NINGÚN log -- next.idx queda huérfano apuntando al número que debía
+    // haberse creado (bug confirmado: corrida sin log tras Bug #024/#025).
+    // Se llama a _log_print() directo (no al macro l_info/l_debug) porque esos
+    // macros no generan código fuera de builds Debug (ver logger.h) y este canario
+    // tiene que existir también en Release.
+    _log_print(LT_INFO, "boot: arrancando main()");
+
     soloader_init_all();
 
     // El testigo y las migas van ANTES de JNI_OnLoad: el .so crea sus hilos de trabajo
@@ -58,6 +69,38 @@ int main() {
 
     gl_init();
     gl_report_mem("tras vglInit");
+
+    // FMV de intro (com.gameloft...GLMediaPlayer). En Android real la Activity
+    // dispara esto ANTES de crear la GLSurfaceView, con un método Java `native
+    // void nativeLoadMovie(String)` que reenvía a GLMediaPlayer.loadMovie() --
+    // acá no hay VM/Activity real que lo llame por su cuenta, así que lo hacemos
+    // nosotros. video_init() necesita GXM ya inicializado (gl_init() arriba)
+    // porque su allocator de framebuffers de video mapea memoria a la GPU.
+    // GLMediaPlayer_nativeInit debe correr ANTES: resuelve el jmethodID real de
+    // "loadMovie" (y de paso ~40 métodos de audio de vox::DriverAndroid, sin
+    // implementar todavía) contra el que nativeLoadMovie hace su
+    // CallStaticVoidMethod -- sin esto el jmethodID queda en 0 y FalsoJNI
+    // descarta la llamada silenciosamente ("method ID 0 not found").
+    void (* GLMediaPlayer_nativeInit)(void *env, void *clazz) =
+        (void *)so_symbol(&so_mod, "Java_com_gameloft_android_ANMP_GloftA6HP_GLMediaPlayer_nativeInit");
+    if (GLMediaPlayer_nativeInit) {
+        l_info("video: GLMediaPlayer_nativeInit @ %p, llamando...", GLMediaPlayer_nativeInit);
+        GLMediaPlayer_nativeInit(&jni, NULL);
+        l_info("video: GLMediaPlayer_nativeInit retornó");
+    } else {
+        l_error("video: so_symbol(GLMediaPlayer_nativeInit) no encontró el símbolo");
+    }
+
+    video_init();
+
+    void (* nativeLoadMovie)(const char *name) = (void *)so_symbol(&so_mod, "nativeLoadMovie");
+    if (nativeLoadMovie) {
+        l_info("video: nativeLoadMovie @ %p, llamando con \"intro.mp4\"...", nativeLoadMovie);
+        nativeLoadMovie("intro.mp4");
+        l_info("video: nativeLoadMovie retornó");
+    } else {
+        l_error("video: so_symbol(nativeLoadMovie) no encontró el símbolo");
+    }
 
     // Ciclo de vida real del motor (Gameloft GLGame/GameRenderer), resuelto por nombre
     // ya que el .so no llama a estas funciones por sí solo (las llama la VM de Android

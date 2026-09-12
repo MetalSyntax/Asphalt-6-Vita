@@ -53,6 +53,18 @@ static bool remap_gameloft_sdcard_path(const char * path, char * out, size_t out
     return true;
 }
 
+// Fallback defensivo (Bug #023): si un asset hace referencia a "IPAD2a_<Name>",
+// quita el prefijo "IPAD2a_" para intentar resolver "<Name>" en el data set de Android.
+static bool strip_ipad2_prefix(const char * path, char * out, size_t out_size) {
+    const char * p = strstr(path, "IPAD2a_");
+    if (!p)
+        return false;
+
+    size_t head_len = (size_t)(p - path);
+    snprintf(out, out_size, "%.*s%s", (int)head_len, path, p + strlen("IPAD2a_"));
+    return true;
+}
+
 FILE * fopen_soloader(const char * filename, const char * mode) {
     bc_event("fopen", BC_RA);
     if (strcmp(filename, "/proc/cpuinfo") == 0) {
@@ -71,6 +83,15 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
 #else
     FILE* ret = fopen(filename, mode);
 #endif
+
+    if (!ret && strip_ipad2_prefix(filename, remapped, sizeof(remapped))) {
+        l_info("[io] Fallback IPAD2a_: reintentando fopen('%s')", remapped);
+#ifdef USE_SCELIBC_IO
+        ret = sceLibcBridge_fopen(remapped, mode);
+#else
+        ret = fopen(remapped, mode);
+#endif
+    }
 
     if (ret)
         l_debug("fopen(%s, %s): %p", filename, mode, ret);
@@ -104,6 +125,11 @@ int open_soloader(const char * path, int oflag, ...) {
 
     oflag = oflags_bionic_to_newlib(oflag);
     int ret = open(path, oflag, mode);
+    if (ret < 0 && strip_ipad2_prefix(path, remapped, sizeof(remapped))) {
+        l_info("[io] Fallback IPAD2a_: reintentando open('%s')", remapped);
+        ret = open(remapped, oflag, mode);
+    }
+
     if (ret >= 0)
         l_debug("open(%s, %x): %i", path, oflag, ret);
     else
@@ -131,6 +157,10 @@ int stat_soloader(const char * path, stat64_bionic * buf) {
 
     struct stat st;
     int res = stat(path, &st);
+    if (res != 0 && strip_ipad2_prefix(path, remapped, sizeof(remapped))) {
+        l_info("[io] Fallback IPAD2a_: reintentando stat('%s')", remapped);
+        res = stat(remapped, &st);
+    }
 
     if (res == 0)
         stat_newlib_to_bionic(&st, buf);
