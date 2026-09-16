@@ -1493,12 +1493,25 @@ void so_patch(void) {
 
     // Diagnostico CNullDriver (ver comentario arriba de los hooked_CNullDriver_*):
     // draw2DLine/getMaxUserClipPlanes se reemplazan 1:1 (son no-ops triviales).
-    // createBuffer ya fue confirmado en log 044 (llamadas legítimas de batching);
-    // su hook se desactiva para eliminar el spam de 3850 líneas y la pausa de 40s en storage.
+    // createBuffer se habia desactivado tras el log 044 para eliminar el spam de
+    // 3850 lineas y la pausa de 40s en storage -- el Bug #028 (colapso de lineas
+    // repetidas por sitio de llamada en logger.c) elimina ese costo de raiz, asi
+    // que se reactiva para retomar la pregunta que quedo abierta en el log 042:
+    // ¿el auto (u otros elementos que siguen desapareciendo) termina con este
+    // vtable nulo, o son 100% los 2 `this` de batching ya confirmados? Sin el
+    // `lr` de esta corrida no hay forma de saberlo sin adivinar.
     uintptr_t sym_cnd_line = (uintptr_t)so_symbol(&so_mod, "_ZN6glitch5video11CNullDriver10draw2DLineERKNS_4core10position2dIiEES6_NS0_6SColorE");
     if (sym_cnd_line) hook_addr(sym_cnd_line, (uintptr_t)&hooked_CNullDriver_draw2DLine);
     uintptr_t sym_cnd_clip = (uintptr_t)so_symbol(&so_mod, "_ZNK6glitch5video11CNullDriver20getMaxUserClipPlanesEv");
     if (sym_cnd_clip) hook_addr(sym_cnd_clip, (uintptr_t)&hooked_CNullDriver_getMaxUserClipPlanes);
+    uintptr_t sym_cnd_createbuffer = (uintptr_t)so_symbol(&so_mod,
+        "_ZN6glitch5video11CNullDriver12createBufferENS0_13E_BUFFER_TYPEENS0_14E_BUFFER_USAGEEjPvb");
+    if (sym_cnd_createbuffer) {
+        // Prologo verificado con objdump: push {r4-r8,sl,lr} + sub sp,sp,#12,
+        // las mismas 2 palabras que el stub emula -- resume 8 bytes despues.
+        g_resume_cnd_createbuffer = (uint32_t)(sym_cnd_createbuffer + 8);
+        hook_addr(sym_cnd_createbuffer, (uintptr_t)&hooked_CNullDriver_createBuffer);
+    }
 
     // Rastreo del tramo MenuScene (ver comentario arriba): si el .so no es el
     // esperado, hook_trace lo reporta y sigue sin parchear ese punto.

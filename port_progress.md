@@ -2754,3 +2754,64 @@ El hook de diagnóstico sobre `CNullDriver::createBuffer` en `source/patch.c` ej
 
 **Verificación:** Compilación limpia completada con `psvita-toolkit build --preset debug`, generando `asphalt6.vpk` y `eboot.bin` actualizados.
 
+### Log 046 — mejora confirmada (24-30 FPS) pero el auto/otros elementos siguen desapareciendo; causa raíz encontrada para el glitch de ventanillas — 2026-09-15
+
+**Log:** `logs/asphalt6_046.log` (11106 líneas). **Reportado por el usuario en consola real:**
+el juego ya corre a 24-30 FPS (antes del #028 se sentía congelado), y el glitch gráfico que
+antes cubría el vehículo ENTERO (Bug #030 causa raíz #2) ahora se limita a las ventanillas —
+ambas mejoras coinciden con lo esperado de los fixes #028/#030. Pero **persisten dos síntomas
+sin resolver:** el auto del jugador (y otros vehículos) siguen desapareciendo por completo de
+forma intermitente, y "otros elementos" del juego también desaparecen — el hook
+`isCulled -> ret0` del Bug #030 NO fue suficiente para eliminar esto, contra lo que se esperaba
+al adoptarlo de Dungeon Hunter 2 sin una corrida de confirmación propia.
+
+**Hallazgo #1 — causa raíz confirmada del glitch de ventanillas (pseudo-C, sin adivinar):**
+`out_ghidra.c:175398` (una función de resolución de textura, camino de
+`glitch::collada::CResFactory::getTextureImpl`) hace un caso especial: si el nombre de textura
+solicitado contiene la subcadena `"Car_Body_Reflection"` (`FUN_0052de10`, un
+find()/strstr()-like que devuelve `-1` si no está), arma un nombre alternativo agregando el
+sufijo `"_Fixed.PVRTC4.tga"` — es decir, busca una variante PRE-COMPRIMIDA PowerVR del mapa de
+reflexión del auto. Esto es coherente con que la GPU real de la Vita SEA PowerVR (vitaGL
+anuncia `GL_IMG_texture_compression_pvrtc` de verdad, `lib/vitaGL/source/get_info.c:63` — no es
+un falso positivo de detección). El log 046 confirma el fallo:
+`[WARNING] fopen(ux0:data/asphalt6/data/BMW_Mini_2010_Bahamas_Car_Body_Reflection_ForShader.png, rb): 0x0`
+y `[WARNING] fopen(ux0:data/asphalt6/data/Car_Body_Reflection._Fixed.PVRTC4.tga, rb): 0x0` — NINGUNA
+de las dos variantes existe en el mirror local (`ux0_data/asphalt6/data`, verificado con `find`,
+0 coincidencias). Si `getTextureImpl` devuelve NULL para esta textura (visto en el pseudo-C:
+`if (local_ec[0] == 0) { *param_1 = 0; }`), el material de reflexión del auto queda con un
+puntero de textura nulo — el mismo material que usan las ventanillas (superficie más reflectiva
+del modelo), consistente con que sean justo ellas las que muestran el artefacto. **Esto es un
+hueco de EXTRACCIÓN DE ASSETS, no un bug de código:** el archivo de reflexión PVRTC4 nunca se
+copió al `ux0_data` local (ni existe en `asphalt6_extract/assets` ni en `Asphalt-6-Adrenaline/assets`
+— ninguna de las dos copias extraídas del APK lo trae). Pendiente de decidir: (a) localizar y
+empaquetar el asset real, o (b) agregar una guarda en el `.so` (mismo patrón que #026/#027) que
+salte el binding de textura nula en vez de dejar el material en un estado indefinido — la opción
+(b) necesita ubicar y verificar por disassembly el call site exacto antes de tocar nada (no
+intentado esta sesión).
+
+**Hallazgo #2 — el auto/otros elementos NO desaparecen (solo) por culling:** dado que el hook
+`isCulled -> ret0` de Bug #030 ya está activo y el síntoma persiste, el frustum culling queda
+descartado como única causa. La investigación de Log 042 (punto 1: ¿el auto termina con el
+vtable de `CNullDriver`, un driver "no-op" que no dibuja nada?) había quedado abierta
+explícitamente a la espera de "evidencia nueva si el auto sigue invisible después de descartar
+otras causas" — que es exactamente la situación actual. El hook de diagnóstico sobre
+`CNullDriver::createBuffer` (que logueaba el `lr`/llamador real) se había desactivado en Bug #030
+por el costo de storage del spam — costo que el Bug #028 ya eliminó de raíz (colapso de líneas
+repetidas por sitio de llamada). Se **reactiva el hook** en `source/patch.c::so_patch()`
+(`sym_cnd_createbuffer`, verificado con `objdump` que el prólogo real —
+`push {r4-r8,sl,lr}` + `sub sp,sp,#12`— coincide exactamente con las 2 palabras que el stub
+`hooked_CNullDriver_createBuffer` ya emulaba, sin tocar el stub en sí) para que el PRÓXIMO log
+diga, sin adivinar, si los objetos que llaman a `createBuffer` sobre el driver nulo incluyen al
+auto del jugador o a los "otros elementos" que desaparecen, o si siguen siendo exclusivamente
+los 2 `this` de batching ya confirmados como legítimos en el log 044 (en cuyo caso la causa de
+la desaparición está en otro lado y hay que seguir buscando). Build Debug verificado
+(`psvita-toolkit build --preset debug` limpio).
+
+**Cómo leer el próximo log:** buscar `[patch] CNullDriver::createBuffer this=0x... llamador=libasphalt6.so+0x...`
+durante una carrera donde el auto desaparezca — si el `llamador` resuelve a código de
+`RaceCar`/`GS_Race` (no a `CBatchDriver::thisAppendBatch`/`CAppendMeshBuffer` como en el 044), es
+la confirmación que faltaba. Si NO aparece ningún `createBuffer` nuevo fuera de los 2 `this` de
+siempre mientras el auto desaparece, la hipótesis de `CNullDriver` queda descartada definitivamente
+y hay que abrir una sesión de RE sobre otro candidato (p.ej. el mismo mecanismo de "byte de
+visibilidad 0x9b" de los Bugs #026-#028, pero aplicado a nodos de escena en vez de UI).
+
