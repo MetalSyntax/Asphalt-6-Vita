@@ -129,27 +129,31 @@ add_dependencies(${CMAKE_PROJECT_NAME} SceLibcBridge)
 set(VITAGL_DIR ${CMAKE_SOURCE_DIR}/lib/vitaGL)
 set(VITAGL_LIB ${VITAGL_DIR}/libvitaGL.a)
 
-# Mismo set probado en Asphalt-5-Vita (y asphalt8-vita-main): DRAW_SPEEDHACK=2
-# (-DSAFER_DRAW_SPEEDHACK) evita que draws grandes agoten/corrompan el temp
-# pool circular de vertices (causa de GPU hangs en A5 Bugs #19/#20/#22);
+# Mismo set base probado en Asphalt-5-Vita y asphalt8-vita-main (release):
+# SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2.
+# DRAW_SPEEDHACK=2 (-DSAFER_DRAW_SPEEDHACK) evita que draws grandes agoten/corrompan
+# el temp pool circular de vertices (causa de GPU hangs en A5 Bugs #19/#20/#22);
 # HAVE_SHADER_CACHE=1 activa el cache oficial de vitaGL (default
-# ux0:data/shader_cache, sin llamar nada desde el loader); sin MATH_SPEEDHACK
-# ni HAVE_SHARK_LOG.
-# LOG_ERRORS=1 hace que vitaGL reporte sus fallos internos (registro de programas en el
-# shader patcher, allocations fallidas, overrun del circular pool, errores del compilador Cg
-# via vitaShaRK). Su macro `vgl_log` está parcheada en
+# ux0:data/shader_cache, sin llamar nada desde el loader).
+#
+# Se REVIRTIERON acá 5 hacks adicionales (NO_DMAC, CIRCULAR_POOL_SPEEDHACK,
+# SAMPLERS_SPEEDHACK, NO_TEX_COMBINER, MATH_SPEEDHACK) que una sesión anterior había
+# adoptado de Dungeon Hunter 2 -- ninguno está en el set de A5/A8, los 4 primeros están
+# marcados "May cause glitches" en README VITAGL.md, y el propio DH2 (de donde salieron)
+# tiene como bug abierto y sin resolver "algunos enemigos se renderizan invisibles" +
+# bajo framerate en combate (ver su README.md) -- exactamente la misma familia de síntoma
+# que veníamos peleando acá (elementos/vehículos que desaparecen). No hay evidencia de que
+# alguno de los 5 sea la causa puntual del glitch de ventanillas (Bug de Log 046, un asset
+# de reflexión faltante) ni del cuelgue de `CBatchDriver::thisAppendBatch` (Log 047, un
+# problema de CPU/algoritmo, no de flags de GPU), pero tampoco hay evidencia de que hagan
+# falta: ninguno de los dos ports hermanos que sí llegan a un estado pulido los usa.
+# LOG_ERRORS=1 se mantiene a propósito (no es un hack de rendimiento, no aparece en la
+# tabla "Hack Flags" del README): hace que vitaGL reporte sus fallos internos (registro de
+# programas en el shader patcher, allocations fallidas, overrun del circular pool, errores
+# del compilador Cg vía vitaShaRK). Su macro `vgl_log` está parcheada en
 # lib/vitaGL/source/utils/debug_utils.h para caer en NUESTRO archivo de log (implementación
 # en source/utils/glutil.c) en vez de en sceClibPrintf, que en retail no se puede leer.
-# Optimizaciones adoptadas de Dungeon Hunter 2 (ver README VITAGL.md y DH2 PORTING_PLAN.md):
-# - DRAW_SPEEDHACK=2: evita desbordes en el circular pool de vertices durante draws grandes
-# - NO_DMAC=1: usa memcpy rapido con NEON en espacio de usuario en vez de syscalls a sceDmacMemcpy
-# - CIRCULAR_POOL_SPEEDHACK=1: reduce drasticamente el overhead de CPU en reservas de vertices
-# - SAMPLERS_SPEEDHACK=1: acelera el binding de samplers de texturas
-# - NO_TEX_COMBINER=1: elimina overhead de texture combiners (el juego usa 100% shaders GLSL)
-# - MATH_SPEEDHACK=1: matematica interna mas rapida
-# Se EXCLUYE BUFFERS_SPEEDHACK=1: provoca condicion de carrera CPU/GPU en glBufferSubData
-# sobre los VBOs de los vehiculos (ruedas, suspension, geometria animada), causando el glitch grafico.
-set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2 NO_DMAC=1 SAMPLERS_SPEEDHACK=1 CIRCULAR_POOL_SPEEDHACK=1 NO_TEX_COMBINER=1 MATH_SPEEDHACK=1")
+set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2")
 separate_arguments(VITAGL_MAKE_ARGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS}")
 
 # Forzar rebuild completo de vitaGL cuando VITAGL_MAKE_FLAGS cambie (la regla

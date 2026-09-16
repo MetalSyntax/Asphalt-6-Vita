@@ -2877,3 +2877,56 @@ patrón (`CNullDriver::createBuffer` alternando sin parar entre los mismos 2 `th
 frames), es la misma causa. Si aparecen OTROS `this`/llamadores durante una desaparición sin el
 patrón de cuelgue de 35s, es una causa distinta y hay que triagearla aparte.
 
+### Bug #031 — Se revierten 5 speedhacks de vitaGL adoptados de Dungeon Hunter 2, sin evidencia propia y marcados "may cause glitches" (`CMakeLists.txt`) — 2026-09-16
+
+**Motivo:** el usuario notó que `CMakeLists.txt` había divergido de los dos ports hermanos más
+cercanos (`Asphalt-5-Vita` y `asphalt8-vita-main`, en `Docs and Zips/`) y sospechó que la
+compilación en sí -- no solo el `.so` -- podía ser parte de los "errores gráficos" reportados en
+los logs 044-047 (ventanillas con glitch, auto/elementos que desaparecen).
+
+**Comparación (`VITAGL_MAKE_FLAGS`, las tres fuentes leídas directamente):**
+
+| Puerto | Flags |
+|---|---|
+| **Asphalt-5-Vita** | `SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2` |
+| **asphalt8-vita-main** (release) | `SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2` |
+| **Asphalt-6-Vita** (antes de este bug) | lo mismo de arriba **+** `LOG_ERRORS=1 NO_DMAC=1 SAMPLERS_SPEEDHACK=1 CIRCULAR_POOL_SPEEDHACK=1 NO_TEX_COMBINER=1 MATH_SPEEDHACK=1` |
+
+Los 5 flags de más (`NO_DMAC`, `SAMPLERS_SPEEDHACK`, `CIRCULAR_POOL_SPEEDHACK`,
+`NO_TEX_COMBINER`, `MATH_SPEEDHACK`) habían entrado en el commit `9e2e255` ("Intro FMV +
+guardas + speedhacks vitaGL") con el comentario "adoptadas de Dungeon Hunter 2" -- correcto en
+cuanto al origen, pero **ninguno de los dos ports que sí llegan a un estado pulido (A5, A8) los
+usa**, y 4 de los 5 (todos menos `NO_DMAC`, que es un flag "Misc" no "Hack") están listados
+textualmente como **"May cause glitches"** en `README VITAGL.md`. Más revelador todavía: el
+propio `Dungeon-Hunter-2-vita/README.md` (de donde salió la adopción) lista como bug abierto y
+sin resolver **"algunos enemigos se renderizan invisibles"** y **bajo framerate en combate** --
+exactamente la misma familia de síntoma que veníamos peleando acá (vehículos/elementos que
+desaparecen, bajones de FPS). No es una prueba de causa-efecto (el cuelgue confirmado de
+`CBatchDriver::thisAppendBatch` del Log 047 es un problema de CPU/algoritmo del `.so`, ajeno a
+estos flags de vitaGL, y el glitch de ventanillas del Log 046 es un asset de textura faltante,
+también ajeno), pero es una correlación fuerte que no tenía por qué estar ahí: adoptar hacks
+"puede causar glitches" de un port que **admite tener ese mismo tipo de glitch sin resolver**,
+sin haber confirmado en esta consola que hicieran falta, es exactamente el tipo de riesgo
+innecesario que el usuario señaló.
+
+**Fix aplicado:** `VITAGL_MAKE_FLAGS` vuelve al set base de A5/A8:
+`SOFTFP_ABI=1 NO_DEBUG=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2`.
+Se mantiene `LOG_ERRORS=1` a propósito (no está en la tabla "Hack Flags" del README, es pura
+redirección de errores internos de vitaGL a nuestro log unificado, cero riesgo de comportamiento
+en runtime) -- es la única diferencia deliberada contra el set literal de A5/A8. `DRAW_SPEEDHACK=2`
+se mantiene porque SÍ está en las tres fuentes y tiene una justificación propia documentada
+(evita agotar/corromper el circular pool de vértices en draws grandes, causa confirmada de GPU
+hangs en Asphalt 5 Bugs #19/#20/#22). No se tocó `-Wl,--allow-multiple-definition` en
+`CMAKE_C_FLAGS`: es un flag de LINKER (no afecta el runtime gráfico) necesario porque
+`source/reimpl/egl.c` redefine a propósito símbolos que también trae `libvitaGL.a` -- sacarlo
+rompería el link, no arreglaría ningún glitch, así que esta es una divergencia intencional
+contra A5 (que no lo necesita porque su `egl.c` no pisa esos símbolos de la misma forma).
+
+**Verificación:** `psvita-toolkit build --preset debug` limpio, con un rebuild completo y
+confirmado de vitaGL (`[patch] Building vendorized vitaGL...` corrió con el flag set nuevo).
+**Pendiente:** confirmar en consola real que el glitch de ventanillas / las desapariciones no
+empeoraron ni mejoraron por este cambio -- no se esperaba que lo arreglara del todo (las causas
+raíz de #046/#047 siguen siendo las documentadas ahí), pero si alguno de los 5 flags revertidos
+resulta haber sido la causa de algún síntoma adicional no diagnosticado todavía, el próximo log
+debería mostrarlo mejorado.
+
