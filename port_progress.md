@@ -2815,3 +2815,65 @@ siempre mientras el auto desaparece, la hipótesis de `CNullDriver` queda descar
 y hay que abrir una sesión de RE sobre otro candidato (p.ej. el mismo mecanismo de "byte de
 visibilidad 0x9b" de los Bugs #026-#028, pero aplicado a nodos de escena en vez de UI).
 
+### Log 047 — SE ENCONTRÓ el cuelgue real de 35+ s: `CBatchDriver::thisAppendBatch` no es una "pasada de conteo" de una sola vez (corrige la lectura del log 044) — 2026-09-15
+
+**Log:** `logs/asphalt6_047.log` (10231 líneas). **Reportado por el usuario:** bajones de FPS,
+el menú de pausa sigue roto (esperado, sin cambios — Bugs #026-#028 no tocan la causa de fondo
+de `Find("menu_main")`/`Find("back_btn_main")` devolviendo NULL, solo dejan de saturar el log
+por eso), y los elementos siguen apareciendo/desapareciendo.
+
+**El testigo (`[wd]`) confirma un cuelgue REAL, no solo bajones subjetivos:** línea 5316,
+`nativeRender ENTRA #4701 hace 35441 ms` — el hilo principal quedó **35+ segundos sin avanzar
+un solo frame**, con el hilo `ASPHALT06` en estado `CORRIENDO` (no bloqueado) consumiendo CPU
+sin parar (`+103996 reservas` en una sola ventana de 5 s, contra un baseline normal de
+~4800/5s en los tramos fluidos del mismo log). El volcado de `[bc]` durante el cuelgue
+(líneas 3419-3499+) muestra al hilo principal llamando `CNullDriver::createBuffer`
+INTERCALADO entre cada entrada del anillo, alternando sin parar entre **los mismos 2 `this`**
+que el log 044 ya había visto: `0x812808F8` (llamador `+0x7E77C8`) y `0x81280900` (llamador
+`+0x7E7F7C`) — ambos resuelven, como antes, a
+`glitch::video::CBatchDriver::thisAppendBatch(...)`.
+
+**Esto corrige la conclusión del log 044.** La lectura anterior ("una pasada de conteo/medición
+contra un driver no-op para calcular tamaños antes de alocar los buffers reales, trabajo
+legítimo de motor, no bug") asumía que era una pasada de UNA sola vez al cargar el circuito.
+Leyendo el pseudo-C esta sesión (`out_ghidra.c:597780` en adelante):
+`glitch::video::CBatchDriver::draw(...)` es **literalmente**
+`{ thisAppendBatch(this, param_1, param_2, param_4); return; }` — o sea, `thisAppendBatch` NO es
+una pasada de conteo: **es la implementación real de cada draw call que pasa por un
+`CBatchDriver`**, con un `std::map<unsigned short, unsigned short>` interno (visto en las
+variables locales, `_Rb_tree<unsigned_short,...>`) para soldar/deduplicar vértices antes de
+acumularlos en un batch, que después se vuelca a la GPU real con `drawPendingBatch()` (visto en
+`IVideoDriver::appendBatch`, `out_ghidra.c:605369` en adelante). Es decir: **mientras el batch
+no termina de acumularse y volcarse, lo que sea que esté esperando ese flush no se dibuja** —
+un mecanismo perfectamente compatible con "el auto/otros elementos desaparecen mientras dura el
+cuelgue" y con los bajones de FPS (es 100% trabajo de CPU real, no I/O ni espera de lock).
+
+**Lo que SIGUE sin confirmarse (necesita su propia sesión de RE, no un parche a ciegas):**
+- Por qué esta soldadura de vértices tarda 35+ segundos reales en DOS objetos puntuales que
+  parecen ser instancias fijas por-nivel (los mismos 2 `this` desde el log 044, no una instancia
+  por auto) — candidatos sin confirmar: un caso degenerado del comparador del `std::map` (muchos
+  vértices con la misma clave forzando reorganizaciones costosas del árbol rojo-negro), o un
+  disparador que re-arma el batch con muchísima más frecuencia de la debida en este port (p.ej.
+  ligado al mismo sistema de grilla espacial que `CustomBatchGridSceneNode`, ya tocado en
+  `source/patch.c` para el menú, pero acá aplicado a geometría de pista — sin confirmar si existe
+  un análogo para la carrera).
+  - Por qué son SIEMPRE los mismos 2 `this` y no una instancia por vehículo/objeto — sugiere que
+  son drivers de batching fijos del NIVEL (p.ej. uno para geometría opaca y otro para
+  transparente de Bahamas), no por-entidad; si es así, la desaparición de MÚLTIPLES tipos de
+  elementos distintos (auto, "otros elementos") durante el mismo cuelgue tendría una única causa
+  compartida, no una por objeto.
+
+**No se aplicó ningún parche esta sesión sobre este hallazgo:** `thisAppendBatch` es una función
+de ~1000 líneas de pseudo-C con manejo manual de un árbol rojo-negro y aritmética de punteros
+densa — exactamente el tipo de función donde un parche a ciegas costó las regresiones de los
+Bugs #017/#019 en el pasado. Necesita disassembly real (`arm-vita-eabi-objdump -M force-thumb`)
+del tramo específico donde el `lr` cae (`+0x7E77C8`/`+0x7E7F7C`, dentro de `thisAppendBatch`) y,
+si el toolchain lo permite, abrir el proyecto real de Ghidra (no solo el `.c` plano) para
+navegar el árbol de llamadas del disparador antes de tocar nada.
+
+**Cómo leer el próximo log:** si el cuelgue de 35+ s se puede reproducir de forma más acotada
+(p.ej. quedándose parado cerca de donde el auto desaparece) y el log resultante muestra el mismo
+patrón (`CNullDriver::createBuffer` alternando sin parar entre los mismos 2 `this`, sin avanzar
+frames), es la misma causa. Si aparecen OTROS `this`/llamadores durante una desaparición sin el
+patrón de cuelgue de 35s, es una causa distinta y hay que triagearla aparte.
+
