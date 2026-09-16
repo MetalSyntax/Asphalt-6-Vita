@@ -145,10 +145,9 @@ void gl_init() {
      */
     vglSetupRenderTargetScenesNum(8, 8);
 
-    // Paridad con Asphalt-5-Vita (probado en hardware): 12 MiB y MSAA NONE.
-    // El EGL que reportamos al juego dice SAMPLES=0 (egl.c), asi que forzar
-    // 4X aqui es inconsistente y un candidato a GPU hang tras el primer draw.
-    vglInitExtended(0, 960, 544, 12 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    // 24 MiB de pool interno para vitaGL (paridad con optimizacion de Dungeon Hunter 2):
+    // asegura espacio suficiente para compilacion de shaders GLSL en caliente y VBOs dinamicos.
+    vglInitExtended(0, 960, 544, 24 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
 }
 
 /*

@@ -14,6 +14,7 @@
 
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #define COLOR_RED    "\x1B[38;5;196m"
 #define COLOR_PINK   "\x1B[38;5;212m"
@@ -46,6 +47,49 @@ static char buffer_a[2048];
 static char buffer_b[2048];
 // Buffer C holds the plain (uncolourised) line written to the log file.
 static char buffer_c[2048];
+
+/*
+ * Bug #028 (log 044): guardas como StateRenderNull/IGMUpdate (source/patch.c) o el
+ * reenvio de FalsoJNI (fjni_log_sink, mas abajo) avisan "una vez" solo mientras la
+ * condicion que disparan es transitoria. Cuando deja de serlo -- el menu de pausa
+ * en carrera la dispara TODOS los frames, miles de veces en una sola corrida -- cada
+ * linea repetida hace un sceIoWrite SINCRONO a la SD (por eso el struct crudo en vez
+ * de stdio, ver el comentario de LOG_DIR): a esa frecuencia el I/O bloqueante ES el
+ * "se queda congelado" que reporta el usuario, no un sintoma cosmetico aparte.
+ *
+ * El log 044 muestra estos avisos INTERCALADOS con otros (dos líneas de FalsoJNI,
+ * una de IGMUpdate, una de StateRenderNull, y vuelta a empezar) -- comparar solo
+ * contra la última línea escrita habría dejado pasar la mayoría (cada una difiere
+ * de su vecina inmediata aunque sea idéntica a la de 4 líneas atrás). Por eso el
+ * colapso es POR SITIO DE LLAMADA: el puntero de `fmt` identifica el `l_error(...)`
+ * exacto que lo emitió (es un literal de .rodata, estable entre llamadas), y cada
+ * slot recuerda el contenido ya renderizado de ESE sitio para no confundir
+ * mensajes reenviados con contenido variable (`fjni_log_sink` reenvía texto de
+ * FalsoJNI distinto bajo el mismo `fmt`) con una repetición real. La primera
+ * línea de una racha (o cualquier cambio de contenido en el mismo sitio) se
+ * escribe siempre; mientras siga IDÉNTICA se cuenta sin tocar storage, con una
+ * reconfirmación cada LOG_COLLAPSE_EVERY para no perder la señal de "sigue
+ * pasando".
+ */
+#define LOG_COLLAPSE_EVERY   300
+#define LOG_THROTTLE_SLOTS   8
+#define LOG_THROTTLE_KEY_LEN 128
+
+typedef struct {
+    const char  *fmt;                     // identidad del sitio de llamada
+    char         text[LOG_THROTTLE_KEY_LEN]; // contenido ya renderizado (prefijo)
+    unsigned int text_len;
+    unsigned int count;
+} log_throttle_slot;
+
+static log_throttle_slot s_throttle[LOG_THROTTLE_SLOTS];
+
+// Los strings literales suelen caer alineados a 4 bytes: se descartan esos bits
+// para no desperdiciar entropía del hash en ceros siempre iguales.
+static log_throttle_slot *throttle_slot_for(const char *fmt) {
+    unsigned int idx = (unsigned int)(((uintptr_t)fmt >> 2) % LOG_THROTTLE_SLOTS);
+    return &s_throttle[idx];
+}
 
 /** Short tag for the file sink, where ANSI colour is just noise. */
 static const char * level_tag(int t) {
@@ -216,7 +260,35 @@ void _log_print(int t, const char* fmt, ...) {
         if (len > 0) {
             if ((unsigned int)len >= sizeof(buffer_c))
                 len = (int)sizeof(buffer_c) - 1;
-            sceIoWrite(_log_fd, buffer_c, (unsigned int)len);
+
+            // Ver el comentario de LOG_THROTTLE_SLOTS mas arriba: colapsa
+            // repeticiones exactas del mismo sitio de llamada en vez de escribir
+            // cada una, aunque vengan intercaladas con otras lineas distintas.
+            log_throttle_slot *slot = throttle_slot_for(fmt);
+            unsigned int key_len = (unsigned int)len < LOG_THROTTLE_KEY_LEN
+                                        ? (unsigned int)len : LOG_THROTTLE_KEY_LEN;
+            bool is_repeat = (slot->fmt == fmt) && (slot->text_len == key_len) &&
+                             sceClibMemcmp(buffer_c, slot->text, key_len) == 0;
+            if (is_repeat) {
+                slot->count++;
+            } else {
+                slot->fmt = fmt;
+                slot->text_len = key_len;
+                sceClibMemcpy(slot->text, buffer_c, key_len);
+                slot->count = 1;
+            }
+
+            if (!is_repeat || (slot->count % LOG_COLLAPSE_EVERY) == 0) {
+                unsigned int write_len = (unsigned int)len;
+                if (is_repeat && len > 1 && buffer_c[len - 1] == '\n') {
+                    int body = len - 1;
+                    int suf = sceClibSnprintf(buffer_c + body, sizeof(buffer_c) - (unsigned int)body,
+                                               " (x%u seguidas)\n", slot->count);
+                    if (suf > 0)
+                        write_len = (unsigned int)body + (unsigned int)suf;
+                }
+                sceIoWrite(_log_fd, buffer_c, write_len);
+            }
         }
     }
 

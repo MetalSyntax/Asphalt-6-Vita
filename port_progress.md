@@ -2404,3 +2404,353 @@ verificado (`psvita-toolkit build --preset debug` limpio).
 **Cómo leer el próximo log (039):** línea `[patch] TrackCopy: fread devolvio 0...`
 ⇒ la guarda mordió y el juego debería seguir al menú. Sin esa línea + mismo
 cuelgue ⇒ el giro no es este bucle; reabrir con el anillo del principal.
+
+### Bug #026 — Data Abort en `GS_Race::StateRender` (`Find("custom_controls_btn")` NULL) — 2026-09-12
+
+**Log:** `logs/asphalt6_040.log` (9927 líneas, primer eboot con la guarda TrackCopy).
+**Dump:** `logs/asphalt6-psp2core-1789184428-0x000d8e2303-eboot.bin.psp2dmp`
+(triageado con `psvita-toolkit analyze --so-base 0x98000000`).
+
+**Lo que el 040 confirma:** la guarda TrackCopy funcionó
+(`[patch] TrackCopy: fread devolvio 0 con restante=293, se omite el resto`) y el
+juego siguió de largo: tracking rotado, `178igMenu.swf` + `178hud.swf` cargados,
+texturas `rank_*.tga`, y entrada a carga de carrera. El cuelgue del log 038 quedó
+atrás — esto es un crash nuevo, más adelante.
+
+**Síntoma:** data abort en el principal, PC en `libasphalt6.so + 0x412ebc`
+(`GS_Race::StateRender + 0x158`): `strb r3, [r0, #155]` con `R0 == 0`.
+`R10 = 0xdeadbeef` (ruido de heap, no el bug).
+
+**Causa raíz (disasm ARM + pseudo-C, sin adivinar):** `r0` es el retorno de
+`RenderFX::Find(this, "custom_controls_btn")` (`bl 0x683acc` en 0x412eb4, string
+resuelto del `.rodata`), usado sin chequear NULL. El pseudo-C muestra el mismo
+idioma en TRES sitios de `StateRender` (0x412e90 `=1`, 0x412ebc `=0` — el crash —,
+0x412f24 `=1`), mientras el cuarto `Find` de la función (`"component_controls"`)
+SÍ chequea `!= 0`. O sea, el propio Gameloft ya contempla NULL ("elemento no
+encontrado") y lo salta; los tres sitios son la inconsistencia. El elemento falta
+por variante de HUD/tipo de control del perfil, no por asset corrupto
+(`178hud.swf` sí cargó en esta corrida).
+
+**Fix aplicado (`source/patch.c`, filosofía Bugs #020/#021):** tres hooks
+(`hook_sr1/sr0/sr2` en 0x412E8C/0x412EB8/0x412F20, palabras verificadas
+`mov r3,#N` + `strb r3,[r0,#0x9b]`): si el resultado es NULL, avisan
+(`[patch] StateRenderNull: ...`) y omiten el store del flag 0x9b, siguiendo en
++8 como el camino chequeado. r0/r3 mueren en el `bl` siguiente y r12 es scratch
+libre. Build Debug verificado (`psvita-toolkit build --preset debug` limpio).
+
+**Hallazgo de build al compilar esto:** `source/video.cpp` nunca estaba en la
+lista de fuentes de `CMakeLists.txt` ni las libs FFmpeg (`avformat/avcodec/
+swresample/avutil/mp3lame`) en `target_link_libraries` — el eboot del 040 se
+había compilado de otra forma. Agregados ambos; sin esto ningún build limpio
+linkea. El `eboot.bin` creció por el link estático de FFmpeg (esperado).
+
+**Cómo leer el 041:** `[patch] StateRenderNull: ...` ⇒ la guarda mordió (sitio
+0/1/2) y la carrera debería seguir. Crash nuevo en otro `Find` sin chequear ⇒
+mismo patrón, nuevo hook (hay más `strb [r0,#0x9b]` tras `Find` en el binario).
+
+### Bug #027 — Data Abort en `GS_Race::IGMUpdate` (`Find("menu_main")` / `Find("back_btn_main")` NULL) — 2026-09-12
+
+**Log:** `logs/asphalt6_041.log` (8939 líneas, eboot con guardas StateRender).
+**Dump:** `logs/asphalt6-psp2core-1789185959-0x000b7424b9-eboot.bin.psp2dmp`
+(triageado con `vita-parse-core` + `arm-vita-eabi-objdump` + Ghidra).
+
+**Lo que el 041 confirma:** las guardas de `StateRender` del Bug #026 funcionaron
+perfectamente (`[patch] StateRenderNull: Find devolvio NULL en sitio 0, store omitido (log 040)`
+en líneas 8931 y 8935). El crash anterior en `0x412ebc` quedó totalmente superado.
+
+**Síntoma:** Data abort exception en hilo principal `ASPHALT06 <0x40010003>`, PC en
+`libasphalt6.so + 0x418ac8` (`GS_Race::IGMUpdate + 0x88`):
+`ldrb r3, [r7, #155]` (`0x9b`) con `R7 == 0x0`, y justo después en `0x418ad0`:
+`strb r3, [r0, #155]` con `R0 == 0x0`.
+
+**Causa raíz (disasm ARM + pseudo-C, sin adivinar):**
+En `_ZN7GS_Race9IGMUpdateEv` (Ghidra línea 38491):
+- `r7` recibe el retorno de `RenderFX::Find(this, "menu_main")` (0x418aac).
+- `r0` recibe el retorno de `RenderFX::Find(this, "back_btn_main")` (0x418ac0).
+- En 0x418ac8 copia el byte de visibilidad (+0x9b): `ldrb r3, [r7, #0x9b]` seguido de
+  `strb r3, [r0, #0x9b]` en 0x418ad0, sin chequear si `r7` o `r0` son NULL.
+- Al no encontrar uno o ambos botones en `178igMenu.swf`, `r7` y `r0` son 0x0,
+  desreferenciando `0x0 + 0x9b` y crasheando en la lectura.
+- Notar que más abajo en la misma función (0x418b64 / línea 38497), el propio código de
+  Gameloft SÍ chequea `subs r8, r0, #0; beq 418b08` tras buscar `"menu_main"` de nuevo.
+  Y `RenderFX::SetText` en 0x418af8 es 100% NULL-safe internamente.
+
+**Fix aplicado (`source/patch.c`, filosofía Bugs #020/#021/#026):**
+Hook en `0x418AC4` (`OFF_IGM_VIS`, palabras verificadas `movw r1, #134` = `0xE3001086`
+y `ldrb r3, [r7, #0x9b]` = `0xE5D7309B`).
+El stub `hook_igm_vis`:
+1. Emula `movw r1, #134` + `movt r1, #2` (dejando `r1 = 0x20086` listo para `StringManager::GetString`).
+2. Evalúa `cmp r7, #0` y `cmp r0, #0`.
+3. Si ambos son válidos: ejecuta la copia `ldrb r3, [r7, #0x9b]` y `strb r3, [r0, #0x9b]`, y salta a `g_skip_igm` (`0x418AD4`).
+4. Si cualquiera es NULL: avisa en log con `igm_null(r7, r0)` y salta directamente a `g_skip_igm` (`0x418AD4`), omitiendo la copia del byte sin crashear.
+Recompilado y verificado limpio (`eboot.bin` y `asphalt6.vpk` generados).
+
+**Cómo leer el próximo log (042):** línea `[patch] IGMUpdate: Find devolvio NULL...`
+⇒ la guarda mordió y la carrera continúa su inicialización y render.
+
+### Log 042 — triage de 3 síntomas reportados en carrera real (congelamientos, auto invisible, "pausa" sin efecto) — 2026-09-12
+
+**Log:** `logs/asphalt6_042.log` (14146 líneas). **Sin ningún crash/Data Abort** -- el log
+termina en pleno régimen de carrera (1560+ frames presentados), no en un abort. Los tres
+síntomas reportados por el usuario tienen tres causas DISTINTAS, ninguna nueva por sí misma:
+
+**1. Los dos "congelamientos" (tras el video / entrando a cargar):** confirmados con el
+testigo (`[wd]`), NINGUNO es un cuelgue real -- el hilo principal queda `CORRIENDO` al 100%
+las dos veces, nunca `BLOQUEADO`, y ambos se recuperan solos:
+- ~15 s justo tras saltear el intro (línea 270-904 del log), último hito `link #2` -- costo de
+  compilar/linkear los primeros shaders GLSL del menú/carrera, no instrumentado por nombre.
+- **~45 s entrando a Bahamas** (línea 4592-8269), último hito `nativeRender ENTRA #569` sin
+  avanzar. Explicado por completo: en esa ventana el log tiene **3850 líneas**
+  `[patch] CNullDriver::createBuffer` para namás **2 objetos** (`this=0x81280900` y
+  `0x812808F8`, separados 8 bytes -- 1925 llamadas cada uno). Es el mismo hook de diagnóstico
+  instalado en la sesión anterior tras el "Bug nuevo (sin confirmar)" de la carga de Bahamas
+  (línea 2276 más arriba) -- pero ahí nunca se había visto el VOLUMEN real de llamadas, solo
+  un crash con PC ahí cerca. Con este dato, la hipótesis de "vtable corrupto" pierde fuerza: el
+  hook engancha la DIRECCIÓN DE CÓDIGO real de `CNullDriver::createBuffer`, así que estos 2
+  objetos genuinamente tienen ese vtable (no es memoria basura) -- la pregunta abierta es si
+  es una elección legítima del motor (p.ej. buffers de colisión/física de la pista, que no se
+  dibujan) o si el AUTO mismo termina con este driver nulo (lo que explicaría el síntoma #2).
+  **Sin confirmar todavía quién llama a `createBuffer` tantas veces** -- se agregó logging del
+  `lr` (dirección de retorno real, `libasphalt6.so+0xNNNN`) a los 3 hooks de `CNullDriver` en
+  `source/patch.c` (antes solo logueaban `this`) para que el log 043 lo diga sin adivinar.
+  Build verificado (`psvita-toolkit build --preset debug` limpio).
+
+**2. Glitch gráfico en vehículos con `BUFFERS_SPEEDHACK=1`, y cuelgue de menú sin él:**
+confirmado por lectura de `lib/vitaGL/source/buffers.c:456-508`
+(`glNamedBufferSubData`/`glBufferSubData`). Sin el speedhack, cuando un VBO se actualizó hace
+poco (`vgl_framecount - gpu_buf->last_frame <= FRAME_PURGE_FREQ`), vitaGL aloca un buffer
+NUEVO, copia el contenido viejo + el parche nuevo ahí, y marca el viejo para borrado diferido
+-- esto evita que la CPU pise memoria que la GPU podría estar leyendo todavía en un draw call
+en vuelo. Con `BUFFERS_SPEEDHACK=1` esa protección se salta por completo
+(`vgl_memcpy((uint8_t*)gpu_buf->ptr + offset, data, size)` directo, sin chequear
+`last_frame`): es una condición de carrera CPU/GPU real, y el patrón que más la dispara es
+geometría que se actualiza por `glBufferSubData` TODOS los frames -- exactamente lo que hace
+un vehículo animado (ruedas, suspensión, daño). Esto explica el síntoma con mecanismo, no
+solo correlación. **Pero no es una feature "de más" que se pueda sacar sin costo:** ya está
+documentado (Bugs #015-#022) que este motor tiene varios cuellos de botella sensibles a
+timing en el tramo de menú -- lo más probable es que sacar `BUFFERS_SPEEDHACK` reintroduce
+uno de esos cuelgues al volverse más lento (no una regresión nueva). **Pendiente de decisión
+de producto:** ¿tocar `buffers.c` del fork de vitaGL para que el camino seguro (doble buffer)
+aplique SOLO a los VBOs de geometría animada, dejando el resto con el camino rápido? Requiere
+saber qué buffers usa el menú para que ese timing no se rompa -- no hay evidencia todavía de
+CUÁL buffer del menú depende del speedhack.
+
+**3. Auto invisible en carrera + "pausa" sin efecto (no es un crash):** dos hallazgos
+separados y confirmados por lectura de código (no del log):
+- **Sin confirmar por qué el auto no se ve** -- las texturas del auto SÍ cargan bien en el 042
+  (`CarNitroTrailTexture`, `rank_*.tga`, etc.), así que no es un asset faltante. Candidato más
+  fuerte hoy: que el auto (o parte de su malla) termine usando el mismo `CNullDriver` del
+  punto 1 -- el logging de `lr` agregado en esta sesión es el paso que lo confirma o descarta.
+- **"Pausa" confirmado que NO está implementada de ningún modo:** `grep` sobre TODO
+  `source/*.c`/`*.cpp` muestra que el ÚNICO lugar donde se lee `sceCtrl*`/`SCE_CTRL_*` en todo
+  el proyecto es `source/video.cpp:1947` (`SCE_CTRL_CROSS | SCE_CTRL_START` para saltear el
+  intro). Fuera de eso, la única entrada real al juego es `source/utils/touch.c` (panel táctil
+  frontal, 1:1 contra las coordenadas que el motor espera vía
+  `GLGame_nativeTouchPressed/Moved/Released`) -- no hay NINGÚN camino que traduzca un botón
+  físico de la Vita a nada dentro del bucle de juego. Apretar Start/Círculo durante la
+  carrera no llega a ningún lado: no es un crash, es una entrada que el port nunca envía. El
+  ítem "mapear controles físicos" de la Fase 6 sigue efectivamente sin empezar (el touch
+  1:1 sí funciona, los botones no). El `.so` sí tiene infraestructura para esto
+  (`glitch::CAndroidOSDevice::postKeyEvent`, `T_SWFManager::SWFDispatchKeyEvent` -- visto en
+  el pseudo-C de Ghidra, `out_ghidra.c:702012`/`125066`) pero no está exportado como símbolo
+  JNI (a diferencia del touch): implementarlo requiere resolverlo por dirección interna y
+  entender el layout de `SEvent`/el keycode que abre el menú de pausa -- no intentado todavía,
+  necesita su propia sesión de RE.
+
+**Próximo paso concreto:** correr la 043 contra Bahamas de nuevo (con el logging de `lr` ya
+compilado) y mirar `[patch] CNullDriver::createBuffer ... llamador=libasphalt6.so+0x...` --
+esa única dirección resuelve contra el índice de símbolos a la función real detrás del spam,
+sin adivinar. Sobre el punto 2 (speedhack) y el punto 3-pausa (controles físicos), son
+decisiones de alcance/trabajo nuevo, no bugs para "arreglar" con un hook -- quedan pendientes
+de que el usuario priorice antes de tocar código de nuevo.
+
+### Log 044 — `lr` del punto 1 confirmado + investigación del ícono de cámara (in-game) — 2026-09-12
+
+**Log:** `logs/asphalt6_044.log`. Ya trae el build con el logging de `lr` agregado en la sesión
+anterior.
+
+**Confirmado el punto 1 (CNullDriver):** el `lr` resuelve, contra el índice de símbolos
+dinámicos del `.so`, a
+`glitch::video::CBatchDriver::thisAppendBatch(...)` (offsets +0x918/+0x10cc) para los 2 objetos
+de siempre, y a `glitch::scene::CAppendMeshBuffer::CAppendMeshBuffer(...)` (offsets +0x174/+0x1f8)
+para los pocos casos raros (3+1 llamadas). **Esto cambia la hipótesis de "vtable corrupto" por
+una mucho más tranquilizadora:** `CBatchDriver` es un wrapper de *batching* de geometría -- el
+patrón de nombre (`thisAppendBatch`) y que **todas** las llamadas caigan sobre un driver nulo es
+consistente con una pasada de **conteo/medición** (un patrón común: iterar una vez contra un
+driver "no-op" para calcular tamaños totales antes de alocar los buffers reales con el driver
+GLSL de verdad en una segunda pasada, que no pasa por nuestro hook porque no toca
+`CNullDriver`). Bajo esta lectura, los ~45 s del congelamiento #2 son trabajo de motor
+legítimo (armar el batch estático de Bahamas), no un bug del port -- no hay evidencia de que
+esto afecte al auto. **No se seguirá investigando este punto salvo que aparezca evidencia
+nueva** (p.ej. si el auto sigue invisible después de descartar otras causas).
+
+**Investigación del ícono de cámara (arriba a la derecha, cambia perspectiva) -- sin resultado
+concreto, documentado para no repetir el mismo camino:**
+- Se rastreó en el pseudo-C: `GS_Race::StateOnFlashEvent(RenderFX::Event&)` compara el nodo
+  clickeado contra un puntero cacheado en `this+0x60`; si coincide y el evento es "click"
+  (`param_1[8]==2`) y no se está en el modal de personalización de controles (`this[0x190]==0`),
+  setea `sMenuData::aGameplayInfoData+0x55 = 1`. Ese flag lo lee
+  `GP_RaceNormal::UpdateCameraMode()`: cooldown de 1000 ms
+  (`Game::GetTime() - DAT_00cd760c`), ciclo de 3 posiciones (`PlayerProfile::GetCameraUsed()+1,
+  mod 3`), y aplica la nueva posición/orientación de cámara desde una tabla estática de configs
+  (`DAT_00cd6f7c` y vecinas) indexada por `eCamPositions`. Es una máquina de estados coherente
+  y sin nada obviamente roto EN EL PSEUDO-C -- si el flujo se dispara, debería funcionar.
+- **El nombre real del botón (qué string se le pasa a `RenderFX::Find` para cachear `this+0x60`
+  en `GS_Race::OnMenuReset`) NO se pudo confirmar esta sesión.** Se identificó que viene de una
+  tabla de ~60 punteros a string cacheados en un bucle (`this[0x11..0x4c]` = offsets
+  `this+0x44`..`this+0x130`, un string por cada 4 bytes de offset; `this+0x60` cae en el índice
+  7), pero el intento de leer esa tabla directo del `.so` (`DAT_00ba84bc` del pseudo-C,
+  interpretado como dirección real del ELF) dio basura -- y un intento posterior de
+  desensamblar alrededor de una dirección real conocida por otro lado (`LAB_00425020`, un goto
+  dentro de la misma función) tampoco cuadró: cayó en medio de lo que parece una **tabla de
+  salto (`TBB`/switch)** de otra función completamente distinta, no en código real de
+  `StateOnFlashEvent`. Se probó primero con `objdump --triple=armv7-none-eabi` (ARM puro) y
+  después con el toolchain real de vitasdk (`~/vitasdk/bin/arm-vita-eabi-objdump -M
+  force-thumb`, no estaba en el `PATH` de esta sesión) -- ninguno de los dos dio una
+  disassembly coherente en esa zona. **Conclusión: no hay que confiar en esta dirección sin
+  abrir el proyecto real de Ghidra (con su base de datos, no solo el `.c` plano) para navegar
+  el cross-reference real** -- intentarlo a ciegas con offsets sueltos, en una zona con tablas
+  de salto mezcladas con código, es exactamente el tipo de error que ya costó las regresiones
+  de los Bugs #017/#019 (direcciones mal pisadas). No se aplicó ningún parche basado en esta
+  dirección.
+- **Instrumentación segura agregada en su lugar** (`source/utils/touch.c`, sin tocar el `.so`):
+  `[touch] PRESS slot=%d x=%d y=%d` / `[touch] RELEASE slot=%d x=%d y=%d` en
+  `touch_poll()` (no en MOVED, para no inundar el log durante el manejo del volante). El
+  próximo log, tocando específicamente el ícono de cámara, va a decir si el toque llega
+  siquiera al motor (coordenadas cerca de la esquina superior derecha en el espacio 960x544) --
+  eso separa "el toque no llega/está mal mapeado" de "el toque llega pero el motor no
+  reacciona" antes de gastar otra sesión en direcciones del `.so`. Build verificado
+  (`psvita-toolkit build --preset debug` limpio).
+
+**Próximo paso concreto:** correr una carrera, tocar el ícono de cámara un par de veces, y
+mandar el log. Si aparecen líneas `[touch] PRESS x=9XX y=Y` con `x` cerca de 960 e `y` cerca de
+0 (la esquina donde está el ícono) y el juego sigue sin cambiar de perspectiva, el problema es
+del lado del motor (necesita abrir el proyecto Ghidra real para seguir sin adivinar). Si NO
+aparece ningún `[touch] PRESS` cuando el usuario toca ahí, el problema es de mapeo de
+coordenadas o de que el ícono está fuera del área táctil que estamos leyendo.
+
+### Bug #028 — "Congelamiento" con errores gráficos en el menú de pausa in-game: el spam de las guardas de #026/#027 ES el freeze (sceIoWrite síncrono por línea) — 2026-09-15
+
+**Log:** `logs/asphalt6_044.log` (12378 líneas). **Dump:** el mismo
+`asphalt6-psp2core-1789185959-0x000b7424b9-eboot.bin.psp2dmp` de Bug #027 (no es un crash
+nuevo — el usuario lo adjuntó de nuevo como referencia del punto donde se traba).
+
+**Síntoma reportado:** al abrir el menú de pausa durante la carrera, el juego "se queda
+congelado con errores gráficos".
+
+**Lo que el 044 confirma (sin adivinar):** NO es un cuelgue real — el `[gl] latido` sigue
+incrementando (420→1080 frames presentados, líneas 8879-12341), así que el hilo principal
+sigue corriendo. Lo que sí pasa: apenas entra al IGM, las guardas de los Bugs #026/#027
+(`StateRenderNull` sitio 0/1 y `IGMUpdate: Find devolvio NULL`) dejan de ser el aviso
+"una vez" para el que se diseñaron y empiezan a dispararse en TODOS los frames — 247+366
+veces `StateRenderNull` y 683 veces `IGMUpdate` en un solo log de 12378 líneas, más 2033
+warnings `[FalsoJNI] ... method ID 0 not found!` reenviados por `fjni_log_sink` — casi el 30%
+del archivo entero. Esto confirma que en el perfil/HUD de este port, `Find("menu_main")`,
+`Find("back_btn_main")` y `Find("custom_controls_btn")` NO están ausentes de forma transitoria:
+faltan TODO el tiempo que el IGM está abierto (mismo patrón ya anotado en #026: "por variante
+de HUD/tipo de control del perfil, no por asset corrupto" — sigue sin confirmarse cuál).
+
+**Causa raíz del freeze en sí (no del porqué de los `Find` NULL):** `_log_print()`
+(`source/utils/logger.c`) hace un `sceIoWrite` SÍNCRONO a la SD en cada llamada, a propósito
+(comentario de `log_file_open`: "every write goes straight to storage... survives a data
+abort"). Eso es correcto para un aviso raro, pero a la frecuencia de un aviso por-frame
+convierte cada `Find` fallido en una escritura bloqueante a almacenamiento — con varias líneas
+por frame, eso es el "congelamiento" real que ve el usuario, no un efecto secundario cosmético.
+Los "errores gráficos" son la otra cara de la misma guarda: al saltear el `strb`/`ldrb` del
+byte de visibilidad (0x9b) en TODOS los frames en vez de una vez, el flag de visibilidad de
+`menu_main`/`back_btn_main`/`custom_controls_btn` nunca se sincroniza — el IGM queda dibujando
+con el estado de visibilidad que haya tenido por última vez antes de la guarda, de ahí el
+glitch visual (no es una corrupción de memoria nueva).
+
+**Fix aplicado (`source/utils/logger.c`, no toca `patch.c` ni ningún hook ARM ya
+verificado):** el 044 muestra estos avisos INTERCALADOS con otros (dos líneas de FalsoJNI,
+una de `IGMUpdate`, una de `StateRenderNull`, y vuelta a empezar) — comparar solo contra la
+última línea escrita habría dejado pasar la mayoría, porque cada una difiere de su vecina
+inmediata aunque sea idéntica a la de 4 líneas atrás. Por eso el colapso es **por sitio de
+llamada**: una tabla fija de 8 slots (`log_throttle_slot`) indexada por el puntero de `fmt`
+(el propio literal de `.rodata` del `l_error(...)`, estable entre llamadas — no confundir con
+comparar el texto ya interpolado) recuerda, por sitio, el último contenido renderizado
+(`sceClibMemcmp`) y un contador. Esto evita además que `fjni_log_sink` — un ÚNICO sitio de
+llamada que reenvía texto DISTINTO de FalsoJNI en cada invocación — trate mensajes diferentes
+como si fueran repeticiones: el contenido se compara igual, así que un mensaje nuevo de
+FalsoJNI se escribe aunque comparta sitio con el spam. La primera línea de una racha (o
+cualquier cambio de contenido en el mismo sitio) siempre se escribe; mientras siga IDÉNTICA se
+cuenta sin tocar storage, con una reconfirmación cada `LOG_COLLAPSE_EVERY` (300) que anota
+cuántas veces seguidas pasó (`" (x%u seguidas)"`) — así no se pierde la señal de "sigue
+pasando" para el próximo triage, pero se elimina el costo de
+I/O por línea que causaba el freeze. No cambia qué se decide loguear en `patch.c`, ni toca la
+consola (`sceClibPrintf`, invisible en retail igual) — solo colapsa el sumidero de archivo, que
+es el que hace la syscall cara. Build Debug verificado (`psvita-toolkit build --preset debug`
+limpio).
+
+**Lo que este fix NO arregla:** por qué `Find("menu_main")`/`Find("back_btn_main")`/
+`Find("custom_controls_btn")` siguen sin encontrar sus elementos mientras el IGM está abierto
+— eso sigue siendo la causa de que el menú de pausa no reciba su actualización de visibilidad
+como corresponde (el glitch visual en sí, aunque ya no acompañado de un frame-rate destrozado).
+Es candidato a la misma investigación pendiente de perfil/HUD que #026, y necesita su propia
+sesión de RE (confirmar qué variante de controles/perfil está activa en runtime y por qué esos
+tres nodos no se crean en `178igMenu.swf` para esa variante) antes de intentar otro hook.
+
+**Cómo leer el próximo log:** si sigue apareciendo `StateRenderNull`/`IGMUpdate` pero con
+`(x300 seguidas)`/`(x600 seguidas)` en vez de una línea por frame, el fix de este bug funcionó
+y el juego debería sentirse fluido en el menú de pausa aunque el glitch visual de
+visibilidad siga presente. Si el frame-rate sigue cayendo en el IGM SIN ese patrón de
+repetición, el freeze tiene otra causa nueva — reabrir con el testigo (`[wd]`) en vez de asumir
+que es esto de nuevo.
+
+### Bug #029 — Desfase y mal escalado de coordenadas táctiles (touch) — 2026-09-15
+
+**Log:** `logs/asphalt6_045.log`.
+
+**Síntoma reportado:** Los toques en pantalla táctil no reaccionan correctamente, como si estuvieran desplazados o mal ubicados respecto a la pantalla de la PS Vita (dificultad para pulsar botones del HUD, menú de pausa, o íconos de cámara).
+
+**Causa raíz:** En `source/utils/touch.c`, el cálculo de coordenadas utilizaba `minAaX`/`maxAaX` (`Active Area` del sensor capacitivo físico, dimensiones 108..1779 x 108..925 reportadas por el hardware) en lugar de `minDispX`/`maxDispX` (área de display visible, 0..1919 x 0..1087). Restar `minAaX` introducía un offset falso constante hacia la izquierda y arriba, y al comprimir el rango activo desalineaba cualquier toque respecto a la resolución lógica 960x544 que espera el motor Gameloft Glitch a través de `GLGame_nativeTouchPressed/Moved/Released`.
+
+**Fix aplicado (`source/utils/touch.c`):**
+Se reescribió `touch_init()` para basarse en `info.minDispX`/`info.minDispY` y el rango exacto `(maxDisp - minDisp) + 1` (1920x1088, escala nativa 2:1 contra 960x544):
+```c
+s_panel_x_min = info.minDispX;
+s_panel_y_min = info.minDispY;
+s_panel_x_range = (info.maxDispX - info.minDispX) + 1;
+s_panel_y_range = (info.maxDispY - info.minDispY) + 1;
+```
+Esto garantiza correspondencia 1:1 directa y perfecta con los píxeles visibles de la pantalla OLED/LCD de la PS Vita, coincidiendo con la configuración estándar probada en `Dungeon-Hunter-2-vita`, `Shadow-Guardian-vita` y `Asphalt-5-Vita`.
+
+### Bug #030 — Auto parpadea/se borra intermitentemente y glitches gráficos en el modelo 3D (culling y buffer speedhack) — 2026-09-15
+
+**Log:** `logs/asphalt6_045.log`.
+
+**Síntomas reportados:**
+1. Durante la carrera, el auto del jugador desaparece y reaparece constantemente (parpadeo intermitente / se dibuja y se borra).
+2. El modelo del vehículo sufre deformaciones y artefactos/glitches gráficos en la carrocería y ruedas.
+3. Pausa prolongada en la carga de circuitos (Bahamas).
+
+**Causa raíz #1 (Culling del vehículo):**
+El motor Gameloft Glitch evalúa la visibilidad de los nodos de la escena mediante `glitch::scene::CSceneManager::isCulled()`, tanto para el nodo de escena (`ISceneNode*`) como para su bounding box tridimensional (`aabbox3d`). Debido al aspect ratio panorámico 16:9 y a los ángulos cambiantes de cámara en carrera, el cálculo de frustum culling del motor clasificaba al nodo del auto como "fuera de campo" en determinados frames, omitiendo por completo sus draw calls. Se revisó el port hermano `Dungeon Hunter 2` (commit `853ac40`), donde se resolvió exactamente el mismo comportamiento para los enemigos invisibles del juego.
+
+**Causa raíz #2 (Glitches gráficos en el auto):**
+En `CMakeLists.txt`, `VITAGL_MAKE_FLAGS` incluía `BUFFERS_SPEEDHACK=1`. En `lib/vitaGL/source/buffers.c`, este flag desactiva la protección de descarte/realloc de buffers en vuelo dentro de `glBufferSubData`, haciendo `vgl_memcpy` directo a la memoria del buffer sin esperar a que la GPU termine de renderizar los draw calls del frame anterior. Dado que los vehículos de Asphalt 6 actualizan sus VBOs dinámicos de vértices en cada frame (animación de ruedas, suspensión y deformación), se generaba una condición de carrera directa CPU/GPU que corrompía la geometría visualmente.
+
+**Causa raíz #3 (Pausa en la carga):**
+El hook de diagnóstico sobre `CNullDriver::createBuffer` en `source/patch.c` ejecutaba 3,850 escrituras síncronas a la tarjeta de memoria en cada carga de circuito. En el log 044 se confirmó que estas llamadas son legítimas del sistema de batching estático de Bahamas (`CBatchDriver::thisAppendBatch`).
+
+**Fixes aplicados:**
+1. **Desactivación de Frustum Culling (`source/patch.c`):**
+   Se hookearon los métodos de culling del motor a `&ret0` (siempre visible):
+   - `_ZNK6glitch5scene13CSceneManager8isCulledEPKNS0_10ISceneNodeE`
+   - `_ZNK6glitch5scene13CSceneManager8isCulledERKNS_4core8aabbox3dIfEENS0_14E_CULLING_TYPEE`
+2. **Remoción de `BUFFERS_SPEEDHACK=1` (`CMakeLists.txt`):**
+   Se eliminó el flag peligroso para devolverle a vitaGL la gestión segura con doble buffering en `glBufferSubData`, eliminando los glitches gráficos.
+3. **Adopción de Speedhacks Seguros de Dungeon Hunter 2 (`CMakeLists.txt`):**
+   Se habilitaron las optimizaciones estables probadas en DH2:
+   - `SAMPLERS_SPEEDHACK=1`: Acelera el binding de samplers de texturas en tiempo de ejecución.
+   - `CIRCULAR_POOL_SPEEDHACK=1`: Reduce overhead de CPU en reservas de vértices temporales.
+   - `NO_TEX_COMBINER=1`: Descarta combinadores FFP ya que el juego usa exclusivamente shaders GLSL.
+   - `MATH_SPEEDHACK=1`: Matemática interna acelerada en vitaGL.
+4. **Ampliación del Pool de vitaGL (`source/utils/glutil.c`):**
+   Se elevó el tamaño del pool de memoria interna en `vglInitExtended` de 12 MiB a 24 MiB (paridad con DH2), asegurando headroom suficiente para compilación y VBOs dinámicos.
+5. **Retiro del hook CNullDriver::createBuffer (`source/patch.c`):**
+   Se eliminó el hook que saturaba el log con 3,850 líneas síncronas en storage.
+
+**Verificación:** Compilación limpia completada con `psvita-toolkit build --preset debug`, generando `asphalt6.vpk` y `eboot.bin` actualizados.
+

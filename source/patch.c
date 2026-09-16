@@ -19,6 +19,7 @@
 
 #include "utils/breadcrumb.h"
 #include "utils/logger.h"
+#include "utils/utils.h"
 
 extern so_module so_mod;
 
@@ -99,8 +100,26 @@ void hooked_RenderFX_SetRenderCachingEnabled() {
  * emulando sus 2 primeras palabras, igual que los demas hook_trace() de este
  * archivo).
  */
-void cnulldriver_log_this(const char *method, uint32_t this_ptr) {
-    l_error("[patch] CNullDriver::%s this=0x%08X", method, (unsigned)this_ptr);
+/*
+ * Log 042 -- confirma que el spam de createBuffer NO es incidental: 1925
+ * llamadas cada uno para SOLO 2 `this` (0x81280900/0x812808F8, separados por
+ * apenas 8 bytes -- probablemente dos miembros adyacentes del mismo objeto
+ * contenedor), sostenidas durante buena parte de la carga de Bahamas y
+ * coincidiendo con el bloqueo de 40+ s reportado por el testigo (nativeRender
+ * ENTRA #569 sin avanzar). Se agrega el `lr` (direccion de retorno real en
+ * libasphalt6.so, capturada ANTES del `bl` a esta funcion) para que el proximo
+ * log diga QUE clase/subsistema llama a createBuffer miles de veces -- sin
+ * eso, la hipotesis de la sesion anterior ("vtable de CNullDriver en un
+ * objeto que no deberia tenerlo") no se puede confirmar ni descartar: hoy solo
+ * sabemos que el vtable real de CNullDriver esta puesto a proposito (el hook
+ * es sobre la direccion de codigo, no sobre el objeto), pero no si eso es
+ * legitimo (p.ej. buffers de colision/fisica, que no se dibujan) o si el auto
+ * mismo esta terminando con este driver nulo (lo que explicaria que no se vea
+ * el vehiculo en carrera).
+ */
+void cnulldriver_log_this(const char *method, uint32_t this_ptr, uint32_t caller_lr) {
+    l_error("[patch] CNullDriver::%s this=0x%08X llamador=libasphalt6.so+0x%X",
+            method, (unsigned)this_ptr, (unsigned)(caller_lr - (uint32_t)so_mod.text_base));
 }
 
 __attribute__((naked, target("arm")))
@@ -108,6 +127,7 @@ void hooked_CNullDriver_draw2DLine() {
     __asm__ volatile(
         "push {r0-r3, r12, lr}\n"
         "mov r1, r0\n"
+        "mov r2, lr\n"
         "ldr r0, 1f\n"
         "bl cnulldriver_log_this\n"
         "pop {r0-r3, r12, lr}\n"
@@ -121,6 +141,7 @@ void hooked_CNullDriver_getMaxUserClipPlanes() {
     __asm__ volatile(
         "push {r0-r3, r12, lr}\n"
         "mov r1, r0\n"
+        "mov r2, lr\n"
         "ldr r0, 1f\n"
         "bl cnulldriver_log_this\n"
         "pop {r0-r3, r12, lr}\n"
@@ -135,6 +156,7 @@ void hooked_CNullDriver_createBuffer() {
     __asm__ volatile(
         "push {r0-r3, r12, lr}\n"
         "mov r1, r0\n"
+        "mov r2, lr\n"
         "ldr r0, 1f\n"
         "bl cnulldriver_log_this\n"
         "pop {r0-r3, r12, lr}\n"
@@ -439,6 +461,37 @@ void hooked_CNullDriver_createBuffer() {
 #define W_MOV_R1_1         0xE3A01001u // mov r1, #1
 #define W2_MOV_R3R4        0xE1A03004u // mov r3, r4
 
+/*
+ * Log 040 + dump 1789184428 — Data Abort en `GS_Race::StateRender + 0x158`
+ * (0x412ebc: `strb r3,[r0,#0x9b]` con r0 = NULL). El `r0` es el retorno de
+ * `RenderFX::Find(this, "custom_controls_btn")` (bl en 0x412eb4), usado SIN
+ * chequear NULL. El pseudo-C muestra el mismo idioma en TRES sitios de la
+ * función (los otros dos con `= 1`): 0x412e90, 0x412ebc (el crash), 0x412f24.
+ * El cuarto `Find` de la función (`"component_controls"`, 0x412fxx) SÍ chequea
+ * `!= 0` antes de tocar el resultado — o sea, el propio código de Gameloft ya
+ * contempla que `Find` devuelva NULL ("elemento no encontrado") y lo salta; los
+ * tres sitios son la inconsistencia, no la norma. El elemento falta
+ * probablemente por variante de HUD/tipo de control (perfil), no por asset
+ * corrupto: `178hud.swf` SÍ cargó en esta corrida.
+ *
+ * Guarda: si el resultado es NULL, se omite el store del flag 0x9b (un byte de
+ * visibilidad) y se sigue en +8, igual que hace el camino chequeado. r0/r3 no
+ * viven después (el siguiente `bl` los pisa) y los flags mueren en el `bl`;
+ * r12 es scratch libre (el `bl Find` previo puede pisar ip por AAPCS y nadie
+ * lo lee hasta el próximo `bl`). Avisa en vivo con el sitio para que el log
+ * diga cuál de los tres mordió.
+ */
+#define OFF_STATER1        0x412E8Cu // StateRender: mov r3,#1 + strb r3,[r0,#0x9b] (=1)
+#define OFF_STATER0        0x412EB8u // StateRender: mov r3,#0 + strb r3,[r0,#0x9b] (=0, crash 040)
+#define OFF_STATER2        0x412F20u // StateRender: mov r3,#1 + strb r3,[r0,#0x9b] (=1)
+#define W_MOV_R3_1         0xE3A03001u // mov r3, #1
+#define W_MOV_R3_0         0xE3A03000u // mov r3, #0
+#define W2_STRB_R3R0_9B   0xE5C0309Bu // strb r3, [r0, #0x9b]
+
+#define OFF_IGM_VIS        0x418AC4u // IGMUpdate: movw r1,#134 + ldrb r3,[r7,#0x9b] (crash 041)
+#define W_MOVW_R1_86       0xE3001086u // movw r1, #134
+#define W2_LDRB_R3R7_9B    0xE5D7309Bu // ldrb r3, [r7, #0x9b]
+
 #define W_PUSH9  0xe92d4ff0u // push {r4-r9, sl, fp, lr}
 #define W_PUSH6a 0xe92d41f0u // push {r4-r8, lr}
 #define W_PUSH8  0xe92d47f0u // push {r4-r9, sl, lr}
@@ -511,6 +564,8 @@ static uint32_t g_resume_c1, g_resume_c2, g_resume_rm, g_resume_grid,
                 g_resume_getlang, g_resume_setlang,
                 g_resume_loadgeom, g_skip_loadgeom,
                 g_resume_trackcopy, g_skip_trackcopy,
+                g_resume_sr0, g_resume_sr1, g_resume_sr2,
+                g_resume_igm, g_skip_igm,
                 g_resume_cnd_createbuffer;
 static uint32_t g_emu_c1, g_emu_c2, g_emu_anim, g_emu_light, g_emu_frame,
                 g_emu_dfret1, g_emu_dfret2, g_emu_cxathrow;
@@ -537,6 +592,7 @@ static const char s_tr_carfind[] = "CarFind";
 static const char s_tr_packfile[] = "PackFileNull";
 static const char s_tr_menucar[] = "MenuCarNull";
 static const char s_tr_trackcopy[] = "TrackCopy";
+static const char s_tr_staterender[] = "StateRenderNull";
 
 // Bug #019: aviso en vivo cuando la guarda omite un drop (raro: una vez por
 // corrida como mucho, sin costo de timing).
@@ -1280,6 +1336,110 @@ static void hook_trackcopy(void) {
     );
 }
 
+void staterender_null(uint32_t site) {
+    l_error("[patch] StateRenderNull: Find devolvio NULL en sitio %u, store omitido (log 040)",
+            (unsigned)site);
+}
+
+// Guardas de GS_Race::StateRender (log 040 + dump 1789184428): el `mov r3,#N`
+// + `strb r3,[r0,#0x9b]` pisados no tocan r0/r12, así que r0 (retorno de Find)
+// sigue intacto a la entrada y r12 es scratch libre. Si r0 == NULL se omite el
+// store y se sigue en +8, igual que el camino chequeado de
+// "component_controls". Ambos caminos convergen en el mismo resume.
+__attribute__((naked, target("arm")))
+static void hook_sr1(void) {
+    __asm__ volatile(
+        ".word 0xe3a03001\n"   // emu: mov r3, #1
+        "cmp r0, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "mov r0, #1\n"
+        "bl staterender_null\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"      // resume en +8 (store omitido)
+        "1:\n"
+        ".word 0xe5c0309b\n"   // emu: strb r3, [r0, #0x9b]
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"
+        "2: .word g_resume_sr1\n"
+    );
+}
+
+__attribute__((naked, target("arm")))
+static void hook_sr0(void) {
+    __asm__ volatile(
+        ".word 0xe3a03000\n"   // emu: mov r3, #0
+        "cmp r0, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "mov r0, #0\n"
+        "bl staterender_null\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"      // resume en +8 (store omitido)
+        "1:\n"
+        ".word 0xe5c0309b\n"   // emu: strb r3, [r0, #0x9b]
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"
+        "2: .word g_resume_sr0\n"
+    );
+}
+
+__attribute__((naked, target("arm")))
+static void hook_sr2(void) {
+    __asm__ volatile(
+        ".word 0xe3a03001\n"   // emu: mov r3, #1
+        "cmp r0, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "mov r0, #2\n"
+        "bl staterender_null\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"      // resume en +8 (store omitido)
+        "1:\n"
+        ".word 0xe5c0309b\n"   // emu: strb r3, [r0, #0x9b]
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"
+        "2: .word g_resume_sr2\n"
+    );
+}
+
+void igm_null(uint32_t menu_main, uint32_t back_btn) {
+    l_error("[patch] IGMUpdate: Find devolvio NULL (menu_main=0x%08X, back_btn=0x%08X), copy omitido (log 041)",
+            (unsigned)menu_main, (unsigned)back_btn);
+}
+
+// Guarda de GS_Race::IGMUpdate (log 041 + dump 1789185959): r7 = Find("menu_main"),
+// r0 = Find("back_btn_main"). Si alguno es NULL, se omite el ldrb/strb de visibilidad
+// en +0x9b y se resume en 0x418AD4 con r1 = 0x20086 ya configurado para GetString.
+__attribute__((naked, target("arm")))
+static void hook_igm_vis(void) {
+    __asm__ volatile(
+        ".word 0xe3001086\n"   // emu: movw r1, #0x86
+        ".word 0xe3401002\n"   // emu: movt r1, #0x2  (r1 = 0x20086)
+        "cmp r7, #0\n"
+        "beq 1f\n"
+        "cmp r0, #0\n"
+        "beq 1f\n"
+        ".word 0xe5d7309b\n"   // emu: ldrb r3, [r7, #0x9b]
+        ".word 0xe5c0309b\n"   // emu: strb r3, [r0, #0x9b]
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"      // resume en 0x418AD4 (g_skip_igm)
+        "1:\n"
+        "push {r0-r3, r12, lr}\n"
+        "mov r1, r0\n"         // arg2: back_btn_main
+        "mov r0, r7\n"         // arg1: menu_main
+        "bl igm_null\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"      // resume en 0x418AD4 (g_skip_igm)
+        "2: .word g_skip_igm\n"
+    );
+}
+
+
 // Engancha text_base+off con stub tras verificar la primera palabra del prologo.
 // emu_lit_off = offset del literal que cargaba el ldr PC-relativo (0 si no hay).
 static void hook_trace(uint32_t off, uint32_t expect1, uint32_t expect2,
@@ -1318,25 +1478,27 @@ void so_patch(void) {
     uintptr_t sym_rc = (uintptr_t)so_symbol(&so_mod, "_ZN8RenderFX23SetRenderCachingEnabledEb");
     if (sym_rc) hook_addr(sym_rc, (uintptr_t)&hooked_RenderFX_SetRenderCachingEnabled);
 
+    // Bypass culling de ISceneNode y bounding box para evitar que el vehiculo / entidades
+    // parpadeen o se borren durante la carrera (optimizacion/fix de Dungeon Hunter 2).
+    uintptr_t sym_is_culled_node = (uintptr_t)so_symbol(&so_mod, "_ZNK6glitch5scene13CSceneManager8isCulledEPKNS0_10ISceneNodeE");
+    if (sym_is_culled_node) {
+        hook_addr(sym_is_culled_node, (uintptr_t)&ret0);
+        l_info("[patch] Hooked CSceneManager::isCulled(ISceneNode*) -> ret0");
+    }
+    uintptr_t sym_is_culled_box = (uintptr_t)so_symbol(&so_mod, "_ZNK6glitch5scene13CSceneManager8isCulledERKNS_4core8aabbox3dIfEENS0_14E_CULLING_TYPEE");
+    if (sym_is_culled_box) {
+        hook_addr(sym_is_culled_box, (uintptr_t)&ret0);
+        l_info("[patch] Hooked CSceneManager::isCulled(aabbox3d, E_CULLING_TYPE) -> ret0");
+    }
+
     // Diagnostico CNullDriver (ver comentario arriba de los hooked_CNullDriver_*):
-    // draw2DLine/getMaxUserClipPlanes se reemplazan 1:1 (son no-ops triviales);
-    // createBuffer conserva su cuerpo real, solo se le antepone el log.
+    // draw2DLine/getMaxUserClipPlanes se reemplazan 1:1 (son no-ops triviales).
+    // createBuffer ya fue confirmado en log 044 (llamadas legítimas de batching);
+    // su hook se desactiva para eliminar el spam de 3850 líneas y la pausa de 40s en storage.
     uintptr_t sym_cnd_line = (uintptr_t)so_symbol(&so_mod, "_ZN6glitch5video11CNullDriver10draw2DLineERKNS_4core10position2dIiEES6_NS0_6SColorE");
     if (sym_cnd_line) hook_addr(sym_cnd_line, (uintptr_t)&hooked_CNullDriver_draw2DLine);
     uintptr_t sym_cnd_clip = (uintptr_t)so_symbol(&so_mod, "_ZNK6glitch5video11CNullDriver20getMaxUserClipPlanesEv");
     if (sym_cnd_clip) hook_addr(sym_cnd_clip, (uintptr_t)&hooked_CNullDriver_getMaxUserClipPlanes);
-    uintptr_t sym_cnd_buf = (uintptr_t)so_symbol(&so_mod, "_ZN6glitch5video11CNullDriver12createBufferENS0_13E_BUFFER_TYPEENS0_14E_BUFFER_USAGEEjPvb");
-    if (sym_cnd_buf) {
-        uint32_t w1 = *(volatile uint32_t *)sym_cnd_buf;
-        uint32_t w2 = *(volatile uint32_t *)(sym_cnd_buf + 4);
-        if (w1 == 0xe92d45f0u && w2 == 0xe24dd00cu) {
-            g_resume_cnd_createbuffer = (uint32_t)(sym_cnd_buf + 8);
-            hook_addr(sym_cnd_buf, (uintptr_t)&hooked_CNullDriver_createBuffer);
-        } else {
-            l_error("[patch] sin hook en CNullDriver::createBuffer: prologo 0x%08X 0x%08X inesperado",
-                    (unsigned)w1, (unsigned)w2);
-        }
-    }
 
     // Rastreo del tramo MenuScene (ver comentario arriba): si el .so no es el
     // esperado, hook_trace lo reporta y sigue sin parchear ese punto.
@@ -1426,4 +1588,13 @@ void so_patch(void) {
     // Log 038: bucle de copia sin cota en TrackingManager::updateSaveFile.
     g_skip_trackcopy = (uint32_t)(so_mod.text_base + 0x558848u);
     hook_trace(OFF_TRACKCOPY, W_MOV_R1_1, W2_MOV_R3R4, hook_trackcopy, 0, &g_resume_trackcopy, NULL);
+
+    // Log 040 + dump 1789184428: Find("custom_controls_btn") NULL en StateRender.
+    hook_trace(OFF_STATER1, W_MOV_R3_1, W2_STRB_R3R0_9B, hook_sr1, 0, &g_resume_sr1, NULL);
+    hook_trace(OFF_STATER0, W_MOV_R3_0, W2_STRB_R3R0_9B, hook_sr0, 0, &g_resume_sr0, NULL);
+    hook_trace(OFF_STATER2, W_MOV_R3_1, W2_STRB_R3R0_9B, hook_sr2, 0, &g_resume_sr2, NULL);
+
+    // Log 041 + dump 1789185959: Find("menu_main") / Find("back_btn_main") NULL en IGMUpdate.
+    g_skip_igm = (uint32_t)(so_mod.text_base + 0x418AD4u);
+    hook_trace(OFF_IGM_VIS, W_MOVW_R1_86, W2_LDRB_R3R7_9B, hook_igm_vis, 0, &g_resume_igm, NULL);
 }

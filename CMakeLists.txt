@@ -92,6 +92,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi
 
 add_executable(${CMAKE_PROJECT_NAME}
                source/main.c
+               source/video.cpp
                source/dynlib.c
                source/java.c
                source/patch.c
@@ -139,12 +140,16 @@ set(VITAGL_LIB ${VITAGL_DIR}/libvitaGL.a)
 # via vitaShaRK). Su macro `vgl_log` está parcheada en
 # lib/vitaGL/source/utils/debug_utils.h para caer en NUESTRO archivo de log (implementación
 # en source/utils/glutil.c) en vez de en sceClibPrintf, que en retail no se puede leer.
-# Optimizaciones añadidas (README VITAGL.md):
-# - BUFFERS_SPEEDHACK=1: copias rapidas de vertex buffers evitando reallocations en glBufferSubData
-# - NO_TILE_CLIPPER=1: desactiva clipping de tiles para scissor testing, reduciendo carga de CPU
-# - NO_DMAC=1: usa memcpy rapido con NEON en vez de syscalls a sceDmacMemcpy
-# - NO_TEX_COMBINER=1: elimina overhead de texture combiners (el juego usa shaders GLSL)
-set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2 BUFFERS_SPEEDHACK=1 NO_TEX_COMBINER=1 NO_DMAC=1 NO_TILE_CLIPPER=1")
+# Optimizaciones adoptadas de Dungeon Hunter 2 (ver README VITAGL.md y DH2 PORTING_PLAN.md):
+# - DRAW_SPEEDHACK=2: evita desbordes en el circular pool de vertices durante draws grandes
+# - NO_DMAC=1: usa memcpy rapido con NEON en espacio de usuario en vez de syscalls a sceDmacMemcpy
+# - CIRCULAR_POOL_SPEEDHACK=1: reduce drasticamente el overhead de CPU en reservas de vertices
+# - SAMPLERS_SPEEDHACK=1: acelera el binding de samplers de texturas
+# - NO_TEX_COMBINER=1: elimina overhead de texture combiners (el juego usa 100% shaders GLSL)
+# - MATH_SPEEDHACK=1: matematica interna mas rapida
+# Se EXCLUYE BUFFERS_SPEEDHACK=1: provoca condicion de carrera CPU/GPU en glBufferSubData
+# sobre los VBOs de los vehiculos (ruedas, suspension, geometria animada), causando el glitch grafico.
+set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2 NO_DMAC=1 SAMPLERS_SPEEDHACK=1 CIRCULAR_POOL_SPEEDHACK=1 NO_TEX_COMBINER=1 MATH_SPEEDHACK=1")
 separate_arguments(VITAGL_MAKE_ARGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS}")
 
 # Forzar rebuild completo de vitaGL cuando VITAGL_MAKE_FLAGS cambie (la regla
@@ -199,6 +204,11 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       m
                       ScePgf_stub
                       mathneon
+                      avformat
+                      avcodec
+                      swresample
+                      avutil
+                      mp3lame
                       kubridge_stub
                       ${CMAKE_BINARY_DIR}/lib/libc_bridge/stubs/libSceLibcBridge_stub.a
                       SceHid_stub

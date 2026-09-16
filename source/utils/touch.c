@@ -77,11 +77,14 @@ void touch_init(touch_native_fn pressed, touch_native_fn moved,
 
     SceTouchPanelInfo info;
     if (sceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &info) == 0
-        && info.maxAaX > info.minAaX && info.maxAaY > info.minAaY) {
-        s_panel_x_min = info.minAaX;
-        s_panel_y_min = info.minAaY;
-        s_panel_x_range = info.maxAaX - info.minAaX;
-        s_panel_y_range = info.maxAaY - info.minAaY;
+        && info.maxDispX > info.minDispX && info.maxDispY > info.minDispY) {
+        s_panel_x_min = info.minDispX;
+        s_panel_y_min = info.minDispY;
+        s_panel_x_range = (info.maxDispX - info.minDispX) + 1;
+        s_panel_y_range = (info.maxDispY - info.minDispY) + 1;
+        l_info("touch_init: panel disp=[%d..%d, %d..%d] (rango %dx%d)",
+               info.minDispX, info.maxDispX, info.minDispY, info.maxDispY,
+               s_panel_x_range, s_panel_y_range);
     } else {
         l_error("sceTouchGetPanelInfo falló, usando %dx%d como rango del panel",
                 TOUCH_PANEL_W_FALLBACK, TOUCH_PANEL_H_FALLBACK);
@@ -119,6 +122,7 @@ void touch_poll(void) {
             s_fingers[slot].x = x;
             s_fingers[slot].y = y;
             seen[slot] = 1;
+            l_error("[touch] PRESS slot=%d x=%d y=%d", slot, x, y);
             if (s_pressed) s_pressed(&jni, NULL, x, y, slot);
             continue;
         }
@@ -134,6 +138,7 @@ void touch_poll(void) {
     for (int slot = 0; slot < TOUCH_MAX_FINGERS; slot++) {
         if (s_fingers[slot].active && !seen[slot]) {
             s_fingers[slot].active = 0;
+            l_error("[touch] RELEASE slot=%d x=%d y=%d", slot, s_fingers[slot].x, s_fingers[slot].y);
             // El release lleva la última posición conocida: el motor la usa para decidir
             // sobre qué widget cayó el tap.
             if (s_released)
