@@ -68,6 +68,11 @@ void glReadPixels_soloader(GLint x, GLint y, GLsizei width, GLsizei height,
 void glEnable_soloader(GLenum cap);
 void glDisable_soloader(GLenum cap);
 void glPixelStorei_soloader(GLenum pname, GLint param);
+// Diagnostico del auto/elementos intermitentes y "mayormente transparentes" en carrera
+// (ver port_progress.md, log 054-056): rastrea el estado de GL_BLEND sin cambiar
+// comportamiento, para ver si algun draw grande (candidato: geometria de auto via
+// CBatchDriver) sale con blending prendido sin que el motor lo haya pedido para ESE draw.
+void glBlendFunc_soloader(GLenum sfactor, GLenum dfactor);
 
 void glShaderSource_soloader(GLuint shader, GLsizei count,
                              const GLchar **string, const GLint *_length);

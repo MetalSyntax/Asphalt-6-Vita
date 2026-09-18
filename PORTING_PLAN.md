@@ -92,14 +92,23 @@ truncado y hubo que sacar del disasm a mano (Bug #013): `getKeyboardText()[B`,
 todo el bucle de carga. Sin él la pantalla queda negra Y el juego se cuelga (la escena de
 sceGxm nunca se cierra).
 
-**Camino JNI que sigue sin implementar: el audio.** `vox::DriverAndroid::_InitAT` no usa
-ningún callback de Gameloft, va directo contra la clase de Android:
-`FindClass("android/media/AudioTrack")` + `GetMethodID` de `<init>`, `getMinBufferSize`,
-`play`, `pause`, `stop`, `release`, `write`; después arranca un hilo (`UpdateThreadedAT`)
-que llena un `short[]` y lo manda con `write()`. En Android el ritmo del audio lo daba el
-bloqueo de `AudioTrack.write()`; con FalsoJNI todo eso devuelve al instante. El `.so` **no
+**Audio -- DOS caminos JNI separados, los dos implementados, pendientes de prueba en
+consola real.** `vox::DriverAndroid::_InitAT` no usa ningún callback de Gameloft, va directo
+contra la clase de Android: `FindClass("android/media/AudioTrack")` + `GetMethodID` de
+`<init>`, `getMinBufferSize`, `play`, `pause`, `stop`, `release`, `write`; después arranca un
+hilo (`UpdateThreadedAT`) que llena un `short[]` y lo manda con `write()`. El `.so` **no
 importa OpenSL ni OpenAL** (0 símbolos de audio entre sus 272 indefinidos), así que
-implementar sonido significa emular esa clase, no enchufar un backend de audio.
+implementar sonido significó emular esa clase (no enchufar un backend de audio genérico)
+sobre `sceAudioOut` -- ver `source/reimpl/audiotrack.c` y `port_progress.md` para la
+aritmética exacta (hay una trampa real: `write()` recibe un tamaño en "shorts" calculado por
+el motor a partir de una cuenta de bytes, contada dos veces para stereo16) y qué mirar en el
+próximo log si el sonido no sale bien. **Aparte de eso**, `GLMediaPlayer_nativeInit` resuelve
+otros ~40 métodos (`loadMusic`/`playMusic`/`playSound`/`registerSoundFile`/...) para la
+música de menú y la mayoría de los SFX -- un sistema TOTALMENTE distinto, sin relación con
+`AudioTrack`, que nunca sonó porque solo `loadMovie` estaba implementado (confirmado en
+`port_progress.md`, log 057/058). Sus assets (`.wav`) viven empaquetados en `file00a.bin`
+(630 entradas, formato propio descifrado a mano) -- ver `source/reimpl/soundpack.c` +
+`source/reimpl/gmp_audio.c`.
 
 ### Bug de decompilación confirmado: Ghidra marca mal `basename@plt` como "no retorna"
 
@@ -132,7 +141,8 @@ Thumb y el código real de estas funciones es ARM -- para desensamblar a mano us
 - [x] Input táctil (`source/utils/touch.c`, firma real confirmada en el disasm).
 - [x] Instrumentación de diagnóstico (hilo testigo + anillo de migas + logs unificados).
 - [ ] **Llegar al menú principal** -- bloqueante actual, Bug #015.
-- [ ] Audio (hay que emular `android/media/AudioTrack` por JNI; no hay OpenSL/OpenAL).
+- [x] Audio (`android/media/AudioTrack` emulado sobre `sceAudioOut`, no hay OpenSL/OpenAL) --
+      implementado, sin probar todavía en consola real.
 - [ ] Input de botones/sticks (hoy solo táctil).
 - [ ] Gameplay, LiveArea/VPK final, pruebas largas en hardware.
 

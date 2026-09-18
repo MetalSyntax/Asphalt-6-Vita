@@ -492,6 +492,39 @@ void hooked_CNullDriver_createBuffer() {
 #define W_MOVW_R1_86       0xE3001086u // movw r1, #134
 #define W2_LDRB_R3R7_9B    0xE5D7309Bu // ldrb r3, [r7, #0x9b]
 
+/*
+ * Bug #033 (log 052 + dump 1789608605) — Data abort en
+ * BaseCarManager::GetPackFilename(int) al elegir un auto (Nissan 370Z Nismo 2010)
+ * en el garage/tuning. Disasm ARM real confirmado con objdump + lectura de bytes
+ * cruda (sin adivinar el layout de instrucciones, a diferencia de thisAppendBatch):
+ *
+ *   48d364: ldr r4, [r3, r2]   ; r4 = this->packNames[index] (un char* de std::string)
+ *   48d368: sub r4, r4, #12   ; r4 = &_Rep (data_ptr - sizeof(_Rep), COW libstdc++)
+ *   48d36c: ldr r3, [r4, #8]  ; CRASH: lee _Rep::_M_refcount -- r4 = 0xFFFFFFF4 (=-12)
+ *
+ * O sea: this->packNames[index] es un std::string CRUDO (memoria en cero, nunca
+ * construido) para este auto/indice -- un char* NULL no es un string vacio valido
+ * bajo COW (eso apuntaria al singleton _S_empty_rep_storage, nunca a 0). Distinto
+ * del Bug #021/PACKFILE (createAndOpenFile() devuelve NULL porque el .pak no abre):
+ * este crash es ANTES, al armar el nombre del archivo, no al abrirlo -- mismo auto
+ * (u otro con el mismo indice de pack) tiene la entrada de nombre directamente sin
+ * poblar. Sigue sin confirmarse POR QUE ese indice queda sin poblar para este auto
+ * en particular (candidato: InitCarMng solo llena `packNames` para los tipos de
+ * pack que ese auto realmente usa, y este call site pide un indice que no aplica
+ * -- necesitaria RE de GetPackFile/InitCarMng para confirmarlo).
+ *
+ * Fix: si el string cargado es NULL, se devuelve el string vacio INMORTAL real del
+ * motor (mismo allocator, `glitch::core::SAllocator<char,...>::_Rep::_S_empty_rep_storage`,
+ * resuelto por simbolo en so_patch() -- no un literal nuestro) en vez de desreferenciar
+ * el puntero armado con -12. Replica el mismo camino de retorno que la funcion ya
+ * usa para el string vacio real (0x48D388-0x48D398), asi que el resultado es un
+ * std::string 100% valido para quien lo use despues (ToString, fopen, etc.), no
+ * solo "no crashea".
+ */
+#define OFF_GETPACKFILENAME 0x48D364u // GetPackFilename: ldr r4,[r3,r2] + sub r4,r4,#12
+#define W_LDR_R4R3R2       0xE7934002u // ldr r4, [r3, r2]
+#define W2_SUB_R4_12       0xE244400Cu // sub r4, r4, #12
+
 #define W_PUSH9  0xe92d4ff0u // push {r4-r9, sl, fp, lr}
 #define W_PUSH6a 0xe92d41f0u // push {r4-r8, lr}
 #define W_PUSH8  0xe92d47f0u // push {r4-r9, sl, lr}
@@ -566,9 +599,13 @@ static uint32_t g_resume_c1, g_resume_c2, g_resume_rm, g_resume_grid,
                 g_resume_trackcopy, g_skip_trackcopy,
                 g_resume_sr0, g_resume_sr1, g_resume_sr2,
                 g_resume_igm, g_skip_igm,
-                g_resume_cnd_createbuffer;
+                g_resume_cnd_createbuffer,
+                g_resume_getpackfilename;
 static uint32_t g_emu_c1, g_emu_c2, g_emu_anim, g_emu_light, g_emu_frame,
                 g_emu_dfret1, g_emu_dfret2, g_emu_cxathrow;
+// Puntero de datos del string vacio inmortal del motor (mismo allocator que
+// BaseCarManager::packNames), resuelto por simbolo en so_patch() -- ver Bug #033.
+static uint32_t g_empty_rep_data;
 
 static const char s_tr_c1[] = "MenuScene::MenuScene";
 static const char s_tr_rm[] = "RemoveChildNodeType";
@@ -593,6 +630,7 @@ static const char s_tr_packfile[] = "PackFileNull";
 static const char s_tr_menucar[] = "MenuCarNull";
 static const char s_tr_trackcopy[] = "TrackCopy";
 static const char s_tr_staterender[] = "StateRenderNull";
+static const char s_tr_getpackfilename[] = "PackFilenameNull";
 
 // Bug #019: aviso en vivo cuando la guarda omite un drop (raro: una vez por
 // corrida como mucho, sin costo de timing).
@@ -1439,6 +1477,47 @@ static void hook_igm_vis(void) {
     );
 }
 
+// Bug #033: aviso en vivo (deberia ser raro -- una vez por auto/indice afectado,
+// no por frame, asi que no hace falta bc_event ni colapso de logger).
+void packfilename_null(void) {
+    l_error("[patch] PackFilenameNull: this->packNames[i] sin construir, se devuelve "
+            "\"\" real del motor en vez de crashear (Bug #033)");
+}
+
+/*
+ * Bug #033, guarda: BaseCarManager::GetPackFilename NULL. Emula `ldr r4,[r3,r2]`;
+ * si el string cargado es NULL, arma el retorno con el string vacio INMORTAL real
+ * (misma allocator que el motor usa, resuelto por simbolo -- ver g_empty_rep_data
+ * en so_patch()) replicando el camino de exito de la propia funcion (0x48D388-
+ * 0x48D398: `*sret = data_ptr; return sret;` con el mismo epilogo `add sp,#12;
+ * pop {r4,r5,pc}`), en vez de saltar a una direccion del medio de la funcion que
+ * asume r4 == r3 (el singleton) para no repetir esa comparacion a mano. r5 (sret)
+ * y la pila ya estan en el estado que esa cola espera: solo `sub sp,sp,#12` corrio
+ * antes de este punto, nada mas toco r4/r5 desde el `push {r4,r5,lr}` inicial.
+ */
+__attribute__((naked, target("arm")))
+static void hook_getpackfilename(void) {
+    __asm__ volatile(
+        "ldr r4, [r3, r2]\n"     // emu
+        "cmp r4, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "bl packfilename_null\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r0, 2f\n"
+        "ldr r0, [r0]\n"          // r0 = g_empty_rep_data (puntero de datos, no direccion del global)
+        "str r0, [r5]\n"          // *sret = puntero al string vacio real
+        "mov r0, r5\n"            // retorno = sret (funcion devuelve por puntero oculto)
+        "add sp, sp, #12\n"       // deshace el "sub sp,sp,#12" de 0x48D360
+        "pop {r4, r5, pc}\n"      // deshace el "push {r4,r5,lr}" de 0x48D354
+        "1:\n"
+        ".word 0xe244400c\n"      // emu: sub r4, r4, #12
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"         // resume en 0x48D36C
+        "2: .word g_empty_rep_data\n"
+        "3: .word g_resume_getpackfilename\n"
+    );
+}
 
 // Engancha text_base+off con stub tras verificar la primera palabra del prologo.
 // emu_lit_off = offset del literal que cargaba el ldr PC-relativo (0 si no hay).
@@ -1478,8 +1557,12 @@ void so_patch(void) {
     uintptr_t sym_rc = (uintptr_t)so_symbol(&so_mod, "_ZN8RenderFX23SetRenderCachingEnabledEb");
     if (sym_rc) hook_addr(sym_rc, (uintptr_t)&hooked_RenderFX_SetRenderCachingEnabled);
 
+#ifdef RENDER_CULLING_BYPASS
     // Bypass culling de ISceneNode y bounding box para evitar que el vehiculo / entidades
     // parpadeen o se borren durante la carrera (optimizacion/fix de Dungeon Hunter 2).
+    // Especulativo, sin confirmar en consola que arregle nada -- ver
+    // RENDER_CULLING_BYPASS en CMakeLists.txt para apagarlo y aislar el sintoma real
+    // (candidato principal: el spam de CNullDriver::createBuffer, ver logs 054/055).
     uintptr_t sym_is_culled_node = (uintptr_t)so_symbol(&so_mod, "_ZNK6glitch5scene13CSceneManager8isCulledEPKNS0_10ISceneNodeE");
     if (sym_is_culled_node) {
         hook_addr(sym_is_culled_node, (uintptr_t)&ret0);
@@ -1490,6 +1573,9 @@ void so_patch(void) {
         hook_addr(sym_is_culled_box, (uintptr_t)&ret0);
         l_info("[patch] Hooked CSceneManager::isCulled(aabbox3d, E_CULLING_TYPE) -> ret0");
     }
+#else
+    l_info("[patch] RENDER_CULLING_BYPASS off -- isCulled() sin tocar (build de diagnostico)");
+#endif
 
     // Diagnostico CNullDriver (ver comentario arriba de los hooked_CNullDriver_*):
     // draw2DLine/getMaxUserClipPlanes se reemplazan 1:1 (son no-ops triviales).
@@ -1610,4 +1696,18 @@ void so_patch(void) {
     // Log 041 + dump 1789185959: Find("menu_main") / Find("back_btn_main") NULL en IGMUpdate.
     g_skip_igm = (uint32_t)(so_mod.text_base + 0x418AD4u);
     hook_trace(OFF_IGM_VIS, W_MOVW_R1_86, W2_LDRB_R3R7_9B, hook_igm_vis, 0, &g_resume_igm, NULL);
+
+    // Log 052 + dump 1789608605: BaseCarManager::GetPackFilename NULL al elegir auto.
+    // g_empty_rep_data = direccion de DATOS del string vacio inmortal (rep + 12,
+    // saltando length/capacity/refcount) -- mismo allocator que usa BaseCarManager
+    // para packNames, resuelto por simbolo real en vez de un literal inventado.
+    uintptr_t sym_empty_rep = (uintptr_t)so_symbol(&so_mod,
+        "_ZNSbIcSt11char_traitsIcEN6glitch4core10SAllocatorIcLNS1_6memory13E_MEMORY_HINTE0EEEE4_Rep20_S_empty_rep_storageE");
+    if (sym_empty_rep) {
+        g_empty_rep_data = (uint32_t)(sym_empty_rep + 12);
+        hook_trace(OFF_GETPACKFILENAME, W_LDR_R4R3R2, W2_SUB_R4_12, hook_getpackfilename,
+                   0, &g_resume_getpackfilename, NULL);
+    } else {
+        l_error("[patch] sin hook en GetPackFilename: no se encontro _S_empty_rep_storage");
+    }
 }

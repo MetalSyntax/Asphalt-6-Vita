@@ -5,6 +5,8 @@
 
 #include <psp2/kernel/processmgr.h>
 
+#include "reimpl/audiotrack.h"
+#include "reimpl/gmp_audio.h"
 #include "utils/glutil.h"
 #include "utils/logger.h"
 #include "video.h"
@@ -197,10 +199,15 @@ jint GLGame_getResourceLengthSoundRaw(jmethodID id, va_list args) { return 0; }
 /*
  * Java_com_gameloft_android_ANMP_GloftA6HP_GLMediaPlayer_nativeInit() resuelve
  * ~40 jmethodID de audio/video contra la clase "GLMediaPlayer" (confirmado con
- * Ghidra: playMusic/playSound/setVolumeMusic/... más loadMovie/isMediaPlaying).
- * Solo implementamos loadMovie -- el resto es el bus de audio de vox::
- * DriverAndroid (sin implementar, ver CLAUDE.md), y no crashean si quedan sin
- * registrar (safe default de FalsoJNI).
+ * Ghidra, `out_ghidra.c:10033`: loadMusic/playMusic/playSound/registerSoundFile/
+ * setVolumeMusic/... más loadMovie/isMediaPlaying). Este es un sistema de sonido
+ * COMPLETAMENTE DISTINTO de `vox::DriverAndroid`/`android/media/AudioTrack` (ver
+ * `reimpl/audiotrack.c`) -- confirmado como la causa real de "no hay sonido en
+ * el menú ni en otras partes" (logs 057/058, port_progress.md): la música/SFX de
+ * ese camino nunca sonaron porque solo `loadMovie` estaba implementado, sin
+ * importar qué tan bien funcionara el AudioTrack de la carrera. Implementación
+ * completa en `reimpl/gmp_audio.c` (música + pool de SFX, leyendo los `.wav`
+ * empaquetados en `file00a.bin` vía `reimpl/soundpack.c`).
  *
  * `nativeLoadMovie(const char*)` (exportado, `libasphalt6.so`) es quien arma
  * el jstring y llama `CallStaticVoidMethod(GLMediaPlayer.class, loadMovie,
@@ -221,6 +228,20 @@ void GLMediaPlayer_loadMovie(jmethodID id, va_list args) {
 jboolean GLMediaPlayer_isMediaPlaying(jmethodID id, va_list args) {
     return JNI_FALSE;
 }
+
+/*
+ * `vox::DriverAndroid::_InitAT()` (motor "Glitch", ver CLAUDE.md) habla con
+ * `android/media/AudioTrack` por JNI crudo -- NO pasa por GLMediaPlayer ni por ninguna
+ * clase Java propia del juego, así que estos nombres se resuelven directo contra
+ * `FindClass("android/media/AudioTrack")` + `GetMethodID`/`GetStaticMethodID`. Como
+ * FalsoJNI resuelve todo por nombre en una tabla plana (no por clase, ver
+ * FalsoJNI_ImplBridge.c), el constructor necesita el prefijo `"<clase>/<init>"` que pone
+ * FalsoJNI::GetMethodID -- el resto de los nombres ("play", "pause", "stop", "release",
+ * "write", "getMinBufferSize") no colisiona con ningún otro nombre que este .so pida (
+ * confirmado con grep sobre el .so decompilado completo). Implementación en
+ * reimpl/audiotrack.c.
+ */
+#define AUDIOTRACK_CTOR_NAME "android/media/AudioTrack/<init>"
 
 NameToMethodID nameToMethodId[] = {
     { 10, "nativeIsXperia", METHOD_TYPE_BOOLEAN },
@@ -261,6 +282,38 @@ NameToMethodID nameToMethodId[] = {
     // Resueltos por GLMediaPlayer_nativeInit (jni_GLMediaPlayer.c del motor).
     { 60, "loadMovie", METHOD_TYPE_VOID },
     { 61, "isMediaPlaying", METHOD_TYPE_BOOLEAN },
+
+    // Resueltos por vox::DriverAndroid::_InitAT() contra android/media/AudioTrack.
+    { 70, AUDIOTRACK_CTOR_NAME, METHOD_TYPE_OBJECT },
+    { 71, "getMinBufferSize", METHOD_TYPE_INT },
+    { 72, "play", METHOD_TYPE_VOID },
+    { 73, "pause", METHOD_TYPE_VOID },
+    { 74, "stop", METHOD_TYPE_VOID },
+    { 75, "release", METHOD_TYPE_VOID },
+    { 76, "write", METHOD_TYPE_INT },
+
+    // Resueltos por GLMediaPlayer_nativeInit contra la propia clase "GLMediaPlayer"
+    // (musica + SFX -- ver reimpl/gmp_audio.c, distinto de AudioTrack arriba).
+    { 80, "registerSoundFile", METHOD_TYPE_VOID },
+    { 81, "loadMusic", METHOD_TYPE_VOID },
+    { 82, "unloadMusic", METHOD_TYPE_VOID },
+    { 83, "playMusic", METHOD_TYPE_INT },
+    { 84, "pauseMusic", METHOD_TYPE_VOID },
+    { 85, "pauseAllMusic", METHOD_TYPE_VOID },
+    { 86, "resumeMusic", METHOD_TYPE_VOID },
+    { 87, "resumeAllMusic", METHOD_TYPE_VOID },
+    { 88, "stopMusic", METHOD_TYPE_VOID },
+    { 89, "stopAllMusic", METHOD_TYPE_VOID },
+    { 90, "setVolumeOneMusic", METHOD_TYPE_VOID },
+    { 91, "setVolumeMusic", METHOD_TYPE_VOID },
+    { 92, "getVolumeMusic", METHOD_TYPE_FLOAT },
+    { 93, "isMusicLoaded", METHOD_TYPE_INT },
+    { 94, "playSound", METHOD_TYPE_INT },
+    { 95, "setPitch", METHOD_TYPE_VOID },
+    { 96, "stopAllSounds", METHOD_TYPE_VOID },
+    { 97, "setMasterVolume", METHOD_TYPE_VOID },
+    { 98, "getMasterVolume", METHOD_TYPE_FLOAT },
+    { 99, "update", METHOD_TYPE_VOID },
 };
 
 MethodsBoolean methodsBoolean[] = {
@@ -270,7 +323,10 @@ MethodsBoolean methodsBoolean[] = {
 MethodsByte methodsByte[] = {};
 MethodsChar methodsChar[] = {};
 MethodsDouble methodsDouble[] = {};
-MethodsFloat methodsFloat[] = {};
+MethodsFloat methodsFloat[] = {
+    { 92, GLMediaPlayer_getVolumeMusic },
+    { 98, GLMediaPlayer_getMasterVolume },
+};
 MethodsInt methodsInt[] = {
     { 11, GLGame_nativeGetLanguageIndex },
     { 22, GLGame_IsWifiEnabled },
@@ -281,6 +337,11 @@ MethodsInt methodsInt[] = {
     { 42, GLGame_getResourceLength },
     { 44, GLGame_getResourceLengthSoundRaw },
     { 53, GameRenderer_isKeyboardVisible },
+    { 71, AudioTrack_getMinBufferSize },
+    { 76, AudioTrack_write },
+    { 83, GLMediaPlayer_playMusic },
+    { 93, GLMediaPlayer_isMusicLoaded },
+    { 94, GLMediaPlayer_playSound },
 };
 MethodsLong methodsLong[] = {};
 MethodsObject methodsObject[] = {
@@ -292,6 +353,7 @@ MethodsObject methodsObject[] = {
     { 41, GLGame_getResourceBytes },
     { 43, GLGame_getSoundRaw },
     { 51, GameRenderer_getKeyboardText },
+    { 70, AudioTrack_ctor },
 };
 MethodsShort methodsShort[] = {};
 MethodsVoid methodsVoid[] = {
@@ -308,6 +370,25 @@ MethodsVoid methodsVoid[] = {
     { 50, GameRenderer_swapEGLBuffers },
     { 52, GameRenderer_setKeyboard },
     { 60, GLMediaPlayer_loadMovie },
+    { 72, AudioTrack_play },
+    { 73, AudioTrack_pause },
+    { 74, AudioTrack_stop },
+    { 75, AudioTrack_release },
+    { 80, GLMediaPlayer_registerSoundFile },
+    { 81, GLMediaPlayer_loadMusic },
+    { 82, GLMediaPlayer_unloadMusic },
+    { 84, GLMediaPlayer_pauseMusic },
+    { 85, GLMediaPlayer_pauseAllMusic },
+    { 86, GLMediaPlayer_resumeMusic },
+    { 87, GLMediaPlayer_resumeAllMusic },
+    { 88, GLMediaPlayer_stopMusic },
+    { 89, GLMediaPlayer_stopAllMusic },
+    { 90, GLMediaPlayer_setVolumeOneMusic },
+    { 91, GLMediaPlayer_setVolumeMusic },
+    { 95, GLMediaPlayer_setPitch },
+    { 96, GLMediaPlayer_stopAllSounds },
+    { 97, GLMediaPlayer_setMasterVolume },
+    { 99, GLMediaPlayer_update },
 };
 
 /*

@@ -29,6 +29,9 @@ GLboolean skip_next_compile = GL_FALSE;
 char next_shader_fname[256];
 void load_shader(GLuint shader, const char * string, size_t length);
 
+// Diagnostico de blending en draws grandes (ver definicion junto a glEnable_soloader).
+static void gl_blend_draw_check(const char *who, GLsizei count);
+
 /*
  * Traza por-llamada de las funciones GL interceptadas. Fue la herramienta que permitio
  * ubicar el cuelgue del frame 3 (ver port_progress.md, Bug #013), pero cada linea es un
@@ -144,6 +147,10 @@ void gl_init() {
      * Tiene que llamarse ANTES de vglInit*: el render target del display se crea ahí adentro.
      */
     vglSetupRenderTargetScenesNum(8, 8);
+
+    // Set shader cache path in game directory so compiled binary shaders are reused across launches
+    sceIoMkdir(DATA_PATH "shader_cache", 0777);
+    vglSetShaderCachePath(DATA_PATH "shader_cache");
 
     // 24 MiB de pool interno para vitaGL (paridad con optimizacion de Dungeon Hunter 2):
     // asegura espacio suficiente para compilacion de shaders GLSL en caliente y VBOs dinamicos.
@@ -266,6 +273,7 @@ void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
     gl_trace("[gl] glDrawArrays mode=0x%x first=%d count=%d",
              (unsigned)mode, (int)first, (int)count);
 #endif
+    gl_blend_draw_check("glDrawArrays", count);
     glDrawArrays(mode, first, count);
 }
 
@@ -275,6 +283,7 @@ void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void
     gl_trace("[gl] glDrawElements mode=0x%x count=%d type=0x%x idx=%p",
              (unsigned)mode, (int)count, (unsigned)type, indices);
 #endif
+    gl_blend_draw_check("glDrawElements", count);
     glDrawElements(mode, count, type, indices);
 }
 
@@ -378,14 +387,56 @@ static int gl_cap_benigno(GLenum cap) {
     return cap == 0x0BD0 || cap == 0x809E || cap == 0x80A0;
 }
 
+// Diagnostico del auto/elementos intermitentes/transparentes en carrera (logs 054-056):
+// createBuffer resulto ser diseño legitimo (CNullDriver::createBuffer arma un CBuffer real
+// en host, compartido por todos los drivers -- confirmado leyendo el pseudo-C, no es un
+// no-op) y RENDER_CULLING_BYPASS no cambio el sintoma -- asi que el sospechoso que queda es
+// estado de render (blending) filtrado entre el HUD Flash (que SI usa blending) y el dibujo
+// de la escena 3D. Se rastrea sin alterar nada (mismo glEnable/glDisable/glBlendFunc reales)
+// y se loguea, acotado a las primeras GL_BLEND_LOG_MAX veces, cuando un draw "grande"
+// (candidato a malla de auto, no un quad de UI) sale con blending prendido.
+static GLboolean g_blend_enabled = GL_FALSE;
+static GLenum g_blend_sfactor = 1, g_blend_dfactor = 0; // GL_ONE, GL_ZERO (default real de GLES2)
+#define GL_BLEND_DRAW_LOG_MAX 40
+#define GL_BLEND_DRAW_VERTS_MIN 300 // filtra quads/HUD; una malla de auto tiene muchos mas
+
 void glEnable_soloader(GLenum cap) {
     if (gl_cap_benigno(cap)) return;
+    if (cap == GL_BLEND) g_blend_enabled = GL_TRUE;
     glEnable(cap);
 }
 
 void glDisable_soloader(GLenum cap) {
     if (gl_cap_benigno(cap)) return;
+    if (cap == GL_BLEND) g_blend_enabled = GL_FALSE;
     glDisable(cap);
+}
+
+void glBlendFunc_soloader(GLenum sfactor, GLenum dfactor) {
+    g_blend_sfactor = sfactor;
+    g_blend_dfactor = dfactor;
+    glBlendFunc(sfactor, dfactor);
+}
+
+static void gl_blend_draw_check(const char *who, GLsizei count) {
+    static int logged_on = 0, logged_off = 0;
+    if (count < GL_BLEND_DRAW_VERTS_MIN) return;
+
+    if (g_blend_enabled) {
+        if (logged_on >= GL_BLEND_DRAW_LOG_MAX) return;
+        logged_on++;
+        l_error("[gl-blend] %s BLEND ON  count=%d sfactor=0x%x dfactor=0x%x (%d/%d)",
+                who, (int)count, (unsigned)g_blend_sfactor, (unsigned)g_blend_dfactor,
+                logged_on, GL_BLEND_DRAW_LOG_MAX);
+    } else {
+        // Contraparte del caso de arriba: si NINGUN draw grande sale nunca con blend
+        // apagado, el problema no es "algunos objetos mal clasificados como
+        // transparentes" sino algo mas sistemico (blend que nunca se apaga de verdad).
+        if (logged_off >= GL_BLEND_DRAW_LOG_MAX) return;
+        logged_off++;
+        l_error("[gl-blend] %s blend off count=%d (%d/%d)",
+                who, (int)count, logged_off, GL_BLEND_DRAW_LOG_MAX);
+    }
 }
 
 void glPixelStorei_soloader(GLenum pname, GLint param) {

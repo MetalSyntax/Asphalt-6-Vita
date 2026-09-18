@@ -13,7 +13,8 @@ exitosamente `pn.dat`/`timespent.dat`, inicializa `FlashFXHandler` y la interfaz
 y entra por completo al menú principal (`GS_MenuMain`), presentando frames de forma continua.
 
 Próximos objetivos: interactividad completa del menú (verificar touch/mapeo de botones físicos)
-y emulación de audio (`android/media/AudioTrack`).
+y verificar en consola real la emulación de audio (`android/media/AudioTrack`, implementada
+esta sesión -- ver el log fechado 2026-09-17 más abajo).
 
 | Área | Estado |
 |---|---|
@@ -24,7 +25,7 @@ y emulación de audio (`android/media/AudioTrack`).
 | Assets (`fopen` sobre `ux0:data/asphalt6/data/`) | funciona |
 | Menú principal (`MenuScene`, `OnLoad3DScene`, `GS_MenuMain`) | **funciona: llega al menú principal** (Bugs #015-#022 resueltos) |
 | Input táctil | implementado, pendiente de prueba interactiva en el menú |
-| Audio | **nada implementado** -- hay que emular `android/media/AudioTrack` por JNI |
+| Audio | `android/media/AudioTrack` emulado sobre `sceAudioOut` (`source/reimpl/audiotrack.c`) -- primera prueba en consola real detectó sonido con estática (Bug #034, resuelto); **pendiente confirmar en consola que ahora suena limpio** |
 | "First time launch" (guardado de `pn.dat`/`timespent.dat` en adelante) | funciona (Bug #022 resuelto) |
 
 ### Correcciones a lo que dicen las Fases 1-2 de más abajo
@@ -50,6 +51,9 @@ y emulación de audio (`android/media/AudioTrack`).
 | #014 | Hipótesis: `scenesPerFrame=1` en los render targets de sceGxm | **descartada** en #015 |
 | #015-#021 | Cuelgue entrando al menú (`MenuScene`, bucle sin cota en `OnLoad3DScene`, `std::sort` sin strict weak ordering) | resueltos |
 | #022 | `abort()` por `std::logic_error` en `StringManager::SetLanguage(NULL)` tras primer arranque | resuelto |
+| #032 | Optimización de velocidad de carga en inicio y carreras (FIOS2 64MB, FCache en RAM, Negative Path Caching, stdio 64KB buffering y afinidad de CPU) | resuelto |
+| #033 | Data abort en `BaseCarManager::GetPackFilename(int)` al elegir un auto en el garage (`packNames[index]` sin poblar) | resuelto |
+| #034 | Sonido con estática/basura constante apenas arranca el audio del juego: el grain del puerto de audio se calculó al doble de los frames que `_FillBuffer` llena de verdad | resuelto |
 
 ## Fase 1: Configuración y Preparación (Completada — 2026-08-23)
 - Repo creado desde soloader-boilerplate, `.gitignore` anti-DMCA.
@@ -86,7 +90,9 @@ y emulación de audio (`android/media/AudioTrack`).
 
 ## Fase 6: Navegación del menú, entrada a carrera y audio (En progreso)
 - [ ] Verificar input táctil y mapear controles físicos (botones / analógicos de PS Vita).
-- [ ] Implementar subsistema de audio (`vox::DriverAndroid` / `android/media/AudioTrack`).
+- [x] Implementar subsistema de audio (`vox::DriverAndroid` / `android/media/AudioTrack`) --
+      código escrito y compila limpio, **sin probar todavía en consola real** (ver log
+      2026-09-17 más abajo).
 - [ ] Probar transición de inicio de carrera y renderizado 3D en pista.
 
 
@@ -2929,4 +2935,677 @@ empeoraron ni mejoraron por este cambio -- no se esperaba que lo arreglara del t
 raíz de #046/#047 siguen siendo las documentadas ahí), pero si alguno de los 5 flags revertidos
 resulta haber sido la causa de algún síntoma adicional no diagnosticado todavía, el próximo log
 debería mostrarlo mejorado.
+
+
+### Bug #032 — Optimización de velocidad de carga en inicio y carreras (FIOS2 64MB, FCache en RAM, Negative Path Caching, stdio 64KB buffering y afinidad de CPU) — 2026-09-16
+
+**Motivo:** En las pantallas de carga tanto al arrancar el juego como al iniciar una carrera (pistas Bahamas, Alpes, etc.), los tiempos de espera y acceso al almacenamiento eran elevados.
+
+**Diagnóstico sobre logs y código real:**
+1. **Cache FIOS2 minúsculo (8 MB):** En `lib/fios/fios.c`, `RAMCACHEBLOCKNUM` estaba fijado en `64` bloques de 128 KB (8 MB totales). El archivo contenedor principal `file00a.bin` pesa 137 MB y el motor lee constantemente bloques de él y de cientos de archivos `.dat`, provocando *cache thrashing* y expulsión continua de datos de la RAM, forzando al hardware a releer sectores físicos de la tarjeta de memoria repetidamente.
+2. **3,031 intentos de lectura a archivos inexistentes:** En `logs/asphalt6_047.log`, se registraron 3,031 llamadas a `fopen(...): 0x0` buscando archivos que no existen (`glsl.config` buscado 153 veces cada vez que compila shaders; 886 intentos para `sfx_asphalt_roll.wav` y cientos para pistas de audio `.wav` y texturas). En el sistema de archivos FAT de la PS Vita, cada `sceIoOpen` fallido obliga al kernel a recorrer los clusters de directorios en almacenamiento físico de forma síncrona y bloqueante.
+3. **Relecturas continuas de archivos pequeños de datos:** Archivos como `file000647.dat` (8 KB) y `file000526.dat` (1.9 KB) fueron abiertos y leídos más de 45 veces cada uno durante la misma sesión desde la tarjeta de memoria.
+4. **Lecturas no bufferizadas de streaming:** `SceLibc` usaba buffers por defecto mínimos (1-4 KB) para leer el archivo gigante `file00a.bin`.
+5. **Afinidad y prioridades de hilos:** Los hilos de callback de FIOS2 corrían con prioridad 191 (la más baja) y sin afinidad explícita, mientras que el hilo principal no estaba aislado en un núcleo dedicado.
+
+**Fixes aplicados (mejores prácticas de TheFloW y Rinnegatamante):**
+1. **Ampliación del Cache FIOS2 a 64 MB y ajuste de prioridades (`lib/fios/fios.c` - TheFloW):**
+   - Se incrementó `RAMCACHEBLOCKNUM` a `512` (64 MB de caché en RAM, paridad con `gtasa_vita`).
+   - Se fijó la afinidad del hilo de callback de FIOS2 a `0x20000` (Core 1, junto al hilo I/O).
+   - Se elevaron las prioridades de los hilos de FIOS2 (`SCE_FIOS_IO_THREAD` y `SCE_FIOS_CALLBACK_THREAD` a `64 + 2`, `DECOMPRESSOR` a `191 - 2`), eliminando demoras en la notificación de I/O completada.
+2. **Negative Path Caching (`source/reimpl/io.c` - Rinnegatamante en Dungeon Hunter 2):**
+   - Se implementó `s_neg_cache` (2048 entradas) con cerrojo `s_fcache_lock`.
+   - Cuando una apertura en modo lectura (`"r"` o `"rb"`) falla, la ruta queda registrada en caché negativo. Los siguientes intentos devuelven `NULL` de inmediato en memoria en 0 µs, eliminando miles de accesos a la tarjeta SD para `glsl.config` y efectos de sonido inexistentes.
+   - Aperturas en modo escritura (`"w"`, `"a"`, `"+"`) invalidan el caché negativo automáticamente.
+3. **In-Memory File Cache en RAM (`FCache`) (`source/reimpl/io.c`, `source/reimpl/io.h` y `source/dynlib.c` - Rinnegatamante):**
+   - Se implementó un pool en RAM de hasta 48 MB (`FCACHE_MAX_TOTAL_BYTES`) para archivos de hasta 4 MB (`FCACHE_MAX_FILE_SIZE`).
+   - La primera lectura de archivos pequeños/medianos (.dat, .swf, texturas, shaders) carga el contenido en RAM. Las subsiguientes aperturas retornan un manejador en memoria (`FCacheHandle`).
+   - `fread_soloader`, `fseek_soloader`, `ftell_soloader`, `feof_soloader`, `fgetc_soloader`, `fgets_soloader`, `fclose_soloader`, etc. operan puramente por `memcpy` sin syscalls de kernel.
+   - Invalidador dinámico `fcache_invalidate` para guardar perfiles y partidas sin lecturas obsoletas.
+4. **Full Stdio Buffering de 64 KB para archivos grandes (`source/reimpl/io.c` - TheFloW/Rinnegatamante):**
+   - En las aperturas de archivos reales que superan el límite de FCache (como `file00a.bin` de 137 MB), se aplica `sceLibcBridge_setvbuf(ret, NULL, _IOFBF, 64 * 1024)`.
+   - Se elevó `sceLibcHeapSize` de 4 MB a 8 MB en `source/main.c` para alojar holgadamente los buffers de streaming de SceLibc.
+5. **Aislamiento de CPU y prioridad del hilo principal (`source/main.c` - TheFloW):**
+   - En `main()`, se fijó la prioridad del hilo principal a `127` y la afinidad a `SCE_KERNEL_CPU_MASK_USER_2` (Core 2), aislando la lógica del juego y renderizado de los hilos de I/O de FIOS2 que corren en Core 1.
+6. **Caché persistente de shaders vitaGL (`source/utils/glutil.c`):**
+   - Se configuró `vglSetShaderCachePath(DATA_PATH "shader_cache")` antes de `vglInitExtended`, asegurando que `HAVE_SHADER_CACHE=1` almacene y reutilice shaders binarios compilados en disco, acelerando drásticamente el inicio.
+
+**Verificación:** Compilación limpia completada con VitaSDK (`cmake --build build`), generando `asphalt6.vpk` y `eboot.bin` actualizados.
+
+### Log 049 — Reconfirmación de los 2 síntomas reportados (auto que desaparece/se ve mal, menú de pausa "descontrolado"); tres hipótesis nuevas descartadas por lectura de código — 2026-09-16
+
+**Log:** `logs/asphalt6_049.log` (7634 líneas). **Reportado por el usuario:** el juego sostiene
+casi 60 FPS, pero persisten (a) el glitch gráfico de vehículos que desaparecen/se ven mal y
+(b) el menú de pausa que "se descontrola". Se pidió una corrección de fondo, no solo más
+diagnóstico.
+
+**(a) Auto/elementos desaparecen — MISMO patrón exacto del Log 047, sin novedad:** líneas
+1907-1924, 2130+ y 5060-5160+ muestran el hilo principal alternando
+`CNullDriver::createBuffer` entre `this=0x81280900` (`llamador=+0x7E7F7C`) y
+`this=0x812808F8` (`llamador=+0x7E77C8`) — los mismos 2 objetos y las mismas 2 direcciones de
+retorno de siempre, ambas dentro de `glitch::video::CBatchDriver::thisAppendBatch`. El testigo
+confirma un cuelgue real de **47332 ms sin avanzar un frame** (`nativeRender ENTRA #664`),
+100% CPU (`CORRIENDO`, no bloqueado), igual que el Log 047. No es un bug nuevo: es la MISMA
+causa raíz ya identificada (soldadura de vértices vía `std::map<unsigned short,unsigned short>`
+dentro de `thisAppendBatch`, que tarda decenas de segundos en 2 instancias fijas del batching
+estático de Bahamas), reconfirmada sin cambios.
+
+**(b) Menú de pausa "descontrolado" — MISMO patrón exacto de los Bugs #026-#028, sin novedad:**
+`[patch] IGMUpdate: Find devolvio NULL (menu_main=0x0, back_btn=0x0)` se repite sin parar
+mientras el IGM está abierto (líneas ~6676-7100+, con el colapso de logging del Bug #028 ya
+activo — `(x300/x600/x900... seguidas)` — así que NO es el freeze de I/O de aquel bug, que
+sigue arreglado). `178igMenu.swf` carga bien (línea 6662-6663, 162575 bytes, sin fallo de
+`fopen`) -- el archivo en sí no falta. Se leyó `GS_Race::IGMUpdate` completo
+(`out_ghidra.c:38440-38520`): es una función que corre **todos los frames sin gate de
+"¿está pausado?"**, no solo cuando se abre el menú -- por diseño del propio Gameloft, no un bug
+del port. El síntoma de "descontrol" visual (botones que no reaccionan, estado de visibilidad
+que no sincroniza) es la consecuencia ya documentada en #028: como `Find("menu_main")` y
+`Find("back_btn_main")` nunca devuelven un puntero válido, el byte de visibilidad en `+0x9b`
+del nodo del botón de resume nunca se copia, y el propio código de Gameloft en esa función usa
+el resultado de `Find("menu_main")` para decidir si el juego está "realmente pausado"
+(`this[0x124]`) -- con el nodo ausente, esa decisión queda en un estado indefinido cada frame,
+consistente con menús que no responden de forma predecible. Sigue sin confirmarse POR QUÉ el
+nodo "menu_main" no existe en el `178igMenu.swf` cargado en este perfil/plataforma.
+
+**Tres hipótesis nuevas evaluadas y descartadas esta sesión (por lectura de código, sin parchear nada):**
+
+1. **¿`IBuffer::map()` (usado al inicio de `thisAppendBatch`, líneas 597947-597950 de
+   `out_ghidra.c`) depende de algún speedhack de vitaGL (`DRAW_SPEEDHACK`, pool circular,
+   etc.)?** No: `glitch::video::IBuffer` es una clase interna del motor (buffers CPU del
+   `CNullDriver`/`CBatchDriver`, no GPU) -- sus llamadas a `map()` nunca llegan a
+   `glMapBuffer`/`glMapBufferRange` de vitaGL (comprobado por búsqueda cruzada, cero
+   referencias). Ningún flag de `VITAGL_MAKE_FLAGS` puede acelerar o evitar este cuelgue: es
+   100% código del `.so`, ajeno a nuestra capa de GL. Confirma la lectura del Log 047 ("es
+   trabajo de CPU real, no I/O ni espera de lock").
+
+2. **¿Se puede remapear en `io.c` (como ya hacemos con `IPAD2a_`) la textura de reflexión
+   faltante (`Car_Body_Reflection`) hacia alguna textura común que sí exista?** No es viable:
+   ni el asset original (`..._ForShader.png`) ni la variante `_Fixed.PVRTC4.tga` existen en
+   NINGUNA fuente de datos disponible (`asphalt6_extract/`, `Asphalt-6-Adrenaline/`, ni el
+   `asphalt6.zip` de 532 MB completo -- verificado con `unzip -l` y `find`, cero coincidencias).
+   Además, las texturas "comunes" que SÍ tienen un fallback exitoso en el log
+   (`car_common_glow`, `_shadow`, `_miscellaneous`) NUNCA pasan por un `fopen()` real tampoco:
+   se resuelven desde una ruta virtual interna del motor (`data/#temp/cartga/...`), un caché
+   ya extraído en RAM desde `file00a.bin` que administra el propio `.so` -- no hay ningún
+   `fopen_soloader()` de por medio que podamos interceptar para sustituir el resultado. Un fix
+   real requeriría o (a) el asset original de una build que sí lo incluyera (posible candidato:
+   el IPA de iOS, que es la plataforma que de verdad usa PVRTC4 en Android/Gameloft y para la
+   que este asset se habría empaquetado), o (b) parchear el `.so` en el sitio exacto donde
+   `CResFactory::getTextureImpl` deja el puntero de textura en NULL -- opción (b) sigue
+   pendiente de disassembly real, ver punto siguiente.
+
+3. **¿Se puede agregar un hook ENTER-only (no invasivo, mismo patrón que los de
+   `MenuScene`/`CustomBatchGrid`) al inicio real de `thisAppendBatch` (`0x7E6EB0`, confirmado
+   por `nm -D`) solo para loguear cuántos vértices procesa cada vez, sin cambiar
+   comportamiento?** Se leyó el prólogo real con `arm-vita-eabi-objdump -M force-thumb`:
+   `ldr r7, [pc, #960]` + `stmdb sp!, {r1,r8,r9,fp,pc}` + `vpush {...}` -- el primer word YA es
+   una carga PC-relativa (el mismo patrón que causó la regresión del Bug #017 cuando se emuló
+   mal con un solo nivel de indirección) y el resto de la función está lleno de tablas de salto
+   (confirmado al intentar desensamblar +0x850: bloques enteros de `b.n` con basura mezclada,
+   igual que la advertencia ya anotada en el Log 044 sobre el ícono de cámara). Verificar a
+   ciegas que la emulación de ese prólogo es exacta, sin poder abrir el proyecto real de Ghidra
+   para confirmar el layout de instrucciones/relocs, es exactamente el tipo de apuesta que ya
+   costó dos regresiones reales en consola (#017, #019) -- **no se aplicó ningún hook**, ni
+   siquiera de solo-lectura, sobre esta función esta sesión.
+
+**No se tocó código esta sesión.** Las dos causas raíz siguen siendo las mismas ya documentadas
+(Log 047 para el auto, Bug #026-#028 para el menú de pausa), y las tres vías de arreglo
+"seguras" que se evaluaron (config de vitaGL, remapeo de asset en `io.c`, hook de solo
+diagnóstico) quedaron descartadas con evidencia concreta en vez de intentadas a ciegas.
+
+**Lo que hace falta para el próximo paso real (no más diagnóstico por log):**
+- **Auto que desaparece:** abrir el proyecto real de Ghidra (con su base de datos, PC del
+  usuario) sobre `thisAppendBatch` para navegar el árbol de llamadas y las tablas de salto de
+  verdad, en vez de un `.c` plano o un `objdump` ciego -- recién ahí un parche ARM es seguro de
+  intentar, y necesita probarse en consola real (no hay forma de validar un patch de este tipo
+  sin hardware).
+- **Menú de pausa:** mismo requisito de Ghidra real para seguir la referencia cruzada de qué
+  arma la lista de nodos de `178igMenu.swf` en tiempo de ejecución y por qué "menu_main" no
+  queda instanciado en el perfil/plataforma de este port. Mientras tanto, hay un experimento de
+  costo cero que el usuario puede probar sin tocar código: cambiar el esquema de control en
+  Options (si hay más de uno disponible, p.ej. botones táctiles vs. inclinación) ANTES de
+  entrar a una carrera, y confirmar si con otro esquema `Find("menu_main")`/
+  `Find("custom_controls_btn")` sí resuelven (validaría o descartaría la hipótesis de
+  "variante de HUD/control" que viene sin confirmar desde el Bug #026).
+
+**Adenda (misma sesión) — se confirmó con `decompiled/disasm/full_libasphalt6.so.md` (250 MB,
+generado con `arm-vita-eabi-objdump`) y `psvita-toolkit disasm` que la hipótesis de "hace falta
+Ghidra real" no era una excusa genérica: se leyeron a mano, byte a byte (con Python +
+`readelf -l`, sin fiarse del stream de `objdump`), los 4 bytes que preceden a los dos
+`llamador` logueados (`+0x7E77C8`/`+0x7E7F7C`) dentro de `thisAppendBatch`. El resultado es
+ambiguo de verdad: los bytes decodifican como una instruccion VFP/NEON de 4 bytes que termina
+EXACTAMENTE en la direccion de retorno logueada (lo cual no tiene sentido para un `bl`/`blx`,
+que por definicion es la instruccion INMEDIATAMENTE ANTERIOR al retorno) -- o alternativamente
+como dos instrucciones de 2 bytes donde la ultima (`0xe12f`) decodifica como un `b.n` (salto,
+no llamada). ARM/Thumb no es auto-sincronizante: sin saber DESDE DONDE viene el flujo real de
+instrucciones (que solo Ghidra reconstruye separando código real de literal pools embebidos),
+no se puede saber cuál de las dos lecturas es la correcta -- exactamente el problema que un
+`objdump` lineal (incluso el de 250 MB ya generado) no resuelve, porque tampoco distingue datos
+de código. Mismo diagnóstico para `CustomResFactory::getTexture` (`out_ghidra.c:174813`, la
+función dueña del NULL-check de `Car_Body_Reflection` en la línea 175466): es una función
+igual de monstruosa, con decenas de literales de `std::string` inline, así que corre el mismo
+riesgo. Conclusión sin cambios: ningún parche ARM sobre estas dos funciones esta sesión.
+
+### Log 050/051 — confirmado: el auto que desaparece y el menú de pausa son 100% específicos de la carrera — 2026-09-16
+
+**Logs:** `logs/asphalt6_050.log` (11140 líneas, carrera) y `logs/asphalt6_051.log` (2399
+líneas, menú principal, según el usuario "funciona bien"). El 051 no tiene NI UNA línea de
+`createBuffer`/`StateRenderNull`/`IGMUpdate`/cuelgue detectado, y sostiene 60 FPS limpio
+(latidos +300 en 5s). El 050 repite exactamente el mismo patrón de siempre (5990 líneas
+combinadas). Como `VITAGL_MAKE_FLAGS` aplica igual en menú y carrera y el menú no sufre nada,
+esto debilita más la hipótesis de que sea un flag de vitaGL (ya veníamos sin evidencia de
+que lo fuera, ver Bug #031) y refuerza que la causa está en la carga/estado de la escena de
+carrera en sí.
+
+**Cambio aplicado para A/B testing futuro (`CMakeLists.txt` + `source/main.c`):**
+`VITAGL_MAKE_FLAGS` ahora se hornea en el binario (`-DVITAGL_MAKE_FLAGS_STR="..."`) y
+`main()` lo loguea con `_log_print` directo (sobrevive en Release) como segunda línea de
+cada log, justo después del canario de arranque. Sin esto, comparar un log "funciona" contra
+uno "falla" de sesiones distintas no decía si el cambio de comportamiento vino de un flag
+tocado entremedio o de otra cosa. Verificado con `psvita-toolkit build --preset debug` limpio.
+
+### Bug #033 — Data abort en `BaseCarManager::GetPackFilename(int)` al elegir un auto en el garage — 2026-09-16
+
+**Log:** `logs/asphalt6_052.log` (1866 líneas). **Dump:**
+`asphalt6-psp2core-1789608605-0x0013f03c05-eboot.bin.psp2dmp` (triageado con
+`psvita-toolkit analyze --so-base 0x98000000`). **Reportado por el usuario:** crash al
+intentar elegir un vehículo.
+
+**Lo que el 052 confirma:** el log termina justo después de cargar las texturas del Nissan
+370Z Nismo 2010 (`nissan_370znismo_2010_body.tga`, `_wheel.tga`, `car_common_glow/_shadow`)
+en la pantalla de garage/tuning (`178all_tunning_menu.swf`, `Atlas_TuningKits.tga` cargados
+antes) — coincide exactamente con "elegir un vehículo" para previsualizarlo/tunearlo.
+
+**Causa raíz (disasm ARM real, sin adivinar — esta vez SIN el problema de jump tables/literal
+pools de `thisAppendBatch`: es una función chica de 5 instrucciones antes del crash, verificada
+también con lectura de bytes cruda):**
+```
+48d354: push {r4, r5, lr}
+48d358: mov r5, r0          ; r5 = sret (puntero de salida, el string a devolver)
+48d35c: mul r2, r1, r2      ; r2 = 456 * index  (tamaño de cada entrada, sizeof por auto)
+48d360: sub sp, sp, #12
+48d364: ldr r4, [r3, r2]    ; r4 = this->packNames[index]  (char* de un std::string)
+48d368: sub r4, r4, #12     ; r4 = &_Rep (data_ptr - 12, layout COW de libstdc++)
+48d36c: ldr r3, [r4, #8]    ; CRASH: lee _Rep::_M_refcount -- r4 = 0xFFFFFFF4 (=-12)
+```
+`this->packNames[index]` es un `std::string` CRUDO (memoria en cero, nunca construido) para
+este auto/índice: un `char*` NULL no es un string vacío válido bajo COW (eso apuntaría al
+singleton `_S_empty_rep_storage`, nunca a 0). Se llega acá desde
+`PhysicCar::PhysicCar` -> `LogicCar::LogicCar` -> `BaseCarManager::GetPackFile(int,int)` ->
+`GetPackFilename(int)`, construyendo el auto para el garage/tuning.
+
+**Distinto del Bug #021/PACKFILE:** aquella guarda (`0x48DA84`, sigue activa) cubre
+`createAndOpenFile()` devolviendo NULL -- el `.pak` no abre. Este crash es ANTES, armando el
+NOMBRE del archivo: la entrada de la tabla nunca se pobló. Sigue sin confirmarse **por qué**
+ese índice queda sin poblar para este auto en particular (candidato: `InitCarMng` solo llena
+`packNames` para los tipos de pack que ese auto realmente usa, y este call site pide un
+índice que no aplica a este auto -- necesita RE de `GetPackFile`/`InitCarMng` para
+confirmarlo, no intentado esta sesión).
+
+**Fix aplicado (`source/patch.c`, mismo patrón que Bugs #020-#028):** hook en `0x48D364`
+(`OFF_GETPACKFILENAME`, palabras verificadas `ldr r4,[r3,r2]` = `0xE7934002` y
+`sub r4,r4,#12` = `0xE244400C`). El stub `hook_getpackfilename`:
+1. Emula el `ldr r4,[r3,r2]` original.
+2. Si `r4 != 0` (caso normal): emula `sub r4,r4,#12` y resume en `0x48D36C` sin ningún cambio
+   de comportamiento.
+3. Si `r4 == 0`: en vez de saltar al camino de la propia función que ya maneja el string vacío
+   (que asume `r4 == r3`, el singleton, algo que no podemos garantizar sin repetir su cálculo
+   PC-relativo/GOT a mano), arma la MISMA respuesta con una dirección resuelta por símbolo:
+   `_ZNSbIcSt11char_traitsIcEN6glitch4core10SAllocatorIcLNS1_6memory13E_MEMORY_HINTE0EEEE4_Rep20_S_empty_rep_storageE`
+   (`_S_empty_rep_storage` del MISMO allocator que usa el motor para este string, resuelto una
+   vez en `so_patch()` con `so_symbol()`, `+12` para saltar el header `_Rep` y apuntar a los
+   datos) y replica el epílogo real de la función (`*sret = puntero; return sret;` +
+   `add sp,#12; pop {r4,r5,pc}`). El resultado es un `std::string` 100% válido para quien lo
+   use después (no solo "no crashea") -- el mismo objeto inmortal que la propia función
+   comparte en su camino feliz, no un literal inventado.
+
+**Verificación:** `psvita-toolkit build --preset debug` limpio.
+
+**Cómo leer el próximo log:** `[patch] PackFilenameNull: ...` ⇒ la guarda mordió y el garage
+debería seguir funcionando con ese auto (posiblemente sin nombre de pack/tuning para él, pero
+sin crashear). Si el crash persiste en la MISMA dirección, la palabra verificada no coincidió
+(el `.so` cambió) y el hook no se instaló -- revisar `[patch] sin hook en +0x48D364` en el log.
+Si aparece un data abort NUEVO en otra `BaseCarManager`/`PhysicCar`/`LogicCar`, es candidato a
+la misma familia (otra entrada de `packNames` sin poblar) y necesita su propio hook en el
+mismo patrón.
+
+### Implementación de audio: `android/media/AudioTrack` sobre `sceAudioOut` — 2026-09-17
+
+**Sin log ni dump todavía -- esta entrada documenta el diseño ANTES de la primera prueba en
+consola real, para que la próxima sesión no tenga que re-derivar la aritmética si algo no
+sonara bien.** `vox::DriverAndroid::_InitAT` (ver CLAUDE.md, motor "Glitch") no usa OpenSL ni
+OpenAL: habla con `android/media/AudioTrack` por JNI crudo, y hasta ahora esos jmethodID
+caían todos en el default seguro de FalsoJNI (no-op), así que el juego corría mudo. Código
+nuevo en `source/reimpl/audiotrack.{c,h}`, registrado en `java.c` (ids 70-76).
+
+**Confirmado leyendo `_InitAT`/`DoCallbackAT`/`UpdateThreadedAT` en
+`decompiled/libasphalt6_armeabi-v7a/ghidra/out_ghidra.c` (líneas ~987300-987670):**
+- Un solo `AudioTrack` para toda la partida (música + SFX ya mezclados por VoxEngine antes
+  de llegar a JNI) -- no hace falta trackear múltiples instancias.
+- `getMinBufferSize(44100, CHANNEL_OUT_STEREO, ENCODING_PCM_16BIT)` se resuelve una única
+  vez y su resultado (R, en bytes) determina TODO lo demás: `_InitAT` hace
+  `framesRaw = R>>2; framesCapped = min(framesRaw, 1024)`, pasa
+  `ctor.bufferSizeInBytes = framesRaw<<2` al constructor y, en cada callback,
+  `write(buf, 0, framesCapped<<2)`. Mientras R <= 4096 no se activa el clamp de 1024 y
+  ambos valores (`bufferSizeInBytes` y el `size` de `write()`) son literalmente el mismo
+  número R.
+- **Trampa encontrada:** ese `size` de `write()` es una cuenta de *shorts* (contrato real de
+  `AudioTrack.write(short[], int, int)`), pero `_InitAT` lo calculó a partir de una cuenta de
+  *bytes* dividida y vuelta a multiplicar por 4 -- para stereo16 eso cuenta cada frame dos
+  veces. El array (`NewShortArray`) se allocó con ese mismo R como largo, así que no hay
+  overflow, pero significa que **la cantidad real de frames por bloque es `size / channels`,
+  NO `size / (channels*2)`** como sería con la aritmética "correcta". Se eligió
+  R = 2048 a propósito: con ese valor, `size / channels` da exactamente 1024 frames/canal --
+  el mismo `AUDIO_GRAIN` que ya usa `video.cpp` para el audio de las cinemáticas.
+- `sceAudioOutOutput()` no recibe un largo: siempre lee, exactamente, los frames con los que
+  se abrió el puerto (`sceAudioOutOpenPort`). Por eso `AudioTrack_write()` no necesita
+  confiar en el `size` que le pasan para nada más que loguear una discrepancia -- el puerto
+  ya sabe cuánto leer.
+
+**Diseño (`source/reimpl/audiotrack.c`):**
+- Puerto único `SCE_AUDIO_OUT_PORT_TYPE_BGM` (separado del `SCE_AUDIO_OUT_PORT_TYPE_VOICE`
+  que usa `video.cpp` para las cinemáticas -- pueden convivir, son dos puertos de hardware
+  distintos), abierto en el constructor con el grain derivado de `bufferSizeInBytes/channels`
+  (ver trampa arriba), 1024 frames/canal con R=2048.
+- `play()`/`pause()`/`stop()` son no-ops a propósito: el propio motor ya deja de llamar
+  `write()` mientras está en pausa (flag `mbPaused` en `UpdateThreadedAT`), no hace falta
+  nada del lado del puerto real.
+- `release()` cierra el puerto (`sceAudioOutReleasePort`). El constructor cierra cualquier
+  puerto previo antes de abrir uno nuevo, por si el motor re-crea el `AudioTrack` entre
+  carreras (`Init()`/`Shutdown()` por partida).
+- `write()` ignora el valor de `size` para la llamada real y siempre saca el bloque fijo con
+  el que se abrió el puerto; solo lo compara contra lo esperado para loguear una vez si no
+  coincide (señal de que el `.so` cambió o la lectura de arriba está mal).
+
+**Verificación:** `psvita-toolkit build --preset debug` limpio, `AudioTrack_ctor` resuelto
+como `MethodsObject` para el nombre especial `"android/media/AudioTrack/<init>"` (prefijo
+que pone `FalsoJNI::GetMethodID` para constructores, ver `FalsoJNI.c`), y confirmado por grep
+sobre el `.so` decompilado completo que ninguno de "play"/"pause"/"stop"/"release"/"write"/
+"getMinBufferSize" colisiona con otro nombre que el juego pida por JNI.
+
+**Cómo leer el próximo log:** `[audiotrack] puerto BGM 0x... abierto (44100 Hz, stereo, 1024
+frames/bloque)` ⇒ el constructor corrió y el puerto se abrió. Si en cambio aparece
+`sceAudioOutOpenPort(...) fallo (0x...)`, buscar ese código con `psvita-toolkit errcode` --
+candidato más probable: la frecuencia pedida no es una de las que acepta el hardware para el
+tipo de puerto BGM (`SCE_AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ`), lo cual pondría en duda el
+`SCE_AUDIO_OUT_PORT_TYPE_BGM` elegido acá y ameritaría probar `SCE_AUDIO_OUT_PORT_TYPE_MAIN`
+en su lugar. Si el puerto abre pero no sale sonido o sale distorsionado/a mitad de velocidad,
+el sospechoso número uno es la trampa shorts-vs-bytes de arriba: confirmar con un
+`l_info` temporal en `AudioTrack_write` cuántos frames reporta la advertencia de discrepancia
+(el warn de `warnedMismatch`) contra los 1024 esperados.
+
+### Bug #034 — Sonido con estática constante: el grain del puerto de audio era el doble de lo que `_FillBuffer` llena de verdad — 2026-09-17
+
+**Log:** `logs/asphalt6_054.log` (1216 líneas). **Reportado por el usuario:** "sonido horrible"
+justo después del video de intro (línea 91: `AudioTrack: puerto BGM 0x100 abierto (44100 Hz,
+stereo, 1024 frames/bloque)` -- el puerto abre sin error, así que el síntoma no es una falla
+de apertura sino contenido incorrecto).
+
+**Causa raíz (confirmada leyendo `vox::DriverCallbackInterface::_FillBuffer` en
+`decompiled/libasphalt6_armeabi-v7a/ghidra/out_ghidra.c:990164`, no una suposición sobre la
+aritmética de `_InitAT` como en la entrada anterior):**
+```
+_FillBuffer(this, buf /*short* salida*/, param_2 /*frames*/)
+  m_sMixingBuffer = VoxAlloc(param_2 << 3)     // param_2 frames stereo de acumulador int32
+  memset(m_sMixingBuffer, 0, param_2 << 3)
+  ... mezcla cada fuente activa sobre param_2 frames ...
+  for (iVar4 = 0; iVar4 != param_2 * 4; iVar4 += 2)   // param_2*2 iteraciones
+      buf[iVar4] = clamp_to_int16(m_sMixingBuffer[iVar4>>1])
+```
+El loop final escribe exactamente `param_2 * 2` shorts -- confirma que `param_2` (que es
+`framesCapped`, el mismo valor que `_InitAT` calculó como "frames") es de verdad una cuenta
+de frames, y que `_FillBuffer` **solo llena la mitad** de los `framesCapped << 2` shorts que
+`_InitAT` luego le pide a `write()` que mande (ver el bug de unidades documentado en la
+entrada anterior, 2026-09-17 más arriba). En Android real esto es inofensivo porque
+`AudioTrack.write()` es un FIFO bufferizado por el sistema, no una escritura directa a
+hardware -- pero `AudioTrack_ctor` (`source/reimpl/audiotrack.c`) había configurado el grain
+del puerto Vita como `bufferSizeInBytes / channels` (== `framesCapped * 2`, el doble de lo
+correcto), así que cada bloque que `sceAudioOutOutput()` mandaba al hardware tenía su
+segunda mitad sin inicializar (memoria cruda de `NewShortArray`, jamás tocada por ningún
+call) -- una constante de basura sonando intercalada con el audio real en cada bloque, todo
+el tiempo. Exactamente "sonido horrible" con estática/ruido de fondo constante.
+
+**Fix (`source/reimpl/audiotrack.c`):**
+- `grainFrames = bufferSizeInBytes >> 2` (el mismo shift fijo que usa `_InitAT`, NO
+  `bufferSizeInBytes / channels` -- ese denominador "más razonable" era justo la causa).
+- `AT_MIN_BUFFER_BYTES` subido de 2048 a 4096 para que el grain resultante siga siendo 1024
+  frames/bloque (mismo `AUDIO_GRAIN` que `video.cpp` usa para las cinemáticas) en vez de caer
+  a 512.
+- `AudioTrack_write()` no cambió de comportamiento (ya ignoraba el `size` que le pasan para
+  la llamada real a `sceAudioOutOutput()`, que siempre saca el bloque fijo del puerto) -- el
+  bug estaba entero en cómo se calculaba ese bloque fijo en el constructor.
+
+**Se investigó también, y se descartó como causa, el diseño del port hermano
+Asphalt-5-Vita** (`source/audio.cpp`, a pedido del usuario): usa un mezclador propio
+(decodifica sus `.glsnd` con `stb_vorbis`/`minimp3` y mezcla samples él mismo, sin emular
+`AudioTrack` en absoluto -- el motor de Asphalt 5 llama a `GLMediaPlayer.playSound`/
+`loadSound` directo, no a `vox::DriverAndroid`), así que no hay una arquitectura para
+reutilizar 1:1. Sí aporta dos datos de diseño válidos para el futuro: abre su puerto con
+`SCE_AUDIO_OUT_PORT_TYPE_MAIN` a 48000 Hz (no `BGM` a 44100 como acá) y fija su hilo mezclador
+en el Core 1 con prioridad 0x40 -- si el fix de arriba no alcanza en la próxima prueba, esas
+son las dos siguientes variables a probar, en ese orden.
+
+**Verificación:** `psvita-toolkit build --preset debug` limpio. **Sin probar todavía en
+consola real** (pendiente para la próxima sesión).
+
+**Cómo leer el próximo log:** si el sonido sigue con estática en el mismo punto, el candidato
+siguiente es el tipo/frecuencia de puerto (ver el dato de Asphalt-5-Vita arriba: probar
+`SCE_AUDIO_OUT_PORT_TYPE_MAIN` a 48000 Hz en vez de `BGM` a 44100). Si en cambio el sonido
+sale limpio pero cortado/con gaps, revisar la prioridad del hilo `UpdateThreadedAT` (creado
+por el propio `.so` vía `pthread_create_soloader`, sin afinidad/prioridad especial asignada
+todavía) contra la del hilo de render principal.
+
+### Log 055 — el audio del Bug #034 confirmado en el menú; pistas nuevas sobre el auto/elementos invisibles en carrera — 2026-09-17
+
+**Log:** `logs/asphalt6_055.log` (7125 líneas). **Reportado por el usuario:** el audio ya
+suena bien en el menú, pero no en el in-game; pidió una build con hacks mínimos para llegar
+al in-game y depurar visualmente por qué el auto y otros elementos no se ven, y revisar qué
+está generando muchos errores gráficos en el log.
+
+**Confirmado:** el fix del Bug #034 corrió sin problema (`puerto BGM 0x100 abierto`, línea
+93) -- pero el chequeo de discrepancia de `AudioTrack_write()` seguía comparando contra la
+fórmula vieja (`grainFrames*channels` en vez de `grainFrames*4`), así que tiraba un warning
+espurio (`size=4096 no coincide con grainFrames*channels=2048`) aunque el audio real ya salía
+bien. **Corregido** en `source/reimpl/audiotrack.c` (solo el mensaje de log, no cambia el
+audio real: `sceAudioOutOutput()` ya ignoraba `size` para la salida real, como estaba desde
+el Bug #034).
+
+**Sobre "no suena en el in-game":** este log no llega a mostrar una carrera real en curso (se
+queda navegando el menú de Quick Race y, al final, atascado en el mismo bug de menú de pausa
+ya conocido -- `IGMUpdate: Find devolvio NULL (menu_main=0x0, back_btn=0x0)`, spam de +5000
+`method ID 0 not found`, Bugs #026-#028/Log 050-051, sin resolver todavía). Hipótesis sin
+confirmar (pendiente de un log que sí llegue a la carrera): lo que se calla en el in-game
+puede no ser la música (que sale por el `AudioTrack` recién arreglado, un solo canal
+mezclado por VoxEngine) sino los efectos de motor/SFX individuales, que van por un camino
+COMPLETAMENTE DISTINTO y nunca implementado -- `fopen()` crudo de archivos `.wav`/`.vxn`
+sueltos (confirmado en este mismo log: `vfx_car_ferrari_458_italia.wav`,
+`vfx_car_nissan_gtr_r35.wav`, `sfx_menu_start_race.wav`, etc., todos `0x0`, ver CLAUDE.md).
+Si lo que falta es el motor de los autos, es este segundo pipeline (sin tocar) el
+responsable, no una regresión del `AudioTrack`.
+
+**Hallazgo nuevo sobre el auto/elementos invisibles -- el spam de `CNullDriver::createBuffer`
+tiene DOS orígenes, no uno:**
+```
+1925x  this=0x81280900/0x812808F8  llamador=+0x7E7F7C/+0x7E77C8   (ya conocido, Log 042/047:
+                                                                    CBatchDriver::thisAppendBatch)
+   4x  this=0x81280A7C/0x81280A78  llamador=+0x751060/+0x7510E4   (NUEVO)
+   2x  this=0x81280BDC/0x81280BD8  llamador=+0x751060/+0x7510E4   (NUEVO)
+```
+Los dos llamadores nuevos (+0x751060/+0x7510E4) resuelven por símbolo a
+`glitch::scene::CAppendMeshBuffer::CAppendMeshBuffer(unsigned int, unsigned int,
+glitch::video::IVideoDriver*, glitch::video::E_BUFFER_USAGE, unsigned int)` -- el MISMO
+subsistema de batching que `CBatchDriver::thisAppendBatch` (`CAppendMeshBuffer` es el buffer
+que ese método rellena), no un bug independiente. O sea: cada vez que se construye un
+`CAppendMeshBuffer` (2 `createBuffer` por instancia, vertex+index probablemente), termina con
+el vtable de `CNullDriver` en vez del driver real -- confirma que el patrón es sistémico del
+subsistema de batching, no de una llamada aislada.
+
+**Sigue sin resolverse la pregunta de fondo** (la misma del Log 042/047, todavía sin Ghidra
+real para confirmarla): si `CBatchDriver`/`CAppendMeshBuffer` reciben legítimamente un
+`CNullDriver*` porque no necesitan un driver real para SU PARTE del trabajo (`createBuffer`
+podría ser un no-op intencional de estas clases, que dibujan por su cuenta con
+`thisAppendBatch`/`draw()` y solo delegan al driver real en `flush()`), o si esto es
+evidencia de que el driver real nunca llega a estas instancias y por eso el auto no se ve.
+Sin poder abrir el proyecto real de Ghidra para seguir la referencia cruzada de
+`CBatchDriver::flush()` (quién lo llama y con qué frecuencia) y de qué construye estos
+`CAppendMeshBuffer` en particular (¿el auto? ¿la pista? ¿ambos?), esto sigue siendo la misma
+apuesta a ciegas que ya costó las regresiones de los Bugs #017/#019 -- no se aplicó ningún
+patch nuevo sobre esta hipótesis esta sesión.
+
+**Build de diagnóstico para la próxima prueba en consola:** se agregó una opción de CMake,
+`RENDER_CULLING_BYPASS` (default `ON`, preserva el comportamiento actual), que envuelve el
+ÚNICO hook de `patch.c` que altera el render por motivos puramente visuales/especulativos (no
+para evitar un crash): el que fuerza `CSceneManager::isCulled()` a "nunca culled", agregado en
+una sesión anterior para el mismo síntoma de auto/elementos que desaparecen, sin haberse
+confirmado nunca en consola que ayude. Todos los demás hooks de `patch.c` son guardas
+necesarias para llegar al in-game sin crashear (Bugs #015-#033) o son puramente diagnóstico
+(no cambian comportamiento) -- así que apagar SOLO este es la build "con hacks mínimos" que
+el usuario pidió. El VPK actual en `build/asphalt6.vpk` se compiló con
+`-DRENDER_CULLING_BYPASS=OFF` (el repo quedó con el default en `ON` para builds normales
+futuras -- para repetir este build de diagnóstico, `psvita-toolkit build` lo vuelve a exponer
+como opción). Objetivo de la próxima corrida: entrar a una carrera real con este build y
+mirar si el auto/elementos siguen invisibles igual (aísla si el hack de culling importaba
+algo), y bajar un log completo de esa carrera para tener, por primera vez, breadcrumbs +
+createBuffer + watchdog de una carrera en curso de verdad (este log 055 nunca llegó a tener
+uno).
+
+### Log 056 — el audio de carrera mejoró; `CNullDriver::createBuffer` queda DESCARTADO como causa del auto/elementos intermitentes; nueva instrumentación de blending — 2026-09-17
+
+**Log:** `logs/asphalt6_056.log` (7738 líneas), con el build de diagnóstico
+`-DRENDER_CULLING_BYPASS=OFF` de la sesión anterior. **Reportado por el usuario:** el sonido
+mejoró en el in-game y los 60 FPS se mantuvieron, pero los vehículos siguen intermitentes y
+la mayor parte transparentes -- confirmando que el bypass de culling **no** era la causa.
+
+**`CNullDriver::createBuffer` -- pregunta abierta desde el Log 042/047, RESUELTA esta
+sesión (sin necesitar Ghidra real, la función es chica y lineal):** el patrón de llamadas es
+IDÉNTICO al del log 055 (mismos 2 `this`/1925 llamadas cada uno desde
+`CBatchDriver::thisAppendBatch`, más los mismos 2 `this` nuevos desde el ctor de
+`CAppendMeshBuffer`, resueltos por símbolo la sesión anterior). Se leyó el pseudo-C de
+`CNullDriver::createBuffer` (`out_ghidra.c:609108`):
+```c
+E_BUFFER_TYPE CNullDriver::createBuffer(...) {
+  this = operator_new(0x14);
+  IBuffer::IBuffer(this, param3, ...);   // ctor real de un CBuffer host-memory
+  *this = &PTR__CBuffer_00bca0e8;         // vtable REAL de CBuffer, no un stub vacío
+  return this;
+}
+```
+Esto es una implementación real y legítima (asigna un `CBuffer` de memoria host de verdad),
+**compartida por diseño por todos los drivers que no la sobreescriben** -- no un "no-op"
+indicando un driver nulo colado por error. `CBatchDriver` administra su propio pool de
+vértices en CPU vía `CAppendMeshBuffer`/`thisAppendBatch` y solo al hacer `flush()` le pasa
+los datos ya batcheados al driver real -- así que NO necesita (ni sobreescribe) un
+`createBuffer` que reserve memoria de GPU. **Conclusión: el spam de createBuffer NUNCA fue
+el auto/elementos invisibles. Se cierra esta línea de investigación** (abierta desde el Log
+042, hace varias sesiones) -- no vale la pena seguir instrumentándola.
+
+**Con las dos hipótesis principales descartadas (culling y createBuffer), el sospechoso que
+queda es estado de render (blending) filtrado entre pasadas** -- el HUD/UI Flash
+(`gameswf`) usa blending por naturaleza (transparencias de UI), y si algo no restaura
+`glDisable(GL_BLEND)`/`glBlendFunc` antes de que la escena 3D dibuje el auto, heredaría
+blending sin que el material del auto lo haya pedido -- exactamente "transparente" y, si
+depende del orden/timing de draws entre frames, también "intermitente". No hay evidencia
+directa todavía (ninguno de los wrappers actuales de `glEnable`/`glDisable`/`glBlendFunc`
+registraba nada, y `TRACE_GL_CALLS` viene apagado por default) -- **instrumentación nueva
+agregada esta sesión, SIN tocar comportamiento** (mismos `glEnable`/`glDisable`/`glBlendFunc`
+reales, solo se les agrega tracking):
+
+- `source/utils/glutil.c`: `glEnable_soloader`/`glDisable_soloader` ahora recuerdan si
+  `GL_BLEND` está prendido; `glBlendFunc_soloader` (nuevo wrapper, antes `glBlendFunc` iba
+  derecho a vitaGL sin pasar por nuestro código) recuerda los factores. `glDrawArrays`/
+  `glDrawElements` (fuera del `#ifdef TRACE_GL_CALLS`, así que corre siempre, no solo en
+  builds de diagnóstico pesado) loguean `[gl-blend]` con el modo, count, sfactor/dfactor
+  las primeras 40 veces que un draw de >= 300 vértices (filtra quads de UI, un auto tiene
+  muchos más) sale con blending prendido.
+- `source/dynlib.c`: `glBlendFunc` ahora resuelve a `glBlendFunc_soloader` (antes iba
+  directo a la función real de vitaGL, invisible para cualquier diagnóstico).
+
+**Build:** compilado con `RENDER_CULLING_BYPASS` en su default (`ON`) -- ya se confirmó que
+apagarlo no cambia el síntoma, así que se lo deja prendido (es inofensivo, y podría seguir
+ayudando con culling genuino en otros casos) mientras se persigue la pista de blending.
+
+**Cómo leer el próximo log:** buscar `[gl-blend]`. Si aparecen líneas con `BLEND ON` para
+draws grandes, confirma la hipótesis -- el `sfactor`/`dfactor` reportados dicen qué tipo de
+blend (p.ej. `0x1 0x0` = ONE/ZERO, que en la práctica es "sin blending real" pese a estar
+`glEnable`d, vs algo como `0x302 0x303` = SRC_ALPHA/ONE_MINUS_SRC_ALPHA, blending real). Si
+NO aparecen líneas `[gl-blend]` en absoluto durante una carrera con el auto visiblemente
+transparente, la hipótesis de blending queda descartada también y hay que mirar hacia
+`glColorMask`/`glDepthMask` (sin instrumentar todavía, van derechos a la función real) o
+hacia el contenido mismo de la textura/vertex color (alpha del vertex color viniendo en 0,
+p.ej. por el guard de `GetPackFilename`/`Car_Body_Reflection` faltante alimentando algún
+canal de opacidad con basura). Importante: para que este log sirva hay que **entrar a una
+carrera real y ver los autos en pista** -- los logs 054-056 nunca llegaron a ese punto.
+
+### Log 057 — regresión de audio confirmada (puerto BGM no se escucha) + blending confirmado con evidencia real, YA DESDE EL MENU — 2026-09-17 (tarde)
+
+**Log:** `logs/asphalt6_057.log` (6809 líneas). **Reportado por el usuario:** sin sonido en
+el menú y "otras partes del juego" (regresión: los logs 054-056 habían confirmado audio
+funcionando, primero en el menú y después también en carrera), y todos los elementos
+invisibles. El log en sí no muestra ningún crash ni cuelgue -- terminó completando al menos
+una carrera real (`Saved Backup Profile with number of money equal to 7950`) a 60 FPS
+estables.
+
+**Audio -- causa encontrada, no era un bug de código:** el puerto (`puerto BGM 0x100
+abierto`, línea 88) abre sin ningún error, pero no suena. La apertura exitosa no implica
+salida audible: `SCE_AUDIO_OUT_PORT_TYPE_BGM` en el SO de la Vita es un canal pensado para
+"música de fondo" del propio sistema (el reproductor de música mientras se juega), con su
+propio mezclado/volumen separado del audio normal de la aplicación -- no es "un tipo más" de
+puerto genérico para audio de juego. Confirmado por comparación directa: Asphalt-5-Vita
+(`source/audio.cpp`, puerto que SÍ se escucha en consola real) usa
+`SCE_AUDIO_OUT_PORT_TYPE_MAIN` para exactamente este mismo propósito (música + SFX
+mezclados por su propio mixer). **Fix:** `source/reimpl/audiotrack.c` cambiado de `BGM` a
+`MAIN` (mismos 44100 Hz/stereo/1024 frames -- la documentación de `sceAudioOutOpenPort`
+lista 44100 como frecuencia válida para cualquier tipo de puerto; si `MAIN` de verdad
+exigiera 48000 en este hardware, `sceAudioOutOpenPort` lo va a rechazar con un error claro
+en el próximo log, fácil de diagnosticar).
+
+**Elementos invisibles -- confirmado con evidencia real que NO es específico de carrera:**
+la instrumentación de blending agregada en el Log 056 encontró su primera señal real, y
+antes de lo esperado -- durante el `GS_MenuMain` recién llegado ("First time launch the
+app", perfil nuevo), **no** durante una carrera:
+```
+[gl-blend] glDrawElements BLEND ON count=1371 sfactor=0x302 dfactor=0x303 (1/40)
+[gl-blend] glDrawElements BLEND ON count=897  sfactor=0x302 dfactor=0x303 (2/40)
+[gl-blend] glDrawElements BLEND ON count=762  sfactor=0x302 dfactor=0x303 (3/40)
+[gl-blend] glDrawElements BLEND ON count=762  sfactor=0x302 dfactor=0x303 (4/40)
+[gl-blend] glDrawElements BLEND ON count=396  sfactor=0x302 dfactor=0x303 (9/40)
+```
+`sfactor=0x302/dfactor=0x303` es `GL_SRC_ALPHA`/`GL_ONE_MINUS_SRC_ALPHA` -- el blend
+"normal" de libro, no un modo aditivo/raro de efecto especial. El mismo grupo de 5 tamaños
+(1371/897/762/762/396 vértices) se repite exactamente igual cada vez que se topa el límite
+de log (se ve en las 8 rachas de 5 dentro de las 40 líneas capturadas) -- son SIEMPRE los
+mismos 5 draws, consistentes con mallas reales (no quads de UI), reapareciendo cada frame
+del fondo 3D del menú. **Esto cambia el alcance del bug: no es "los autos en carrera", es
+cualquier malla 3D del motor, desde el primer frame del menú principal.** Coherente con que
+el usuario ahora vea "todos los elementos invisibles", no solo el auto.
+
+**Hipótesis reforzada, todavía sin patch (mismo motivo de cautela que con
+`thisAppendBatch`/`CustomResFactory::getTexture`, ambas confirmadas como funciones
+"monstruo" con literales/tablas que no son seguras de tocar a ciegas):** el motor
+probablemente clasifica cada nodo/material como "sólido" o "transparente" en dos listas de
+render separadas (patrón estándar Irrlicht) ANTES de dibujar, y algo hace que mallas que
+deberían ir a la lista sólida terminen en la transparente -- explicaría tanto la
+transparencia (heredan blend SRC_ALPHA real) como lo "intermitente" (el orden de dibujo de
+la lista transparente se resuelve por profundidad, y con múltiples objetos mal clasificados
+compitiendo ahí ese orden es inestable cuadro a cuadro). Encaja con el dato ya confirmado de
+`Car_Body_Reflection._Fixed.PVRTC4.tga` fallando SIEMPRE (si la clasificación depende de
+"¿tiene este slot de textura?" y ese slot vuelve NULL, un fallback conservador a
+"transparente" cuando no se puede determinar el material sería coherente) -- pero eso sigue
+sin confirmarse.
+
+**Instrumentación extendida esta sesión (sin cambiar comportamiento):**
+`gl_blend_draw_check()` en `source/utils/glutil.c` ahora también cuenta y loguea (mismo
+límite de 40) los draws grandes que salen con blending **apagado** (`blend off`, antes solo
+se logueaba el caso ON). Esto da la proporción real en el próximo log: si NINGÚN draw
+grande sale con blend apagado, el problema es más sistémico (blend que nunca se desactiva
+de verdad, o mala aplicación de estado en vitaGL) en vez de "algunos materiales mal
+clasificados" -- si hay una mezcla sana de ambos, refuerza la hipótesis de clasificación por
+material.
+
+**Cómo leer el próximo log:** primero confirmar si el audio ya se escucha (buscar
+`puerto MAIN ... abierto` y, más importante, escuchar la consola). Para blending, comparar
+cuántas líneas `BLEND ON` vs `blend off` aparecen para draws grandes durante el mismo tramo
+del menú -- si es 100% ON, la pista de "vitaGL no aplica bien el estado" sube de prioridad
+sobre "clasificación de material".
+
+### Log 058 — Bug #036: `SCE_AUDIO_OUT_PORT_TYPE_MAIN` exige 48000 Hz; blending confirmado como clasificación de material, no un bug de estado; y la causa REAL del silencio en el menú — 2026-09-17 (noche)
+
+**Log:** `logs/asphalt6_058.log` (7066 líneas). **Reportado por el usuario:** ya no suena en
+ningún lado (peor que antes), los vehículos siguen invisibles, los botones físicos no hacen
+nada, el menú en el in-game sigue bugueado, el menú principal funciona bien.
+
+**Bug #036 -- `MAIN` a 44100 Hz falla de verdad (confirmado, no una nota genérica de la
+documentación):** `sceAudioOutOpenPort(MAIN, 1024, 44100, stereo)` devuelve
+`0x80260008` (`SCE_AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ`), línea 91. El cambio de la sesión
+anterior (`BGM`→`MAIN`, basado en que Asphalt-5-Vita usa `MAIN`) fue un paso en falso: en
+este hardware `MAIN` de verdad requiere 48000 Hz (la nota de `audioout.h` no era genérica).
+**Revertido a `BGM`** en `source/reimpl/audiotrack.c` (que abre sin error a 44100, confirmado
+en logs 055-057) -- queda documentado como opción futura resamplear a 48000 si hiciera falta
+`MAIN` para la mezcla de carrera, pero no fue necesario para lo que sigue.
+
+**La razón real del silencio en el menú -- no era ni el tipo de puerto ni el AudioTrack:**
+`Java_..._GLMediaPlayer_nativeInit` (`out_ghidra.c:10033`) resuelve **otro sistema de sonido
+completo y separado** de `vox::DriverAndroid`: `loadMusic`, `playMusic(IFI)I`,
+`playSound(IFIF)I`, `registerSoundFile(ILjava/lang/String;I)V`, `setVolumeMusic`,
+`pauseMusic`, etc. -- confirmado leyendo la función completa. Hasta esta sesión **solo
+`loadMovie` estaba implementado** de esos ~40 métodos; el resto caía en el default seguro de
+FalsoJNI (silencioso, sin loguear siquiera porque SÍ estaban registrados en `nameToMethodId`
+como no-ops en algunos casos). O sea: la música del menú (y probablemente la mayoría de los
+SFX de UI/choques/motor) nunca iban a sonar por más que se arreglara `AudioTrack` -- son dos
+caminos de audio distintos que coexisten (uno para la mezcla de carrera vía VoxEngine, este
+para música + SFX generales).
+
+**Los assets no son archivos sueltos -- están empaquetados en `file00a.bin` (143 MB), formato
+descifrado con un script Python contra el archivo real (no documentado en ningún lado):**
+una secuencia plana de 630 entradas autocontenidas, cada una
+`magic("QL\x04\x05")+ver(u32)+flags(u16)+hash1(u32)+hash2(u32)+sizeA(u32)+sizeB(u32)+
+nameLen(u32)+name+data` -- sin compresión (`sizeA==sizeB` en las 630), el `data` es un WAV
+PCM16 crudo con su propio header RIFF. Verificado exacto: el tamaño de la primera entrada
+(111356 bytes) menos 44 (header RIFV estándar) coincide bit a bit con el chunk `data` del
+WAV (111312 bytes). Los nombres (`mem_gp_sfx_npc_4na_idle.wav`, `sfx_intro_rev_4_electric.wav`,
+etc.) son EXACTAMENTE los mismos que aparecían fallando con `fopen(...): 0x0` en todos los
+logs anteriores -- confirma que esos fallos de `fopen` sueltos son un camino que nunca iba a
+resolver nada (ni con un fix de rutas), el dato real siempre estuvo en este pack.
+
+**Implementado esta sesión (nuevo, no un fix sobre código viejo):**
+- `source/reimpl/soundpack.c/.h` -- escanea `file00a.bin` una vez (630 entradas, `~1 KiB` de
+  índice en RAM) y resuelve `nombre -> {offset, tamaño}` para leer cualquier WAV a demanda.
+- `source/reimpl/gmp_audio.c/.h` -- puente JNI completo de `GLMediaPlayer` (música con loop +
+  pool de 8 voces de SFX), mezclador propio por interpolación lineal (mismo patrón que
+  `source/audio.cpp` de Asphalt-5-Vita: ganancia con rampa para evitar clicks, soft-limiter
+  `tanh`, hilo dedicado en Core 1). A diferencia de Asphalt-5-Vita (OGG/MP3 vía `stb_vorbis`/
+  `minimp3`, con un hilo cargador aparte porque decodificar tardaba hasta 4+ segundos), acá
+  el WAV es PCM16 crudo -- un `memcpy`, no un códec -- así que la carga es sincrónica sin
+  hilo aparte; si algún WAV puntual resultara pesado igual, ese es el próximo lugar a mirar.
+  Puerto propio `SCE_AUDIO_OUT_PORT_TYPE_MAIN` a 48000 Hz (separado del `BGM` de
+  `vox::DriverAndroid` y del `VOICE` de las cinemáticas -- los tres pueden convivir).
+- `source/java.c` -- registrados ids 80-99 (`registerSoundFile`, `loadMusic`, `playMusic`,
+  `playSound`, `setPitch`, volumenes, etc.). Las firmas exactas de los métodos con string
+  de tipo legible en el pseudo-C se tomaron literales (`"(IFI)I"`, `"(IFIF)I"`,
+  `"(ILjava/lang/String;I)V"`, etc.); las que Ghidra no pudo inlinear como texto
+  (`DAT_00a89c98`, `DAT_00a9402c`, ...) se dedujeron por qué OTROS métodos ya conocidos
+  comparten la misma constante (p.ej. `DAT_00a89acc` es la misma que usan
+  `sendAppToBackground`/`setFullyLoaded`, ya registrados como `()V` -- así se dedujo que
+  `pauseAllMusic`/`resumeAllMusic`/`stopAllSounds`/`stopAllMusic`/`update` también son
+  `()V`). Sin implementar a propósito (fuera de alcance esta sesión, no parecen críticos):
+  emisores posicionales (`isEmitterPlaying`/`setEmitterVolume`/etc.), streaming de fondo
+  (`loadBackground`), y el intercambio de pools de memoria (`swapPool`/`swapAllPools`) --
+  quedan registrados como no-ops seguros si hiciera falta evitar ruido de log a futuro.
+
+**Blending -- confirmado que NO es un bug de estado de vitaGL:** el log trajo, por primera
+vez, una mezcla real: 8 draws grandes distintos (1182 a 5589 vértices) salieron con blend
+apagado, y el MISMO grupo fijo de 4 draws (1371/897/762/762 vértices) salió con blend
+prendido -- ambos casos repitiéndose consistentes cuadro a cuadro. Esto descarta "vitaGL no
+aplica bien `glDisable(GL_BLEND)`" (si fuera así, NADA saldría con blend apagado) y confirma
+que es clasificación por objeto/material: unos pocos elementos SIEMPRE van a la lista
+transparente. Dato nuevo para la próxima sesión: este grupo fijo de 4 aparece igual en la
+carga del MENÚ, con vértices demasiado pocos y constantes para ser el auto completo -- son
+candidato más probable a ser decoración fija del menú (vidrio/brillo/luces), no
+necesariamente el bug del auto. **El límite de 40 líneas del diagnóstico se agota siempre
+durante el menú/garage, antes de llegar a una carrera real en pista** -- sigue pendiente ver
+qué pasa con el blending durante gameplay real.
+
+**Botones físicos:** confirmado por qué "no hacen nada en particular" -- **nunca se
+implementó** lectura de `SceCtrl` en este port (`grep` sobre `source/utils/touch.c` y
+`source/main.c`: cero resultados). No es una regresión de esta sesión; está en el checklist
+de `PORTING_PLAN.md` ("Input de botones/sticks (hoy solo táctil)") desde el principio.
+Falta identificar qué esquema de control espera el motor (¿touch-drag tipo volante? ¿inclinar
+el dispositivo? ¿ambos según opción de menú?) antes de mapear nada a ciegas -- la skill
+`psvita-porting` (`references/input_handling.md`) documenta el patrón correcto (nunca un slot
+de touch "extra", competir por los mismos 0-4 slots que los dedos reales) para cuando se
+haga. Pendiente para una sesión dedicada.
+
+**Menú en el in-game bugueado:** sigue siendo el mismo bug ya trackeado (Bugs #026-#028,
+Log 050/051): `Find("menu_main")`/`Find("back_btn_main")` NULL. Sin evidencia nueva esta
+sesión.
+
+**Verificación:** `psvita-toolkit build --preset debug` limpio (incluye los 2 archivos
+nuevos). **Sin probar todavía en consola real.**
+
+**Cómo leer el próximo log:** buscar `[gmp_audio] listo` (el puerto MAIN de música/SFX abrió
+bien) y `[gmp_audio] cargado '<nombre>' (...)` cada vez que se reproduce un sonido nuevo por
+primera vez -- si en cambio aparece `no esta en file00a.bin` para un nombre que sí se ve en
+el pack (630 entradas, confirmado), revisar `soundpack_init()` (¿escaneo cortado antes de
+tiempo?). Para blending, entrar de verdad a una carrera y ver si aparecen líneas
+`[gl-blend]` nuevas con el auto visiblemente transparente en pantalla en ese momento exacto.
 

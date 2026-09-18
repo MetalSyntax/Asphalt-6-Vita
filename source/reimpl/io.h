@@ -86,6 +86,29 @@ int close_soloader(int fd);
 
 int fclose_soloader(FILE *f);
 
+size_t fread_soloader(void *ptr, size_t size, size_t count, FILE *f);
+size_t fwrite_soloader(const void *ptr, size_t size, size_t count, FILE *f);
+int fseek_soloader(FILE *f, long int offset, int origin);
+long int ftell_soloader(FILE *f);
+int fseeko_soloader(FILE *f, off_t offset, int origin);
+off_t ftello_soloader(FILE *f);
+void rewind_soloader(FILE *f);
+int feof_soloader(FILE *f);
+int ferror_soloader(FILE *f);
+int fflush_soloader(FILE *f);
+int fgetc_soloader(FILE *f);
+int getc_soloader(FILE *f);
+int fputc_soloader(int ch, FILE *f);
+int putc_soloader(int ch, FILE *f);
+char *fgets_soloader(char *s, int n, FILE *f);
+int fputs_soloader(const char *s, FILE *f);
+int fileno_soloader(FILE *f);
+int setvbuf_soloader(FILE *f, char *buf, int mode, size_t size);
+int ungetc_soloader(int c, FILE *f);
+int remove_soloader(const char *pathname);
+int unlink_soloader(const char *pathname);
+void fcache_invalidate(const char *path);
+
 int closedir_soloader(DIR *dir);
 
 int fcntl_soloader(int fd, int cmd, ...);

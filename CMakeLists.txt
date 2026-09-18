@@ -74,6 +74,22 @@ if (TRACE_GL_CALLS)
   add_definitions(-DTRACE_GL_CALLS)
 endif()
 
+# El UNICO hack de patch.c que altera comportamiento de render por motivos
+# puramente visuales (no para evitar un crash/cuelgue): fuerza
+# CSceneManager::isCulled() a "nunca culled", agregado especulativamente para
+# el auto/elementos que desaparecen en carrera (ver bug abierto en
+# port_progress.md, log 054/055) sin haber confirmado la causa real. Apagarlo
+# aisla si el hack ayuda, no hace nada, o enmascara el sintoma real (el spam
+# de CNullDriver::createBuffer desde CBatchDriver::thisAppendBatch y el ctor
+# de CAppendMeshBuffer) -- todos los demas hooks de patch.c son guardas
+# necesarias para llegar a in-game sin crashear (Bugs #015-#033) o son
+# puramente diagnostico (no cambian comportamiento), asi que apagar ESTE es lo
+# que da la build "con hacks minimos" para depurar visibilidad.
+option(RENDER_CULLING_BYPASS "Forzar isCulled() a 'nunca culled' (hack visual, no un guard anti-crash)" ON)
+if (RENDER_CULLING_BYPASS)
+  add_definitions(-DRENDER_CULLING_BYPASS)
+endif()
+
 # Unique debug definition for loader's logging to not interfere with anything
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_definitions(-DDEBUG_SOLOADER)
@@ -96,6 +112,9 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/dynlib.c
                source/java.c
                source/patch.c
+               source/reimpl/audiotrack.c
+               source/reimpl/gmp_audio.c
+               source/reimpl/soundpack.c
                source/reimpl/bits/_ctype.c
                source/reimpl/egl.c
                source/reimpl/errno.c
@@ -155,6 +174,12 @@ set(VITAGL_LIB ${VITAGL_DIR}/libvitaGL.a)
 # en source/utils/glutil.c) en vez de en sceClibPrintf, que en retail no se puede leer.
 set(VITAGL_MAKE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2")
 separate_arguments(VITAGL_MAKE_ARGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS}")
+
+# Horneado en el binario para que CADA log diga con qué VITAGL_MAKE_FLAGS se compiló
+# (source/main.c lo imprime al boot) -- sin esto, comparar un log "funciona bien" contra
+# uno "falla" de sesiones distintas no dice si el cambio de comportamiento vino de un
+# flag que se tocó entremedio o de otra cosa (build viejo linkeado sin limpiar, etc.).
+add_definitions(-DVITAGL_MAKE_FLAGS_STR="${VITAGL_MAKE_FLAGS}")
 
 # Forzar rebuild completo de vitaGL cuando VITAGL_MAKE_FLAGS cambie (la regla
 # OUTPUT de abajo sola no reconstruye si la .a ya existe -- sin esto, editar

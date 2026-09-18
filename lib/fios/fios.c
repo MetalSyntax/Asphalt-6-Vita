@@ -13,7 +13,7 @@
 
 #define MAX_PATH_LENGTH 256
 #define RAMCACHEBLOCKSIZE (128 * 1024)
-#define RAMCACHEBLOCKNUM 64
+#define RAMCACHEBLOCKNUM 512
 
 static int64_t g_OpStorage[SCE_FIOS_OP_STORAGE_SIZE(64, MAX_PATH_LENGTH) / sizeof(int64_t) + 1];
 static int64_t g_ChunkStorage[SCE_FIOS_CHUNK_STORAGE_SIZE(1024) / sizeof(int64_t) + 1];
@@ -38,12 +38,12 @@ int fios_init(const char * path) {
     params.pathMax = MAX_PATH_LENGTH;
 
     params.threadAffinity[SCE_FIOS_IO_THREAD] = 0x20000;
-    params.threadAffinity[SCE_FIOS_CALLBACK_THREAD] = 0;
+    params.threadAffinity[SCE_FIOS_CALLBACK_THREAD] = 0x20000;
     params.threadAffinity[SCE_FIOS_DECOMPRESSOR_THREAD] = 0;
 
-    params.threadPriority[SCE_FIOS_IO_THREAD] = 64;
-    params.threadPriority[SCE_FIOS_CALLBACK_THREAD] = 191;
-    params.threadPriority[SCE_FIOS_DECOMPRESSOR_THREAD] = 191;
+    params.threadPriority[SCE_FIOS_IO_THREAD] = 64 + 2;
+    params.threadPriority[SCE_FIOS_CALLBACK_THREAD] = 64 + 2;
+    params.threadPriority[SCE_FIOS_DECOMPRESSOR_THREAD] = 191 - 2;
 
     res = sceFiosInitialize(&params);
     if (res < 0)

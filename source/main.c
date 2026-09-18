@@ -26,7 +26,7 @@ int _newlib_heap_size_user = 256 * 1024 * 1024;
 #define GAME_LANGUAGE_ENGLISH 0
 
 #ifdef USE_SCELIBC_IO
-int sceLibcHeapSize = 4 * 1024 * 1024;
+int sceLibcHeapSize = 8 * 1024 * 1024;
 #endif
 
 so_module so_mod;
@@ -43,6 +43,11 @@ int main() {
     // macros no generan código fuera de builds Debug (ver logger.h) y este canario
     // tiene que existir también en Release.
     _log_print(LT_INFO, "boot: arrancando main()");
+    _log_print(LT_INFO, "build: VITAGL_MAKE_FLAGS=%s", VITAGL_MAKE_FLAGS_STR);
+
+    // Set main thread priority and affinity (TheFloW's practice: Core 2 for game, Core 1 for FIOS2 I/O)
+    sceKernelChangeThreadPriority(0, 127);
+    sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_2);
 
     soloader_init_all();
 
