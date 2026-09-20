@@ -2,8 +2,8 @@
 #include "utils/init.h"
 #include "utils/glutil.h"
 #include "utils/logger.h"
-#include "utils/touch.h"
 #include "utils/watchdog.h"
+#include "input.h"
 #include "video.h"
 
 #include <stdlib.h>
@@ -140,6 +140,14 @@ int main() {
     void (* GLGame_nativeTouchReleased)(void *env, void *thiz, jint x, jint y, jint id) =
         (void *)so_symbol(&so_mod, "Java_com_gameloft_android_ANMP_GloftA6HP_GLGame_nativeTouchReleased");
 
+    // Entradas fisicas (Xperia Play): (env, clazz, keyCode) -> mov r0,r2 ->
+    // notifyKeyPressed/Released -> GamePadManager::GamePadEvt (ver input.c).
+    // El BACK (4) y el MENU (82) actuan al SOLTAR, segun el estado actual.
+    void (* GLGame_nativeSetOnKeyDown)(void *env, void *thiz, jint keycode) =
+        (void *)so_symbol(&so_mod, "Java_com_gameloft_android_ANMP_GloftA6HP_GLGame_nativeSetOnKeyDown");
+    void (* GLGame_nativeSetOnKeyUp)(void *env, void *thiz, jint keycode) =
+        (void *)so_symbol(&so_mod, "Java_com_gameloft_android_ANMP_GloftA6HP_GLGame_nativeSetOnKeyUp");
+
     // Fix confirmed con so-crash-triage (dump asphalt6-psp2core-1788232196-0x0000752183):
     // GLGame_nativeInit hace "*lockPointer4 = 1;" como su segunda instruccion real (sin
     // chequeo de NULL), pero `lockPointer4` solo se malloc'ea dentro de nativeStart(),
@@ -179,8 +187,14 @@ int main() {
         GameRenderer_nativeInit(&jni, NULL, SCREEN_W, SCREEN_H, GAME_LANGUAGE_ENGLISH);
     if (GameRenderer_nativeResize) GameRenderer_nativeResize(&jni, NULL, SCREEN_W, SCREEN_H);
 
-    touch_init(GLGame_nativeTouchPressed, GLGame_nativeTouchMoved,
-               GLGame_nativeTouchReleased);
+    // Input unificado (ver source/input.c): panel tactil frontal 1:1 en
+    // 960x544 + botones fisicos como touches sinteticos (estilo
+    // Asphalt-5-Vita: cruceta/stick izq-der = direccion, SQUARE/CROSS =
+    // frenos en las esquinas inferiores, TRIANGLE = nitro flotante) y como
+    // keycodes de gamepad (BACK = CIRCLE, MENU = START).
+    input_init(GLGame_nativeTouchPressed, GLGame_nativeTouchMoved,
+               GLGame_nativeTouchReleased,
+               GLGame_nativeSetOnKeyDown, GLGame_nativeSetOnKeyUp);
 
     gl_report_mem("tras nativeInit");
     watchdog_mark("bucle principal", 0);
@@ -206,7 +220,7 @@ int main() {
         // el jugador no toca nada (típico en menús), y las esperas de display/audio en las
         // que están bloqueados el motor y vitaGL nunca vuelven -- parece un freeze.
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
-        touch_poll();
+        input_poll(&jni, NULL);
 
         unsigned int swaps_before = gl_swap_count;
         if (GameRenderer_nativeRender) {

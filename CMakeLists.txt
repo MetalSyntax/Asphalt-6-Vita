@@ -108,6 +108,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi
 
 add_executable(${CMAKE_PROJECT_NAME}
                source/main.c
+               source/input.c
                source/video.cpp
                source/dynlib.c
                source/java.c
@@ -132,7 +133,6 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/utils/init.c
                source/utils/logger.c
                source/utils/settings.c
-               source/utils/touch.c
                source/utils/utils.c
                source/utils/watchdog.c
                lib/falso_jni/FalsoJNI.c

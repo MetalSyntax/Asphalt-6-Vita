@@ -554,3 +554,99 @@ jfloat GLMediaPlayer_getMasterVolume(jmethodID id, va_list args) {
 void GLMediaPlayer_update(jmethodID id, va_list args) {
     (void) id; (void) args;
 }
+
+/*
+ * Log 065: 17 metodos que GLMediaPlayer_nativeInit resuelve (0x3d0b00) no
+ * estaban en la tabla de FalsoJNI -> el motor guardaba jmethodID 0 y cada
+ * llamada caia en "method ID 0 not found!" con el default seguro
+ * (int=-1, boolean=FALSE, void=no-op). Dos de esos defaults eran gates
+ * cerrados que explican el silencio total fuera del motor (vox/AudioTrack):
+ * - isRecoveringAudio() poll por frame devolvia -1 (!= 0 = "recuperando") y
+ * - isFinishBackground() devolvia FALSE ("fondo sin terminar"),
+ * asi que el motor jamas llegaba a loadMusic/playMusic/playSound (en el 065
+ * no hay NI UNA linea [gmp_audio]: sfx_get nunca corrio).
+ * Firmas confirmadas una por una en el disasm (pares nombre/firma en r2/r3
+ * antes de cada `ldr pc,[ip,#0x1c4]`).
+ */
+void GLMediaPlayer_onRecoverAudio(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_recoverAudio(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_reinit(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+jint GLMediaPlayer_isRecoveringAudio(jmethodID id, va_list args) {
+    (void) id; (void) args;
+    return 0; // 0 = audio sano, no hay recovery pendiente
+}
+
+void GLMediaPlayer_loadBackground(jmethodID id, va_list args) {
+    (void) id; (void) args;
+    // no-op: nuestras cargas (sfx_get) son sincronas, no hay fondo pendiente
+}
+
+jboolean GLMediaPlayer_isFinishBackground(jmethodID id, va_list args) {
+    (void) id; (void) args;
+    return JNI_TRUE; // carga sincrona = siempre "terminada", no traba el wait-loop
+}
+
+void GLMediaPlayer_loadSoundGroup(jmethodID id, va_list args) {
+    (void) id;
+    (void) va_arg(args, jint);
+    (void) va_arg(args, jint); // boolean llega como int en varargs
+}
+
+void GLMediaPlayer_swapPool(jmethodID id, va_list args) {
+    (void) id;
+    (void) va_arg(args, jint);
+}
+
+void GLMediaPlayer_swapAllPools(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_setSwapTimer(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_setEnableSwapPool(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+jboolean GLMediaPlayer_isEmitterPlaying(jmethodID id, va_list args) {
+    (void) id; (void) args;
+    return JNI_FALSE; // no trackeamos emisores 3D; el one-shot de base igual suena
+}
+
+void GLMediaPlayer_setEmitterVolume(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_setEmitterPitch(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_setEmitterParams(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_stopEmitter(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_pauseEmitter(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_resumeEmitter(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}
+
+void GLMediaPlayer_getEmitter(jmethodID id, va_list args) {
+    (void) id; (void) args;
+}

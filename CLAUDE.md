@@ -46,7 +46,10 @@ elegí "Continuar con un port existente" apuntando a esta carpeta.
      `.wav` no son archivos sueltos: están empaquetados en `file00a.bin` (630 entradas, formato
      propio descifrado a mano -- ver `reimpl/soundpack.c`). Implementado en
      `source/reimpl/gmp_audio.c` (mezclador propio, puerto `SCE_AUDIO_OUT_PORT_TYPE_MAIN` a
-     48000 Hz, música con loop + pool de 8 voces de SFX). Sin probar en consola todavía.
+     48000 Hz, música con loop + pool de 8 voces de SFX). Segunda tanda registrada (log
+     065): recovery/emitters/pools/background de `GLMediaPlayer_nativeInit` (41/41
+     métodos, firmas del disasm) -- sin esos, `isRecoveringAudio()` devolvía -1 por
+     frame y el motor jamás reproducía nada. Sin probar en consola todavía.
 - **Elementos 3D intermitentes/transparentes, YA DESDE EL MENÚ (no específico de carrera):**
   confirmado con evidencia real (logs 057/058) que un grupo FIJO de ~4 mallas (762-1371
   vértices) se dibuja con `GL_BLEND` activo (`SRC_ALPHA`/`ONE_MINUS_SRC_ALPHA`) desde el
@@ -67,7 +70,8 @@ elegí "Continuar con un port existente" apuntando a esta carpeta.
   (Bugs #015-#021) y el abort por excepción C++ con idioma no inicializado al primer arranque
   (Bug #022 en `StringManager`), el juego supera el guardado de perfil, carga la UI Flash
   (`gameswf`) y alcanza el menú principal (`GS_MenuMain`), presentando frames continuamente.
-  Pendiente: verificación interactiva de controles físicos/touch, confirmar en consola real
+  Pendiente: verificación en consola real de los controles físicos/touch (mapeo ya
+  implementado en `source/input.c`, estilo Asphalt-5-Vita -- falta prueba interactiva),
   que el cambio de puerto de audio a `MAIN` (log 057) se escucha, y diagnosticar la
   transparencia/intermitencia de mallas 3D (ver más arriba).
 

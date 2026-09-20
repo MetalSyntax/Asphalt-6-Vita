@@ -207,7 +207,9 @@ jint GLGame_getResourceLengthSoundRaw(jmethodID id, va_list args) { return 0; }
  * ese camino nunca sonaron porque solo `loadMovie` estaba implementado, sin
  * importar qué tan bien funcionara el AudioTrack de la carrera. Implementación
  * completa en `reimpl/gmp_audio.c` (música + pool de SFX, leyendo los `.wav`
- * empaquetados en `file00a.bin` vía `reimpl/soundpack.c`).
+ * empaquetados en `file00a.bin` vía `reimpl/soundpack.c`), INCLUIDA la segunda
+ * tanda (recovery/emitters/pools/background, log 065): sin esos el motor guarda
+ * id 0 y `isRecoveringAudio()` por frame devuelve -1 = "recuperando" eterno.
  *
  * `nativeLoadMovie(const char*)` (exportado, `libasphalt6.so`) es quien arma
  * el jstring y llama `CallStaticVoidMethod(GLMediaPlayer.class, loadMovie,
@@ -314,11 +316,36 @@ NameToMethodID nameToMethodId[] = {
     { 97, "setMasterVolume", METHOD_TYPE_VOID },
     { 98, "getMasterVolume", METHOD_TYPE_FLOAT },
     { 99, "update", METHOD_TYPE_VOID },
+
+    // Segunda tanda de GLMediaPlayer_nativeInit (0x3d0b00): faltaban en la
+    // tabla -> id 0 -> "method ID 0 not found!" + default (log 065, spam
+    // x3000 de methodIntCall por frame). Firmas confirmadas en el disasm.
+    { 100, "onRecoverAudio", METHOD_TYPE_VOID },
+    { 101, "recoverAudio", METHOD_TYPE_VOID },
+    { 102, "reinit", METHOD_TYPE_VOID },
+    { 103, "isRecoveringAudio", METHOD_TYPE_INT },
+    { 104, "isEmitterPlaying", METHOD_TYPE_BOOLEAN },
+    { 105, "setEmitterVolume", METHOD_TYPE_VOID },
+    { 106, "setEmitterPitch", METHOD_TYPE_VOID },
+    { 107, "setEmitterParams", METHOD_TYPE_VOID },
+    { 108, "stopEmitter", METHOD_TYPE_VOID },
+    { 109, "pauseEmitter", METHOD_TYPE_VOID },
+    { 110, "resumeEmitter", METHOD_TYPE_VOID },
+    { 111, "getEmitter", METHOD_TYPE_VOID },
+    { 112, "loadBackground", METHOD_TYPE_VOID },
+    { 113, "isFinishBackground", METHOD_TYPE_BOOLEAN },
+    { 114, "loadSoundGroup", METHOD_TYPE_VOID },
+    { 115, "swapPool", METHOD_TYPE_VOID },
+    { 116, "swapAllPools", METHOD_TYPE_VOID },
+    { 117, "setSwapTimer", METHOD_TYPE_VOID },
+    { 118, "setEnableSwapPool", METHOD_TYPE_VOID },
 };
 
 MethodsBoolean methodsBoolean[] = {
     { 10, GLGame_nativeIsXperia },
     { 61, GLMediaPlayer_isMediaPlaying },
+    { 104, GLMediaPlayer_isEmitterPlaying },
+    { 113, GLMediaPlayer_isFinishBackground },
 };
 MethodsByte methodsByte[] = {};
 MethodsChar methodsChar[] = {};
@@ -342,6 +369,7 @@ MethodsInt methodsInt[] = {
     { 83, GLMediaPlayer_playMusic },
     { 93, GLMediaPlayer_isMusicLoaded },
     { 94, GLMediaPlayer_playSound },
+    { 103, GLMediaPlayer_isRecoveringAudio },
 };
 MethodsLong methodsLong[] = {};
 MethodsObject methodsObject[] = {
@@ -389,6 +417,22 @@ MethodsVoid methodsVoid[] = {
     { 96, GLMediaPlayer_stopAllSounds },
     { 97, GLMediaPlayer_setMasterVolume },
     { 99, GLMediaPlayer_update },
+    { 100, GLMediaPlayer_onRecoverAudio },
+    { 101, GLMediaPlayer_recoverAudio },
+    { 102, GLMediaPlayer_reinit },
+    { 105, GLMediaPlayer_setEmitterVolume },
+    { 106, GLMediaPlayer_setEmitterPitch },
+    { 107, GLMediaPlayer_setEmitterParams },
+    { 108, GLMediaPlayer_stopEmitter },
+    { 109, GLMediaPlayer_pauseEmitter },
+    { 110, GLMediaPlayer_resumeEmitter },
+    { 111, GLMediaPlayer_getEmitter },
+    { 112, GLMediaPlayer_loadBackground },
+    { 114, GLMediaPlayer_loadSoundGroup },
+    { 115, GLMediaPlayer_swapPool },
+    { 116, GLMediaPlayer_swapAllPools },
+    { 117, GLMediaPlayer_setSwapTimer },
+    { 118, GLMediaPlayer_setEnableSwapPool },
 };
 
 /*

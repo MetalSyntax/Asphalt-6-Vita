@@ -138,12 +138,15 @@ Thumb y el código real de estas funciones es ARM -- para desensamblar a mano us
       del menú compilan y linkean sin errores).
 - [x] Presentación de frames (`swapEGLBuffers`, Bug #013) -- la pantalla de carga se ve y anima.
 - [x] Assets: `fopen` directo sobre `ux0:data/asphalt6/data/`.
-- [x] Input táctil (`source/utils/touch.c`, firma real confirmada en el disasm).
+- [x] Input táctil + físico (`source/input.c`, firmas reales confirmadas en el disasm:
+      touch `(x,y,id)` y `nativeSetOnKeyDown/Up(keyCode)` -> `GamePadManager::GamePadEvt`).
+      Estilo Asphalt-5-Vita, sin probar todavía en consola real.
 - [x] Instrumentación de diagnóstico (hilo testigo + anillo de migas + logs unificados).
 - [ ] **Llegar al menú principal** -- bloqueante actual, Bug #015.
 - [x] Audio (`android/media/AudioTrack` emulado sobre `sceAudioOut`, no hay OpenSL/OpenAL) --
       implementado, sin probar todavía en consola real.
-- [ ] Input de botones/sticks (hoy solo táctil).
+- [x] Input de botones/sticks (implementado en `source/input.c`, sin probar todavía en
+      consola real).
 - [ ] Gameplay, LiveArea/VPK final, pruebas largas en hardware.
 
 ## 5. Herramientas

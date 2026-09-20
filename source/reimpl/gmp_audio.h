@@ -64,6 +64,32 @@ jfloat GLMediaPlayer_getMasterVolume(jmethodID id, va_list args);
 // -- llamado por el motor todos los frames; no hace falta que haga nada --
 void GLMediaPlayer_update(jmethodID id, va_list args);
 
+// -- recuperacion de foco de audio (Android) + carga de fondo + pools --
+// Firmas reales confirmadas desensamblando GLMediaPlayer_nativeInit (0x3d0b00):
+// cada GetMethodID deja (nombre, firma) en r2/r3 antes del `ldr pc,[ip,#0x1c4]`.
+void GLMediaPlayer_onRecoverAudio(jmethodID id, va_list args);   // ()V
+void GLMediaPlayer_recoverAudio(jmethodID id, va_list args);     // ()V
+void GLMediaPlayer_reinit(jmethodID id, va_list args);           // ()V
+jint GLMediaPlayer_isRecoveringAudio(jmethodID id, va_list args); // ()I
+void GLMediaPlayer_loadBackground(jmethodID id, va_list args);   // ()V
+jboolean GLMediaPlayer_isFinishBackground(jmethodID id, va_list args); // ()Z
+void GLMediaPlayer_loadSoundGroup(jmethodID id, va_list args);   // (IZ)V
+void GLMediaPlayer_swapPool(jmethodID id, va_list args);         // (I)V
+void GLMediaPlayer_swapAllPools(jmethodID id, va_list args);     // ()V
+void GLMediaPlayer_setSwapTimer(jmethodID id, va_list args);     // ()V
+void GLMediaPlayer_setEnableSwapPool(jmethodID id, va_list args); // ()V
+
+// -- emisores 3D (choques, ambiente, derrapes): control fino posicional sin
+// implementar; el sonido de base (playSound) suena igual --
+jboolean GLMediaPlayer_isEmitterPlaying(jmethodID id, va_list args); // (II)Z
+void GLMediaPlayer_setEmitterVolume(jmethodID id, va_list args); // (IIF)V
+void GLMediaPlayer_setEmitterPitch(jmethodID id, va_list args);  // (IIF)V
+void GLMediaPlayer_setEmitterParams(jmethodID id, va_list args); // (IIFF)V
+void GLMediaPlayer_stopEmitter(jmethodID id, va_list args);      // (II)V
+void GLMediaPlayer_pauseEmitter(jmethodID id, va_list args);     // (II)V
+void GLMediaPlayer_resumeEmitter(jmethodID id, va_list args);    // (II)V
+void GLMediaPlayer_getEmitter(jmethodID id, va_list args);       // (II)V
+
 #ifdef __cplusplus
 }
 #endif

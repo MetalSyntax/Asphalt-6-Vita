@@ -4044,3 +4044,97 @@ Los vehículos (auto del jugador, competidores de la IA, vehículos de tráfico 
 
 **Verificación:**
 Compilación completa y limpia de `eboot.bin` y `asphalt6.vpk` sin errores.
+
+## Sesión 2026-09-20: Controles físicos como touch (estilo Asphalt-5-Vita)
+
+**Pedido del usuario:** que los botones físicos actúen como el touch, con layout tipo
+Asphalt 5: cruceta izq/der = touch en pantalla, frenos abajo en las esquinas, botón
+flotante para el nitro.
+
+**Confirmado con desensamblado (capstone, modo ARM, sobre `libasphalt6.so`) antes de tocar código:**
+- `nativeSetOnKeyDown/Up(env,clazz,keyCode)` = `mov r0,r2; b notifyKeyPressed/Released`
+  (0x3c8c84/0x3c9234) -> `GamePadManager::GamePadEvt(down, mascara, 0)` (0x48a46c).
+- Tabla keycode -> máscara (ramas incondicionales de `notifyKeyPressed`): 103 -> 4,
+  108 -> 8, 106 -> 1, 105 -> 2 (variantes con precondición de estado para
+  304/305/307/310/311 -> mismas máscaras). 4 (BACK) ignorado al pulsar, al soltar hace el
+  back/pausa del estado actual; 82 (MENU) al soltar setea el flag de menú (bit 0x100000);
+  19-22 (DPAD Android) IGNORADOS -- el juego es era Xperia Play, no entiende DPAD.
+- `CarControl::UpdateSteeringOnscreenButtons` (0x4ece98) lee los bits 4 y 8 como par de
+  dirección (`ands r6,r3,#4` / `tst r3,#8`); `SetManualInputFlags` (0x4ed9f8) mezcla los
+  bits 1/2/4/8 en TODOS los modos de control (también inclinación) -> la dirección por
+  gamepad vale sin importar el esquema activo en Options. Signo izq/der sin confirmar:
+  si van al revés, intercambiar KEY_STEER_L/R en `source/input.c` (una línea).
+- `notifyTouchPress/Moved/Released` (0x3c8a00/0x3c897c/0x3c8a84) NO indexan arreglo por
+  id: arman el SEvent en pila (tipo +0, id +4, X +8, Y +12). Sin riesgo de heap-corruption
+  por id grande, pero los sinteticos compiten igual por los mismos slots 0-7 (skill
+  psvita-porting/input_handling: id virtual -2, nunca slot "extra").
+- `nativeAccelerometer` solo escribe 3 globales: NO se alimenta desde el stick a
+  propósito (un neutro mal elegido sesgaría la dirección en modo inclinación; hoy esos
+  globales quedan en 0 = recto, igual que antes).
+
+**Implementado (`source/input.{c,h}` nuevo, reemplaza `source/utils/touch.{c,h}`; `main.c`
+resuelve `nativeSetOnKeyDown/Up` y llama `input_init`/`input_poll`):**
+- Cruceta IZQ/DER + L1/R1 + stick izq = tap (110,330)/(850,330) + keys 103/108.
+- SQUARE/CROSS = frenos (80,470)/(880,470) + keys 106/105.
+- TRIANGLE = nitro flotante (800,350), solo táctil, con prioridad de slot (expulsa un
+  freno si no hay libre, como en A5).
+- CIRCLE = BACK (4), START = MENU (82), por flanco (sin auto-repeat).
+- Panel real intacto (misma escala por `minDisp/maxDisp`, mismos logs `[touch]`).
+- Nuevos logs `[pad] FAKE PRESS/RELEASE` y `[pad] KEYDOWN/KEYUP` (siempre visibles,
+  sirven para calibrar posiciones como se hizo en A5 con asphalt5_072.log).
+
+**Sin probar en consola todavía.** Posiciones de HUD y signo izq/der son la parte a
+validar con el log en mano. Build pendiente (`psvita-toolkit build`) -- no hay vitasdk en
+esta sesión, solo chequeo `gcc -fsyntax-only` de `input.c` con stubs.
+
+## Sesión 2026-09-20: Sin SFX salvo el motor (log 065) -- 17 métodos GLMediaPlayer sin registrar
+
+**Síntoma reportado por el usuario:** solo suena el motor (vox/AudioTrack); en menú y
+carrera no hay golpes, ambiente ni nada. En el 065 no hay NI UNA línea `[gmp_audio]`
+(`sfx_get` nunca corrió: `loadMusic`/`playMusic`/`playSound` jamás llegaron).
+
+**Causa raíz (disasm, sin adivinar):** `GLMediaPlayer_nativeInit` (0x3d0b00) resuelve 41
+nombres (extraídos uno por uno: cada `GetMethodID` deja (nombre, firma) en r2/r3 antes
+del `ldr pc,[ip,#0x1c4]`); 17 NO estaban en `nameToMethodId[]` de `java.c` -> el motor
+guardó jmethodID 0 y cada llamada cayó en `method ID 0 not found!` con el default
+(int=-1, boolean=FALSE). El spam `methodIntCall id 0` x3000 por frame del 065 es
+`isRecoveringAudio() ()I` devolviendo -1 = "recuperando" eterno, y
+`isFinishBackground() ()Z` devolvía FALSE: dos gates cerrados que impiden que el motor
+llegue a cargar/reproducir nada. Firmas de los 41 confirmadas en el mismo disasm
+(p. ej. `playSound (IFIF)I`, `setEmitterParams (IIFF)V`, `getEmitter (II)V` (void),
+`loadSoundGroup (IZ)V`).
+
+**Fix (`source/java.c` + `source/reimpl/gmp_audio.{c,h}`):** registrados los 17 con su
+tipo correcto (ids 100-118): `isRecoveringAudio` -> 0, `isFinishBackground` ->
+JNI_TRUE (cargas sincronas = siempre terminadas, no traba el wait-loop),
+`isEmitterPlaying` -> JNI_FALSE, resto (recovery/emitters/pools/background/update)
+no-ops. Sin probar en consola todavía: el próximo log debería mostrar CERO líneas
+`method ID 0` de audio y las primeras `[gmp_audio] cargado ...`.
+
+## Sesión 2026-09-20: Pausa rompe la UI (log 065) -- IGMProbe, sin parche a ciegas
+
+**Síntoma reportado por el usuario:** al pausar, la interfaz se rompe y colapsa (soft
+crash: el juego sigue presentando frames, log 065 llega a 4359+ frames).
+
+**Confirmado con disasm (sin adivinar):**
+- `IGMUpdate` (0x418a40) hace `Find(peli 0xc, "menu_main")` -> r7 y
+  `Find(peli 0xc, "back_btn_main")` -> r0 (strings resueltos por `ldr+add pc`);
+  `SetText("menu_main.resume_btn.mc_label.tf", ...)` (0x686094) asume que el subárbol
+  existe. `StateOnFlashEvent` (0x414fe0) compara el nodo clickeado contra
+  `Find("btn_GLIVE")` / `Find("back_btn_main")` / `Find("control_btn")`; solo el click
+  sobre `back_btn_main` (inexistente) llama a `ResumeFromIGM` (0x418934, el toggle).
+- `OnMenuReset` (0x411090) cachea 60 punteros con `Find(peli 9, tabla[i])`; la tabla
+  (0xb984bc) es TODA `hud.*` -> peli 9 = HUD (178hud.swf), peli 0xc = IGM.
+- `menu_main`/`back_btn_main`/`custom_controls_btn` NO existen como clips estáticos en
+  `178igMenu.swf` (FWS sin comprimir: grep fiable); solo en `178igMenu_test.swf` (que el
+  motor nunca carga: el nombre `igMenu.swf` sale de tabla estática 0xad0524, sin
+  variantes) y en .dat packs. En Android se adjuntan dinámicamente por ActionScript.
+- NO hay parche C++ seguro que cree contenido Flash: se deja el diagnóstico.
+- Nota: con el mapeo nuevo (CIRCLE/START -> BACK/MENU por `nativeSetOnKeyDown/Up`),
+  retomar desde la pausa por tecla podría funcionar aunque la UI siga rota: a probar.
+
+**Sonda agregada (`source/patch.c`, hook_igm_vis/igm_null):** en el camino NULL se pasa
+la pelicula (r5, viva en el sitio) y UNA vez por arranque se loguea
+`IGMProbe: movie=%p main_menu=%p hud.container=%p menu_main=%p
+menu_custom_controls=%p` (Find es solo-lectura; el log colapsa el resto). El próximo log
+dirá si la peli es la correcta (main_menu presente) y falta solo el attach dinámico.

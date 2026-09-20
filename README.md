@@ -54,6 +54,11 @@ backed by a real console log/crash-dump — no guessing).
 - **Touch Input**: the front touch panel is mapped 1:1 to the engine's own touch UI
   (`GLGame_nativeTouchPressed/Moved/Released`) — menus and in-race steering/controls work via
   touch.
+- **Physical controls (Asphalt-5 style)**: D-Pad/stick left-right (plus L1/R1) steer via
+  synthetic screen touches *and* the engine's native gamepad keys; SQUARE/CROSS hit the brake
+  corners, TRIANGLE fires the floating nitro button, CIRCLE is BACK and START is MENU
+  (`GLGame_nativeSetOnKeyDown/Up`, `source/input.c`). Synthetic touches share the same slot
+  allocator as real fingers, so they can never collide.
 - **Intro FMV**: the intro video plays through a software FFmpeg decoder.
 - **Assets from `ux0:`**: resource loading reads the game's packed/loose asset files from
   `ux0:data/asphalt6/data/`.
@@ -77,10 +82,14 @@ backed by a real console log/crash-dump — no guessing).
 - **Graphical glitch on vehicle windows**: caused by a car-reflection texture
   (`*_Fixed.PVRTC4.tga`) that was never extracted from the original APK data — a missing-asset
   issue, not a code bug.
-- **No audio yet**: the engine's audio layer (`vox::DriverAndroid`) talks to
-  `android/media/AudioTrack` through raw JNI calls that this port doesn't intercept yet.
-- **No physical button mapping**: only the touchscreen is wired up right now; D-Pad/analog/face
-  buttons aren't mapped to menu or in-race actions.
+- **Audio (engine sound works; music/SFX pending hardware test)**: the race mix
+  (`vox::DriverAndroid` → `android/media/AudioTrack`) is emulated over SceAudio
+  (`source/reimpl/audiotrack.c`), and menu music + SFX (`GLMediaPlayer`, samples packed
+  in `file00a.bin`) run through a dedicated mixer (`source/reimpl/gmp_audio.c`,
+  `source/reimpl/soundpack.c`). A second batch of `GLMediaPlayer` methods
+  (audio-focus recovery, 3D emitters, pool swapping — found via disassembly of
+  `GLMediaPlayer_nativeInit`) was just registered; without them the engine thought
+  audio was "recovering" forever and stayed silent. Not yet verified on hardware.
 
 ---
 
@@ -152,7 +161,7 @@ parsing), use **psvita-port-toolkit** instead of raw `cmake`/`make`.
 
 - `source/`: Native C/C++ loader — lifecycle (`main.c`, `java.c`, `dynlib.c`), the engine's
   runtime ARM patch set (`patch.c`, one confirmed bug/hook at a time), and video/input
-  (`video.cpp`, `utils/touch.c`).
+  (`video.cpp`, `input.c`).
 - `source/reimpl/`: Minimal reimplementations of the Android surfaces the engine expects (EGL,
   asset manager, memory, pthreads, errno, 64-bit time).
 - `source/utils/`: On-device diagnostics — `watchdog.c` (thread/frame-pacing heartbeat),

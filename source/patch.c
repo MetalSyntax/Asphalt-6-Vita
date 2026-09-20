@@ -1472,14 +1472,40 @@ static void hook_sr2(void) {
     );
 }
 
-void igm_null(uint32_t menu_main, uint32_t back_btn) {
+void igm_null(uint32_t menu_main, uint32_t back_btn, void *movie) {
     l_error("[patch] IGMUpdate: Find devolvio NULL (menu_main=0x%08X, back_btn=0x%08X), copy omitido (log 041)",
             (unsigned)menu_main, (unsigned)back_btn);
+    /*
+     * Log 065: menu_main/back_btn_main/custom_controls_btn no existen como clips
+     * estaticos en 178igMenu.swf (grep: solo en 178igMenu_test.swf + .dat packs) --
+     * en Android se adjuntan dinamicamente por ActionScript al abrir la pausa y aca
+     * no. Esta sonda (UNA sola linea por arranque, sin spam) dice sobre LA MISMA
+     * pelicula del fallo: si main_menu (estatico, deberia estar) aparece y
+     * hud.container (de 178hud.swf, NO deberia estar) no, la pelicula es la
+     * correcta y falta solo el attach dinamico; cualquier otro patron apunta a
+     * otra causa sin adivinar. Find es solo-lectura (IGMUpdate ya lo llamo dos
+     * veces justo antes sobre la misma pelicula).
+     */
+    static int s_igm_probe_done = 0;
+    if (!s_igm_probe_done && movie) {
+        s_igm_probe_done = 1;
+        void *(* find)(void *, const char *) =
+            (void *(*)(void *, const char *))((uintptr_t)so_mod.text_base + 0x683acc);
+        void *p_main_menu = find(movie, "main_menu");
+        void *p_hud_container = find(movie, "hud.container");
+        void *p_menu_main = find(movie, "menu_main");
+        void *p_custom = find(movie, "menu_custom_controls");
+        l_error("[patch] IGMProbe: movie=%p main_menu=%p hud.container=%p menu_main=%p "
+                "menu_custom_controls=%p (log 065)",
+                movie, p_main_menu, p_hud_container, p_menu_main, p_custom);
+    }
 }
 
 // Guarda de GS_Race::IGMUpdate (log 041 + dump 1789185959): r7 = Find("menu_main"),
-// r0 = Find("back_btn_main"). Si alguno es NULL, se omite el ldrb/strb de visibilidad
-// en +0x9b y se resume en 0x418AD4 con r1 = 0x20086 ya configurado para GetString.
+// r0 = Find("back_btn_main"), r5 = la pelicula (RenderFX* de GetFxByByFlashFile(0xc)).
+// Si alguno es NULL, se omite el ldrb/strb de visibilidad en +0x9b y se resume en
+// 0x418AD4 con r1 = 0x20086 ya configurado para GetString. r5 se pasa a igm_null
+// como 3er argumento para la sonda IGMProbe (log 065).
 __attribute__((naked, target("arm")))
 static void hook_igm_vis(void) {
     __asm__ volatile(
@@ -1495,6 +1521,7 @@ static void hook_igm_vis(void) {
         "ldr pc, [r12]\n"      // resume en 0x418AD4 (g_skip_igm)
         "1:\n"
         "push {r0-r3, r12, lr}\n"
+        "mov r2, r5\n"         // arg3: la pelicula (para IGMProbe)
         "mov r1, r0\n"         // arg2: back_btn_main
         "mov r0, r7\n"         // arg1: menu_main
         "bl igm_null\n"
