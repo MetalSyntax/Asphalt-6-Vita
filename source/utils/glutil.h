@@ -73,6 +73,11 @@ void glPixelStorei_soloader(GLenum pname, GLint param);
 // comportamiento, para ver si algun draw grande (candidato: geometria de auto via
 // CBatchDriver) sale con blending prendido sin que el motor lo haya pedido para ESE draw.
 void glBlendFunc_soloader(GLenum sfactor, GLenum dfactor);
+// Log 062: mismo rastreo que glBlendFunc_soloader de arriba pero para el estado de
+// profundidad -- hipotesis de que el skybox de zonas abiertas tapa el auto por un test o
+// mascara de profundidad mal configurados al momento de dibujarlo (ver glutil.c).
+void glDepthMask_soloader(GLboolean flag);
+void glDepthFunc_soloader(GLenum func);
 
 void glShaderSource_soloader(GLuint shader, GLsizei count,
                              const GLchar **string, const GLint *_length);

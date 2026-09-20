@@ -75,7 +75,17 @@
 #endif
 
 #ifdef SAFER_DRAW_SPEEDHACK
-#define SAFE_DRAW_SIZE_THRESHOLD (0x8000) // Minimum bytes of vertices data for a draw to be handled with speedhack
+// Asphalt-6-Vita (log 061): 0x8000 (32 KiB) cae justo en el rango de las mallas
+// dinamicas del juego (vehiculos de ~1000-5600 vertices x ~36 B = 36-200 KiB,
+// nitros/particulas reescritas por frame). Por encima del umbral vitaGL pasa el
+// puntero cliente DIRECTO a la GPU sin copiar al temp pool ni mantenimiento de
+// cache: con triple buffering el motor reusa/sobrescribe ese buffer antes de que
+// la GPU termine, y las mallas aparecen y desaparecen de forma intermitente a
+// 60 fps (menu perfecto porque sus draws son chicos y se copian). 0x40000
+// (256 KiB) cubre todas las mallas dinamicas vistas (max ~200 KiB) y deja el
+// camino directo solo para draws gigantes, que es donde el temp pool circular
+// realmente necesita proteccion (GPU hangs de A5 Bugs #19/#20/#22).
+#define SAFE_DRAW_SIZE_THRESHOLD (0x40000) // Minimum bytes of vertices data for a draw to be handled with speedhack
 #endif
 
 #ifdef DEBUG_THREAD_SAFENESS
@@ -295,6 +305,24 @@ extern int NEW_DISPLAY_HEIGHT; // Requested new display height in pixels
 #include "utils/mem_utils.h"
 
 #include "texture_callbacks.h"
+
+#ifdef SAFER_DRAW_SPEEDHACK
+// Asphalt-6-Vita: diagnostico del camino "directo" (sin copiar) del speedhack de
+// SAFE_DRAW_SIZE_THRESHOLD -- si algun draw REAL en carrera todavia lo toma tras la suba a
+// 256 KiB (log 061), esto lo confirma en el proximo log con el tamano exacto en vez de
+// seguir adivinando el tamano maximo de malla dinamica. Capado a 8 lineas (misma practica
+// que el resto del port desde el log 060: jamas un log por-llamada en un bucle caliente).
+static inline __attribute__((always_inline)) void vgl_log_speedhack_bypass(const char *who, uint32_t size) {
+#ifdef LOG_ERRORS
+	static int n = 0;
+	if (n < 8) {
+		vgl_log("[speedhack] %s: draw directo sin copiar, %u bytes > umbral %u (posible causa de flicker si aparece en carrera)\n",
+			who, (unsigned)size, (unsigned)SAFE_DRAW_SIZE_THRESHOLD);
+		n++;
+	}
+#endif
+}
+#endif
 
 // Fixed-function pipeline shader cache settings
 #define FFP_SHADER_CACHE_MAGIC 28 // This must be increased whenever ffp shader sources or shader mask/combiner mask changes

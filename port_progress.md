@@ -3609,3 +3609,438 @@ el pack (630 entradas, confirmado), revisar `soundpack_init()` (¿escaneo cortad
 tiempo?). Para blending, entrar de verdad a una carrera y ver si aparecen líneas
 `[gl-blend]` nuevas con el auto visiblemente transparente en pantalla en ese momento exacto.
 
+### Log 059 — se ubica en Ghidra la función real que clasifica sólido/transparente; el cupo
+de diagnóstico de blending se agotaba SIEMPRE durante la carga, nunca vimos una carrera real;
+y aparece una textura de reflejo compartida que falla sin fallback — 2026-09-18
+
+**Log:** `logs/asphalt6_059.log` (7024 líneas). **Reportado por el usuario:** siguen
+invisibles todos los "elementos dinámicos". A diferencia de los logs 054-058, este SÍ llega
+a una carrera real: navega Quick Race → Tuning → selección de auto (BMW Mini 2010) → pista
+Bahamas, y hay ~4300 frames de juego con inputs táctiles de manejo tras la carga (línea
+~1900 en adelante) -- es el primer log que probablemente tiene al auto en pantalla.
+
+**Se encontró la función Ghidra real de clasificación sólido/transparente (ya no es
+especulación "sin Ghidra real"):**
+`glitch::scene::CSceneManager::registerNodeForRendering` (`out_ghidra.c:444491`), el switch
+sobre `E_SCENE_NODE_RENDER_PASS` (case 3, línea ~444588) es exactamente el punto de la
+"clasificación por objeto/material, patrón Irrlicht de dos listas" que ya se sospechaba
+desde el Log 057/058. La decisión es:
+```c
+material = *param_2;                       // boost::intrusive_ptr<CMaterial const>&
+if (material == NULL) {
+    // sin material -> SIEMPRE a la lista SOLIDA (SDefaultNodeEntry, this+0x78)
+} else {
+    technique = CMaterial::getTechnique();           // índice de técnica activa
+    flags = *(material->effect[+4]->techniques[+0x18][technique*0xc + 8]);
+    if ((flags & 0x100000) != 0 && this[0x1b8] == 0)
+        -> lista TRANSPARENTE (STransparentNodeEntry, this+0x84)
+    else
+        -> lista SOLIDA (SDefaultNodeEntry, this+0x78)
+}
+```
+O sea: el bit `0x100000` de un array de técnicas por-material (`STechnique`, tipo real
+confirmado por símbolos de COLLADA como `CColladaHardwareMatrixSkinTechnique`) decide todo.
+Un material sin puntero (`material==NULL`) va a SÓLIDO, no a transparente -- descarta la
+hipótesis anterior de "fallback conservador a transparente cuando no se puede determinar el
+material". `this[0x1b8]` es un booleano de la escena que puede forzar todo a sólido (posible
+interruptor de "modo sin transparencias" del propio motor, sin uso confirmado todavía).
+
+**Hallazgo nuevo en el log, más prometedor que el bit en sí -- una textura de reflejo
+GENÉRICA (no por-auto) falla sin ningún fallback, a diferencia de TODAS las demás:**
+en este log, cada textura que falla `fopen(...): 0x0` (son ~200+) es seguida, casi siempre en
+la línea siguiente, por un `[ALOG][HDVD] Loaded texture from file: <ruta distinta, en
+minúsculas/vía #temp>` -- confirma que el fallback de resolución de rutas del propio motor
+(mayúsculas/ubicación original del APK -> minúsculas/ubicación real empaquetada) funciona
+bien para prácticamente todo. **Excepción única en las 7024 líneas:**
+`Car_Body_Reflection._Fixed.PVRTC4.tga` (línea 1091) falla y NO tiene ninguna línea de
+"Loaded texture" después -- es la ÚNICA textura de todo el log sin fallback exitoso. Se
+carga una sola vez, muy temprano (antes de cualquier auto específico), con nombre genérico
+sin prefijo de auto -- consistente con ser una textura BASE/compartida que arma la técnica
+de reflejo para TODOS los materiales reflectivos (probablemente antes de que cada auto la
+sobreescriba con la suya, como `BMW_Mini_2010_Bahamas_Car_Body_Reflection_ForShader.png` en
+línea 6469, que SÍ tiene fallback exitoso). El nombre `.PVRTC4.tga` (formato de compresión de
+PowerVR/iOS, no el ETC/ETC2 típico de Android) sugiere que es un recurso de una build
+multiplataforma que puede nunca haber existido en el APK de Android tal cual -- falta
+confirmar si esto también falla en Android real (no sería bug de puerto) o si es genuinamente
+un archivo que sí está pero con una ruta que nuestro `fopen`/resolución de rutas no cubre
+(sí sería bug de puerto). Sin tocar `CustomResFactory::getTexture`/`GetPackFilename`
+todavía -- mismo motivo de cautela que sesiones anteriores (función "monstruo").
+
+**El motivo real por el que nunca vimos blending en una carrera real, en NINGÚN log hasta
+ahora:** el cupo de diagnóstico (`GL_BLEND_DRAW_LOG_MAX`, `source/utils/glutil.c`) se agota
+siempre en los primeros ~90 draws grandes de TODO el proceso -- que ocurren en el primer
+segundo, durante el fondo 3D del menú/garage, mucho antes de que el usuario llegue a
+Quick Race. Confirmado con este log: las 80 líneas `[gl-blend]` (40 ON + 40 OFF) están TODAS
+entre las líneas 1644-1725, y el log sigue 5300 líneas más (incluida la carrera real) sin
+loguear una sola línea más. **Instrumentación agregada esta sesión (sin cambiar
+comportamiento):** `GL_BLEND_DRAW_LOG_MAX` subido de 40 a 200 (100 ON + 100 OFF), y cada
+línea `[gl-blend]` ahora incluye `frame=%u` con `gl_swap_count` (el mismo contador del
+latido `[gl] latido: N frames presentados`) para poder filtrar en el próximo log qué líneas
+son de carga/menú (frame bajo) y cuáles son de la carrera real (frame alto) sin tener que
+adivinar ni agregar un hook nuevo sobre una función del juego.
+
+**Build:** `psvita-toolkit build --preset debug` limpio. **Sin probar todavía en consola
+real.**
+
+**Cómo leer el próximo log:** buscar `[gl-blend]` y mirar el campo `frame=`. Si TODAS las
+líneas siguen teniendo `frame` bajo (menú/carga) incluso con el cupo en 200, el auto en pista
+nunca llega a generar 100 draws grandes con blend ON u OFF antes de que el cupo se llene con
+ruido de menú -- en ese caso el próximo paso es forzar el reseteo del contador cuando arranca
+la carrera real (falta identificar el hook correcto, ninguno agregado todavía). Si en cambio
+aparecen líneas con `frame` alto (carrera en curso) y el auto se ve transparente en pantalla
+en ese momento, eso confirma por primera vez que la clasificación de
+`registerNodeForRendering` (arriba) afecta al auto mismo, no solo a decoración de menú.
+
+### Log 060 — reconfirmado el cuelgue de `CBatchDriver::thisAppendBatch`, ahora de 59+ s y
+cuantificado (~2912 llamadas a `createBuffer`, ~50/s), durante la PANTALLA DE CARGA de
+Bahamas, no en plena carrera — 2026-09-18
+
+**Log:** `logs/asphalt6_060.log` (7235 líneas). **Reportado por el usuario:** volvió el error
+gráfico de los vehículos en el menú, los vehículos y power-ups siguen invisibles, FPS
+inestables.
+
+**No es "FPS inestables" en el sentido de jitter -- es el mismo cuelgue total ya documentado
+en los Logs 047/049 (`thisAppendBatch`), esta vez más largo y con datos nuevos:** el testigo
+marca 3 volcados de "sin frames nuevos" (10s, luego 40s) con el hilo principal en
+`CORRIENDO` (no bloqueado) durante **59+ segundos sin avanzar un frame**
+(`nativeRender ENTRA #482 hace 58986 ms`, línea 5880). Con el número de línea a mano se pudo
+CONTAR por primera vez: 2912 llamadas a `CNullDriver::createBuffer` durante la ventana exacta
+del cuelgue (líneas 3273-6532), el 99.9% repartidas 1455/1455 entre los MISMOS 2 punteros de
+siempre (`this=0x812808F8` llamador `+0x7E77C8`, `this=0x81280900` llamador `+0x7E7F7C`,
+ambos dentro de `CBatchDriver::thisAppendBatch`) -- **~50 recreaciones de buffer por
+segundo, sobre el mismo par de objetos**, sin que ninguna llegue nunca a un `flush()` real
+mientras dura el cuelgue. Confirma sin ambigüedad la teoría del Log 047 ("no es una pasada de
+conteo, es la soldadura de vértices real que nunca termina") con un número concreto en vez de
+una sospecha.
+
+**Dato nuevo -- el cuelgue ocurre en la PANTALLA DE CARGA de la pista, no en plena carrera:**
+`Bahamas_loading.tga` se carga en la línea 2167; el cuelgue arranca ~1100 líneas después
+(línea 3271, frame 624) y el usuario nunca llega a manejar en este log. Esto es coherente con
+la hipótesis ya escrita en el Log 047 de que los 2 `this` fijos son instancias de batching
+POR-NIVEL (geometría estática opaca/transparente de Bahamas completa), armadas una sola vez
+al cargar el circuito -- no algo ligado a autos individuales ni a poder ups. Un freeze de un
+minuto en la pantalla de carga explica bien la sensación de "FPS inestables" que reporta el
+usuario (el juego no está tartamudeando, se congela del todo y después arranca).
+
+**El diagnóstico de blending (Log 059, cupo subido a 200) NO alcanzó a ver la carrera esta
+vez tampoco -- y ahora se entiende por qué el cupo más alto no fue suficiente:** las 400
+líneas `[gl-blend]` quedaron todas entre `frame=160` y `frame=199` (39 frames), o sea el
+mismo grupo fijo de mallas de decoración del menú (confirmado en el Log 057/058/059) sigue
+generando ~5 draws grandes por frame TODOS los frames del menú -- con ese ritmo, ningún cupo
+razonable (sin inundar el log) va a sobrevivir hasta pasar menú+garage+pantalla de carga.
+Subir el número no es la solución; hace falta resetear el contador al entrar de verdad a la
+pista, y no hay todavía un hook confirmado y seguro para ese punto de transición -- se deja
+pendiente, no se agregó ningún hook nuevo esta sesión (mismo motivo de cautela que las
+regresiones de los Bugs #017/#019 al emular mal un prólogo).
+
+**No se tocó código esta sesión.** No hay evidencia de una causa NUEVA distinta de las dos ya
+conocidas y documentadas extensamente (`thisAppendBatch` para el cuelgue/desaparición,
+`registerNodeForRendering`+clasificación de material para la transparencia de decoración de
+menú) -- los síntomas reportados (glitch de vehículos en menú, power-ups invisibles, FPS
+inestables) son consistentes con ambas causas ya conocidas, no apuntan a algo distinto.
+
+**Recomendación concreta para la próxima sesión, distinta de lo ya intentado:** las últimas
+~4 sesiones (Log 047/049/059/060) llegaron todas a la misma pared -- "hace falta el proyecto
+real de Ghidra (con base de datos) para separar código real de tablas de salto/literal pools
+dentro de `thisAppendBatch`, y no está disponible en este entorno". Como alternativa que NO
+depende de eso: el toolkit standalone (`psvita-toolkit`) tiene soporte de GDB -- en vez de
+seguir leyendo disassembly estático, la próxima vez que se reproduzca este cuelgue de 59s en
+consola real es la primera oportunidad concreta de **adjuntar GDB en vivo mientras el cuelgue
+está ocurriendo** (dura casi un minuto, tiempo de sobra para atacharse) y mirar el PC/stack
+real del hilo principal dentro de `thisAppendBatch` -- eso resuelve la ambigüedad de
+literal-pool/jump-table que bloqueó el disassembly estático en el Log 049, porque se estaría
+viendo la ejecución real en vez de adivinar el flujo de instrucciones.
+
+
+## Sesión 2026-09-18: log 060 -- el propio diagnóstico frenaba la carga + CopyTex dummy rompía visuales
+
+**Origen:** reporte del usuario con `logs/asphalt6_060.log`: texturas rotas en menú, vehículo
+mal, carga lentísima, y "al ingresar al menu en el ingame todo se rompe". El log 060 es build
+**Debug** (trazas `[DEBUG]`/`[WARNING]` activas) y llega hasta carga de Bahamas (frame 624,
+`nativeRender ENTRA #482` sin avanzar, +433914 strcmp en 5 s).
+
+**Hallazgo 1 (carga lenta): el diagnóstico era parte del problema.** Tres fuentes de
+sceIoWrite por-llamada en el camino caliente, todas visibles en el propio log 060:
+(a) `CNullDriver::createBuffer` logueaba UNA línea por llamada y durante la carga de Bahamas
+se llama MILES de veces en bucle cerrado (llamadores 0x7E77C8/0x7E7F7C alternados, ~230
+líneas seguidas solo en el tramo mostrado); (b) `[gl] compile/link BEGIN/END` + `[gl-mem]`
+por programa (138 shaders / 69 programas = ~400 writes por carga); (c) `[gl-blend]` por draw
+grande (200 líneas solo en menú, frames 160-199). Con el hilo de render atascado escribiendo
+a la SD, los frames caen a +3/5 s y cualquier menú abierto en ese momento "se rompe".
+Práctica de Rinnegatamante: jamás loguear por-llamada en bucle caliente.
+
+**Hallazgo 2 (vehículo mal + menú ingame roto): `glCopyTexImage2D` dummy.** Estaba stubbeado
+a textura 1x1 y `glCopyTexSubImage2D` a no-op (trade-off heredado de A5). Pero en este motor
+la reflexión de carrocería (`Car_Body_Reflection`, `garage_car_body_reflection_forshader`),
+la cadena de post-procesado del menú (shaders con `blurOffsetX`/`threshold`) y el fondo
+atenuado del menú de pausa leen el framebuffer con estas llamadas -- con el dummy el
+vehículo sale mal y al abrir el menú ingame el fondo sale corrupto. Primero corrección,
+después se mide FPS.
+
+**Cambios aplicados (compilan limpio a objeto con arm-vita-eabi-gcc, Release y Debug):**
+- `source/patch.c` (`cnulldriver_log_this`): rate-limit -- 4 primeras líneas por método
+  (identifican this/llamador) + latido cada 4096. Comparación por puntero con forward
+  declarations a nivel de archivo (cero costo en el bucle).
+- `source/utils/glutil.c`: `gl_info` pasa a solo-Debug; BEGIN/END de compile/link y
+  `gl-mem` por programa solo en Debug (fallos de compilado/linkeado y latido siguen siempre);
+  `gl_blend_draw_check` no-op en Release; `glCopyTex*` restaurados a llamadas reales;
+  `glPixelStorei(GL_UNPACK_ALIGNMENT, 1)` en `gl_init()` (decoders TGA entregan filas
+  compactas; hay texturas NPOT de 16x32/128x32); `glCompressedTexImage2D` reporta (acotado a
+  8) si vitaGL rechaza un formato -- el próximo log dirá si PVRTC4 pasa o no.
+- `source/reimpl/io.c` (`io_expected_miss`): silencia el warn de misses esperados (SFX
+  sueltos `*.wav`/`*.vxn` que viven en `file00a.bin`, sondas sueltas `*PVRTC4*`/`*NOMIPMAP*`
+  que viven en los `.dat`, `glsl.config`, `*.car`). El negative cache sigue evitando el
+  acceso a SD; esto evita además el write al log en Debug (cientos de líneas por carga).
+- `source/reimpl/net.{c,h}` (nuevo) + `dynlib.c` + `CMakeLists.txt`: `gethostbyname`/
+  `getaddrinfo` fail-fast solo para `gameloft.com` (telemetría `ets.gameloft.com` del
+  TrackingManager: 3 POSTs con reintentos por sesión en el log 060, cada uno bloqueando un
+  hilo en DNS/connect sin backend real). El resto de hosts pasa a resolución real.
+- **Nota de uso:** el log 060 es Debug -- para medir carga/FPS hay que probar en Release
+  (en Release las trazas `[DEBUG]`/`[INFO]`/`[WARNING]` no generan código). Debug solo para
+  triage.
+
+**Pendiente de consola real:** confirmar (1) que la carga menú→Bahamas baja de tiempo,
+(2) que el vehículo/reflexión se ve bien, (3) que el menú de pausa ingame no corrompe el
+fondo, (4) qué dice el nuevo reporte de `glCompressedTexImage2D` sobre PVRTC4. Si el FPS
+empeora por el CopyTex real, medir antes de recortar (el profiler manda, no la intuición).
+
+## Sesión 2026-09-18: log 061 -- flicker ingame (vehículos/nitros aparecen y desaparecen)
+
+**Síntoma (usuario + log):** menú perfecto, pero en carrera todos los elementos dinámicos
+(vehículos, nitros, otros) aparecen y desaparecen de forma intermitente. El log 061 corre a
+~59 fps ingame sin crashes (frames +280/5 s) con `RENDER_CULLING_BYPASS` activo (isCulled→0
+instalado, líneas 8-9) -- NO es stall de CPU ni frustum culling del motor, es corrección de
+render a framerate completo. `glCompressedTexImage2D` sin errores: PVRTC4 sube bien.
+
+**Causa probable (mecanismo confirmado en código, pendiente de consola):**
+`SAFER_DRAW_SPEEDHACK` (`DRAW_SPEEDHACK=2`) en `lib/vitaGL/source/{custom_shaders,ffp}.c`:
+arrays de vértices en memoria cliente mayores a `SAFE_DRAW_SIZE_THRESHOLD` (0x8000 = 32 KiB)
+se pasan a la GPU por puntero DIRECTO, sin copiar al temp pool ni mantenimiento de caché.
+El umbral cae justo en el rango de las mallas dinámicas (vehículos 1000-5600 vértices x
+~36 B = 36-200 KiB; nitros/partículas reescritas por frame): con triple buffering el motor
+reusa/sobrescribe ese buffer antes de que la GPU termine, y la malla sale con datos
+rancios/rotos de forma intermitente. El menú es perfecto porque sus draws son chicos (se
+copian) o estáticos. Firma exacta del reporte.
+
+**Cambios:**
+- `lib/vitaGL/source/shared.h`: `SAFE_DRAW_SIZE_THRESHOLD` 0x8000 → 0x40000 (256 KiB,
+  cubre la malla dinámica máxima vista ~200 KiB; el camino directo queda solo para draws
+  gigantes, donde el temp pool sí necesita protección contra los GPU hangs de A5).
+- `source/utils/glutil.c`: revertido `glPixelStorei(GL_UNPACK_ALIGNMENT, 1)` en `gl_init`
+  -- vitaGL lo rechaza con `GL_INVALID_ENUM` (línea 49 del 061, solo acepta
+  `GL_UNPACK_ROW_LENGTH`) y dejaba el flag de error pegado (upload de video pasó de
+  err=0x0000 en 060 a err=0x0500 en 061). Sin beneficio, puro riesgo.
+- `source/reimpl/io.c`: restaurado `#define FCACHE_ENABLED 1` (mi sesión anterior lo
+  había borrado por accidente al insertar `io_expected_miss` -- el 061 corre SIN file
+  cache: cero líneas `[fcache]`, todo a la SD); `io_expected_miss` ampliado a `.png`/`.tga`
+  sueltos (sondas como `BMW_Mini_2010_Bahamas_Car_Body_Reflection_ForShader.png`, línea
+  2175 del 061, que resuelven vía `.dat`).
+
+**Incidente de build (documentado para no repetirlo):** `psvita-toolkit build --preset
+release` falló el link con undefined references a `s_tr_*`/`g_skip_*` (símbolos `static`
+referenciados SOLO desde strings de basic-asm opaco, invisibles para GCC: con -O3 los
+elimina; en Debug/-O0 se emiten y por eso el 061 sí linkeó). Fix: `__attribute__((used))`
+en esos bloques de `source/patch.c`. Segundo hallazgo: el custom-command de CMake NO
+reconstruye `lib/vitaGL.a` si el archivo existe (el Makefile de vitaGL además no trackea
+headers) -- tras tocar `shared.h` hizo falta `gmake -C lib/vitaGL clean` + rebuild para
+que el VPK incluya el cambio de verdad. **Build Release OK: `build/asphalt6.vpk`
+(2026-09-18).**
+
+**A probar en consola (Release):** (1) si el flicker de vehículos/nitros desaparece en
+carrera; (2) tiempo de carga con FCACHE restaurado; (3) FPS ingame con el threshold alto
+(si empeora, el profiler manda antes de recortar).
+
+## Sesión 2026-09-19: verificación de que el fix del log 061 llega al binario real + diagnóstico de respaldo
+
+**Motivo:** antes de seguir "mejorando" a ciegas el fix del flicker de vehículos (subida de
+`SAFE_DRAW_SIZE_THRESHOLD` en el log 061), había que confirmar que ese fix realmente afecta
+el código que se compila -- `custom_shaders.c`/`ffp.c` tienen DOS caminos distintos
+controlados por `#ifdef DRAW_SPEEDHACK` / `#ifdef SAFER_DRAW_SPEEDHACK`, y a primera vista
+`handle_speedhack_attrib()` (el camino `#else // DRAW_SPEEDHACK`) hace bypass directo
+SIEMPRE, sin mirar `SAFE_DRAW_SIZE_THRESHOLD` en absoluto -- lo que habría dejado el fix del
+061 como código muerto para el draw más común (`_glDrawArrays_CustomShadersIMPL`/
+`_glDrawElements_CustomShadersIMPL`).
+
+**Verificado en `lib/vitaGL/Makefile` (líneas 75-80):** el flag que este port pasa es
+`DRAW_SPEEDHACK=2` (`CMakeLists.txt` → `VITAGL_MAKE_FLAGS`), y el Makefile mapea
+`DRAW_SPEEDHACK=1` → `-DDRAW_SPEEDHACK` pero `DRAW_SPEEDHACK=2` → `-DSAFER_DRAW_SPEEDHACK`
+(nombres parecidos, comportamiento opuesto: son mutuamente excluyentes pese al nombre común).
+Con valor 2, el macro `DRAW_SPEEDHACK` NO está definido en este build, así que el código
+realmente compilado es el bloque `#ifndef DRAW_SPEEDHACK` con `is_packed`/
+`handle_unpacked_attrib`, que SÍ respeta `SAFE_DRAW_SIZE_THRESHOLD`. **Conclusión: el fix
+del log 061 (umbral a 256 KiB) sí es efectivo en el binario real** -- la duda quedó
+descartada con evidencia del Makefile, no con una suposición nueva.
+
+**Cambio de esta sesión (solo diagnóstico, cero riesgo de regresión):** en vez de subir el
+umbral otra vez a ciegas (ya se documentó en el 061 que 256 KiB es una estimación sobre
+mallas "vistas", no un límite duro conocido), se agregó `vgl_log_speedhack_bypass()`
+(`lib/vitaGL/source/shared.h`) y se la llamó en los 5 puntos reales donde
+`custom_shaders.c` toma el camino directo sin copia (`_glDrawArrays_CustomShadersIMPL` y
+`_glDrawElements_CustomShadersIMPL`, únicos draws relevantes -- el motor es GLES2 puro sin
+pipeline fijo, así que `ffp.c` no se tocó). Capada a 8 líneas totales (misma práctica que
+el resto del port desde el log 060: nunca un log por-llamada en un bucle caliente). Si el
+próximo log de consola real muestra CUALQUIER línea `[speedhack]`, es la prueba directa de
+que algún draw real todavía supera los 256 KiB y el flicker puede persistir en ese objeto
+puntual -- si no aparece ninguna, es evidencia (no solo estimación) de que el umbral actual
+cubre todos los draws dinámicos reales del juego.
+
+**Build:** Debug y Release compilan limpio con `psvita-toolkit build --preset debug\|release`
+(sin warnings nuevos, ambos generan `build/asphalt6.vpk`).
+
+**Pendiente de consola real (sin cambios respecto al log 061):** confirmar que el flicker de
+vehículos/nitros desaparece en carrera, y ahora además revisar el log por líneas
+`[speedhack]` para saber si hace falta ajustar el umbral con datos reales en vez de estimados.
+
+## Sesión 2026-09-19 (continuación): log 062 -- el auto solo aparece bajo sombra/techo, nunca al aire libre
+
+**Reporte del usuario (`logs/asphalt6_062.log`, Release, carrera completa terminada por
+primera vez):** el auto SOLO se ve cuando tiene sombra o techo encima; al aire libre no
+aparece en absoluto. Ya no hay corrupción visual cuando sí se muestra -- esto es distinto
+del flicker aleatorio investigado hasta ahora: es una ausencia **consistente y atada a la
+zona**, no una carrera de datos por frame.
+
+**El log 062 confirma que el fix del umbral (log 061) SÍ está vivo en el binario, y casi no
+se dispara:** solo **1** línea `[speedhack]` en toda la carrera completa (571552 bytes, un
+draw gigante y único -- geometría estática de una sola vez, no una malla de auto por
+frame). Esto descarta que el problema actual sea el mismo mecanismo de flicker por buffer
+triple-buffereado: ese camino casi no se usa, así que no puede explicar una ausencia
+sistemática atada a zonas abiertas.
+
+**El log 062 no tiene ninguna traza `[ALOG]` real** (es Release, como debe ser para medir
+FPS -- ver la nota de siempre sobre Debug solo para triage) y **el diagnóstico de blending
+(`gl_blend_draw_check`) estaba compilado AFUERA por completo** desde la sesión del log 060
+(quedó detrás de `#ifdef DEBUG_SOLOADER` al sacarlo del camino caliente de Release) --
+0 líneas `[gl-blend]` pese a terminar la carrera. Ningún diagnóstico existente cubre esta
+sesión real; hace falta uno nuevo antes de poder confirmar nada.
+
+**Hipótesis a confirmar (no aplicada como fix todavía, solo instrumentada):** el motor es
+Irrlicht-derivado con manejo de skybox confirmado en el pseudo-C (852 coincidencias de
+`skybox`/`ESNRP_`/`CSceneManager` en `out_ghidra.c`). En zonas al aire libre se dibuja un
+skybox; en interiores/túneles/con techo, no. Si el skybox se dibuja DESPUÉS del auto con el
+test o la máscara de profundidad mal configurados (o vitaGL/GXM no los respeta como
+debería), el skybox lo tapa por completo todos los frames -- exactamente el patrón
+reportado (siempre tapado al aire libre, nunca tapado bajo techo, sin corrupción visual
+porque el auto sí se dibuja bien, solo que algo lo pinta encima después). Es una hipótesis,
+no una conclusión: no hay todavía un log con datos de profundidad reales para confirmarla.
+
+**Cambios (solo diagnóstico, cero cambio de comportamiento real):**
+- `source/utils/glutil.c`/`.h`: `gl_blend_draw_check` se reactiva para Release (ya no
+  depende de `DEBUG_SOLOADER` -- `LOG_ERRORS` está siempre prendido en este build, y una
+  escritura cada tanto no repite el error del log 060 de loguear por-llamada). Se cambió de
+  "las primeras N veces y después nada" (que el log 059 ya demostró que se agota siempre en
+  menú/garage) a un **muestreo periódico que nunca se detiene**: primeras
+  `GL_BLEND_DRAW_LOG_HEAD` (16) confirman la línea de base de siempre, después 1 de cada
+  `GL_BLEND_DRAW_LOG_SAMPLE` (2048) para dejar muestras durante TODA la sesión, incluida
+  pista real. Con los ~24660 frames del log 062 esto habría dejado varios cientos de
+  muestras repartidas en toda la carrera en vez de cero.
+- Se agregó rastreo de estado de profundidad (`glDepthMask_soloader`/`glDepthFunc_soloader`
+  nuevos, más `GL_DEPTH_TEST` sumado al rastreo existente de `glEnable_soloader`/
+  `glDisable_soloader`) y se sumó `depth_test`/`depth_mask`/`depth_func` a cada línea
+  `[gl-blend]` -- para confirmar o descartar la hipótesis del skybox con UN solo log nuevo
+  en vez de tener que iterar.
+
+**Build:** Debug y Release compilan limpio (`psvita-toolkit build --preset debug\|release`).
+
+**A probar en consola (Release):** correr otra carrera completa pasando por una zona al
+aire libre con el auto invisible, y bajar el log nuevo. Buscar líneas `[gl-blend]` con
+`frame=` dentro del rango de la carrera (no menú) y comparar `depth_test`/`depth_mask`/
+`depth_func` entre draws grandes bajo techo (auto visible) vs al aire libre (auto
+invisible) -- si difieren, confirma la hipótesis del skybox; si son idénticos, hay que
+descartarla y mirar clasificación de blend/material en su lugar.
+
+## Sesión 2026-09-20: log 063 -- primeros datos reales de blend/profundidad + reporte nuevo de streaming por partes
+
+**Reporte del usuario (`logs/asphalt6_063.log`, Debug, ~95s de sesión con pista "Alps"
+cargada y autos de tráfico presentes):** confirma el patrón del log 062 (auto visible solo
+en sombra/sin sol directo, invisible al aire libre) y agrega un síntoma nuevo: el mapa
+"carga por partes" a medida que el auto se acerca -- a la distancia no hay nada, aparece
+recién de cerca.
+
+**Este es el primer log con datos reales de `[gl-blend]` (50 líneas) desde que se reactivó
+para Release/muestreo permanente la sesión pasada.** Lectura de los datos:
+- **Grupo fijo que sale con `BLEND ON`** (tamaños 1371/897/552/396/840/342 vértices,
+  repetido idéntico desde el primer frame de splash/garage hasta bien entrada la carrera):
+  con más contexto que en sesiones previas, esto es casi con certeza la **UI Flash
+  (gameswf)** -- persiste sin cambios en menú Y en carrera, algo que ningún elemento 3D
+  ligado al auto o al escenario haría (cambiaría con el track/auto seleccionado). Se
+  **retira como sospechoso de tapar el auto** -- las notas previas ya lo marcaban como
+  incierto ("podría ser decoración fija del menú, no necesariamente el auto"); con estos
+  datos ese llamado de atención queda resuelto: no es el auto.
+- **Todos los draws grandes con `blend off` (candidatos reales a auto/pista) muestran
+  estado sano:** `depth_test=1 depth_mask=1 depth_func=0x203` (`GL_LEQUAL`) sin excepción,
+  salvo una única línea con `depth_test=0 depth_mask=1` (frame 4356) que por tamaño (336
+  vértices) es más HUD/decoración que auto. **No hay ninguna anomalía de profundidad
+  visible en los draws opacos capturados** -- la hipótesis del "skybox mal ordenado
+  tapando el auto por profundidad" NO tiene todavía evidencia a favor ni en contra, porque
+  el muestreo (1 de cada 2048 en ese momento) es demasiado disperso para una sesión de solo
+  95s: es muy probable que nunca se haya capturado el instante exacto en que el auto está
+  al sol.
+- **Se confirmó con datos reales que el motor SÍ tiene skybox propio de pista**
+  (`data/#temp/tracktga/alps_skybox.pvrtc4.tga`, línea 1614) y una **textura de distancia
+  separada** (`alps_lod.pvrtc4.tga`, línea 1536) además del detalle cercano
+  (`alps_asphalt`, `alps_atlas01-03`, etc.) -- confirma que el motor real SÍ implementa un
+  esquema de nivel de detalle/streaming por distancia, no es una suposición.
+- **Sin cuelgues durante la carrera** (un solo volcado de breadcrumbs, en el arranque
+  temprano antes de cargar la pista -- contención de mutex normal durante la carga
+  síncrona inicial, no relacionado) y **sin señales de agotamiento de VRAM** (baja de forma
+  monótona 85 MiB → ~65 MiB libres en 92 programas compilados, sin ciclo de
+  desalojo/recarga de texturas).
+
+**Sobre el streaming "por partes" (síntoma nuevo):** con `alps_lod.pvrtc4.tga` confirmado
+como asset real del juego, todo indica que el motor original YA implementa carga
+progresiva de la pista por distancia (común en Asphalt 6 de Android, pensado para no tener
+toda la geometría de la pista en memoria a la vez). Esto probablemente **no es un bug
+introducido por el port** sino comportamiento original -- aunque es posible que se note más
+en Vita por E/S más lenta que el flash del celular original. No hay todavía evidencia de
+qué tan tarde llega comparado con el diseño original (no hay una referencia en Android a
+mano para comparar tiempos). Se deja documentado como hipótesis, no como conclusión.
+
+**Cambios (solo diagnóstico, cero cambio de comportamiento real):**
+- `source/utils/glutil.c`: `GL_BLEND_DRAW_LOG_SAMPLE` baja de 2048 a 512 -- el log 063 duró
+  solo ~95s (comparado con los ~7 min del log 062) y el muestreo disperso no alcanzó a
+  capturar la transición sombra/sol; 512 sigue siendo seguro sostenido toda una carrera
+  larga (<1 línea/seg estimada) pero da ~4x más resolución para una prueba corta y
+  deliberada.
+- Se agrega `program=%u` a cada línea `[gl-blend]` (nuevo `g_cur_program`, actualizado en
+  `glUseProgram_soloader`) -- shaders distintos (auto/pista/skybox/UI) casi seguro compilan
+  a programas GLSL distintos, así que el id de programa es la forma más barata de
+  distinguir de qué objeto es cada draw grande sin tener que mapear nombres de archivo de
+  textura (que vitaGL no conserva después de subir los píxeles).
+
+**Build:** Debug y Release compilan limpio (`psvita-toolkit build --preset debug\|release`).
+
+**A probar en consola (recomendado Debug, para tener también las trazas `[ALOG]` de
+texturas):** una prueba CORTA y deliberada (10-20s) manejando entrando y saliendo de una
+zona de sombra repetidas veces, en vez de una carrera completa -- con el muestreo más denso
+esto debería dejar varias líneas `[gl-blend]` por cada draw grande candidato a auto/pista
+en la ventana exacta de la transición. Comparar `program=`/`depth_test`/`depth_mask` entre
+el momento visible (sombra) e invisible (sol) para el MISMO `program` (mismo objeto/auto)
+si aparece en ambos.
+
+## Sesión 2026-09-20: Causa raíz real de vehículos y poderes invisibles identificada y corregida (Camera::IsInViewFrustrum)
+
+**Síntoma reportado por el usuario:**
+Los vehículos (auto del jugador, competidores de la IA, vehículos de tráfico en las calles) y los poderes/pickups (nitros, dinero, EMP, coleccionables) están invisibles casi todo el tiempo y solo se hacen visibles en contadas ocasiones (p.ej. bajo túneles o sombras).
+
+**Investigación de referencias cruzadas (A5, A8, DH2 y Ghidra de A6):**
+1. **Asphalt 5 (`Asphalt-5-Vita`):** Corre en OpenGL ES 1.1 Fixed-Function; no usa frustum culling dinámico en el loop de autos (`Scene::RenderCars` itera y dibuja directamente).
+2. **Asphalt 8 (`asphalt8-vita-main`):** Usa una generación de motor posterior completamente distinta (no Irrlicht/Glitch) con arquitectura de shaders propia.
+3. **Dungeon Hunter 2 (`Dungeon-Hunter-2-vita`):** Comparte el mismo motor "Glitch" de Gameloft (GLES 2.0). En el commit `853ac40`, los enemigos/NPCs se volvían invisibles erráticamente por desajustes entre el frustum/aspect-ratio de Vita y las bounding boxes dinámicas. DH2 resolvió esto hookeando `ObjectBase::TestCullingBeforeUpdate -> ret1` y `CSceneManager::isCulled -> ret0`.
+4. **Análisis en profundidad de Asphalt 6 (`out_ghidra.c` y disassembly de `libasphalt6.so`):**
+    - El hook anterior de `RENDER_CULLING_BYPASS` en `source/patch.c` únicamente interceptaba `CSceneManager::isCulled(ISceneNode*)` y `CSceneManager::isCulled(aabbox3d, E_CULLING_TYPE)` hacia `ret0`.
+    - **El gran hallazgo:** En Asphalt 6, **NINGUNO** de los vehículos ni poderes llama a `CSceneManager::isCulled()`. Todos dependen exclusivamente de una única función:
+      `Camera::IsInViewFrustrum(glitch::core::aabbox3d<float> const&)` (símbolo mangled: `_ZN6Camera16IsInViewFrustrumERKN6glitch4core8aabbox3dIfEE` en `0x00439448`).
+    - Esta función prueba la bounding box del objeto contra los 6 planos del frustum de la cámara. Debido al cambio de resolución/aspect ratio de Vita (16:9 960x544 vs resoluciones nativas de Android), así como a discrepancias en el cálculo de planos de proyección en coma flotante, la función falla devolviendo `0` (fuera del frustum) durante la conducción normal:
+      * **RaceCar::UpdateMeshes** (líneas 65548 y 65564 en `out_ghidra.c`): si `Camera::IsInViewFrustrum` devuelve `0`, itera a través de los 43 (`0x2b`) nodos de malla del auto y ejecuta `node->setVisible(false)`, apagando por completo el auto del jugador y de todos los competidores. (En el garaje o menú se evalúa `this[0x50] == 0` y se salta este chequeo, por eso en el garaje siempre se veía).
+      * **TrafficCar::IsViewable** (líneas 91938-91942 en `out_ghidra.c`): retorna directamente el resultado de `Camera::IsInViewFrustrum(...)`. Si es `0`, el auto de tráfico se marca como no visible y se ignora su render.
+      * **BaseSceneObject::SceneObjUpdateCull** (líneas 93297-93330 en `out_ghidra.c`): calcula `*(byte *)(item + 0x1a) = (byte)Camera::IsInViewFrustrum(...) ^ 1`. Si devuelve `0`, se establece `isCulled = 1` y se invoca `node->setVisible(false)` en el nodo del poder (BonusNitro, BonusCash, BonusEMP, BonusPower, CollectibleItem, etc.).
+
+**Solución implementada (`source/patch.c`):**
+- Se hookeó `Camera::IsInViewFrustrum` (`_ZN6Camera16IsInViewFrustrumERKN6glitch4core8aabbox3dIfEE`) hacia `&ret1`. Al devolver siempre `1` (dentro del frustum = visible):
+  * `RaceCar::UpdateMeshes` omite el bucle de ocultamiento `setVisible(false)` y procesa normalmente las partes del auto (carrocería, ruedas, luces, conductor, daño).
+  * `TrafficCar::IsViewable` devuelve `1`, manteniendo los autos de calle visibles.
+  * `BaseSceneObject::SceneObjUpdateCull` asigna `isCulled = 0` e invoca `setVisible(true)` sobre el nodo de escena del pickup.
+- Se hookeó adicionalmente `CustomSceneManager::isCulledCustom` (`_ZNK18CustomSceneManager14isCulledCustomEPKN6glitch5scene10ISceneNodeE9CULL_TYPE`) hacia `&ret0` (0 = no culled) para asegurar que ningún nodo de escena personalizado sea descartado erróneamente.
+
+**Verificación:**
+Compilación completa y limpia de `eboot.bin` y `asphalt6.vpk` sin errores.

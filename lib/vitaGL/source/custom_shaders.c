@@ -75,6 +75,7 @@ char vgl_file_cache_path[256];
 			attributes[i].offset = 0; \
 		} else { \
 			if (count * streams[i].stride > SAFE_DRAW_SIZE_THRESHOLD) { \
+				vgl_log_speedhack_bypass("unpacked", count * streams[i].stride); \
 				ptrs[i] = (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * streams[i].stride; \
 			} else { \
 				ptrs[i] = gpu_alloc_mapped_temp(count * streams[i].stride); \
@@ -1045,6 +1046,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 	if (is_packed[0]) {
 #ifdef SAFER_DRAW_SPEEDHACK
 		if (count * streams[0].stride > SAFE_DRAW_SIZE_THRESHOLD) {
+			vgl_log_speedhack_bypass("packed[0]", count * streams[0].stride);
 			ptrs[0] = (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride;
 		} else
 #endif
@@ -1076,6 +1078,7 @@ GLboolean _glDrawArrays_CustomShadersIMPL(GLint first, GLsizei count, GLboolean 
 		} else {
 #ifdef SAFER_DRAW_SPEEDHACK
 			if (count * streams[0].stride > SAFE_DRAW_SIZE_THRESHOLD) {
+				vgl_log_speedhack_bypass("packed", count * streams[0].stride);
 				ptrs[0] = (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]] + first * streams[0].stride;
 			} else
 #endif
@@ -1320,6 +1323,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 	if (is_packed[0]) {
 #ifdef SAFER_DRAW_SPEEDHACK
 		if (top_idx * streams[0].stride > SAFE_DRAW_SIZE_THRESHOLD) {
+			vgl_log_speedhack_bypass("elements packed[0]", top_idx * streams[0].stride);
 			ptrs[0] = (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]];
 		} else
 #endif
@@ -1351,6 +1355,7 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 		} else {
 #ifdef SAFER_DRAW_SPEEDHACK
 			if (top_idx * streams[0].stride > SAFE_DRAW_SIZE_THRESHOLD) {
+				vgl_log_speedhack_bypass("elements packed", top_idx * streams[0].stride);
 				ptrs[0] = (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]];
 			} else
 #endif

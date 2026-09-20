@@ -52,6 +52,7 @@
 #include "reimpl/pthr.h"
 #include "reimpl/sys.h"
 #include "reimpl/egl.h"
+#include "reimpl/net.h"
 #include "reimpl/time64.h"
 #include "reimpl/asset_manager.h"
 
@@ -360,9 +361,9 @@ so_default_dynlib default_dynlib[] = {
         { "bind", (uintptr_t)&bind },
         { "connect", (uintptr_t)&connect },
         { "freeaddrinfo", (uintptr_t)&freeaddrinfo },
-        { "getaddrinfo", (uintptr_t)&getaddrinfo },
+        { "getaddrinfo", (uintptr_t)&getaddrinfo_soloader },
         { "gethostbyaddr", (uintptr_t)&gethostbyaddr },
-        { "gethostbyname", (uintptr_t)&gethostbyname },
+        { "gethostbyname", (uintptr_t)&gethostbyname_soloader },
         { "gethostname", (uintptr_t)&gethostname },
         { "getpeername", (uintptr_t)&getpeername },
         { "getservbyname", (uintptr_t)&getservbyname },
@@ -601,8 +602,8 @@ so_default_dynlib default_dynlib[] = {
         { "glDeleteRenderbuffersOES", (uintptr_t)&glDeleteRenderbuffers },
         { "glDeleteShader", (uintptr_t)&glDeleteShader_soloader },
         { "glDeleteTextures", (uintptr_t)&glDeleteTextures_soloader },
-        { "glDepthFunc", (uintptr_t)&glDepthFunc },
-        { "glDepthMask", (uintptr_t)&glDepthMask },
+        { "glDepthFunc", (uintptr_t)&glDepthFunc_soloader },
+        { "glDepthMask", (uintptr_t)&glDepthMask_soloader },
         { "glDepthRangef", (uintptr_t)&glDepthRangef },
         { "glDepthRangex", (uintptr_t)&glDepthRangex },
         { "glDetachShader", (uintptr_t)&ret0 },

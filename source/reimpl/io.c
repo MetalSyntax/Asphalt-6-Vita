@@ -69,6 +69,27 @@ static bool strip_ipad2_prefix(const char * path, char * out, size_t out_size) {
     return true;
 }
 
+// Misses ESPERADOS que no aportan nada al log (log 060: cientos de lineas por
+// carga): el motor sondea cada SFX por nombre suelto ("sfx_*.wav", "vfx_*",
+// "m_*", "*.vxn" sin ruta -- esos viven en file00a.bin via soundpack, nunca como
+// archivo suelto) y cada textura PVRTC por archivo suelto ("*.PVRTC4.tga",
+// "*NOMIPMAP*" -- esas viven en los fileNNNNNN.dat via el mapa de ofuscacion).
+// El negative cache ya evita repetir el acceso a la SD; esto evita ademas la
+// linea de log en Debug, que es un sceIoWrite por miss.
+static int io_expected_miss(const char *filename) {
+    if (!strchr(filename, '/')) {
+        size_t n = strlen(filename);
+        if (n > 4 && (strcmp(filename + n - 4, ".wav") == 0 ||
+                      strcmp(filename + n - 4, ".vxn") == 0 ||
+                      strcmp(filename + n - 4, ".png") == 0 ||
+                      strcmp(filename + n - 4, ".tga") == 0))
+            return 1;
+    }
+    if (strstr(filename, "NOMIPMAP") || strstr(filename, "PVRTC4") ||
+        strstr(filename, ".car") || strcmp(filename, "ux0:data/asphalt6/data/glsl.config") == 0)
+        return 1;
+    return 0;
+}
 #define FCACHE_ENABLED 1
 #define FCACHE_MAX_ENTRIES 1024
 #define FCACHE_MAX_FILE_SIZE (4 * 1024 * 1024)
@@ -308,7 +329,8 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
             }
             pthread_mutex_unlock(&s_fcache_lock);
         }
-        l_warn("fopen(%s, %s): %p", filename, mode, ret);
+        if (!io_expected_miss(filename))
+            l_warn("fopen(%s, %s): %p", filename, mode, ret);
     }
 
     return ret;

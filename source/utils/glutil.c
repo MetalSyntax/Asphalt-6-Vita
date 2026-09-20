@@ -31,6 +31,11 @@ void load_shader(GLuint shader, const char * string, size_t length);
 
 // Diagnostico de blending en draws grandes (ver definicion junto a glEnable_soloader).
 static void gl_blend_draw_check(const char *who, GLsizei count);
+// Log 063: distintos materiales (auto, pista, skybox, HUD Flash) casi seguro compilan a
+// programas GLSL distintos -- este id es la forma mas barata de distinguir un draw grande
+// de otro sin tener que mapear nombres de archivo de textura. Se guarda aca (no junto a
+// g_blend_enabled) porque glUseProgram_soloader esta mas arriba en este archivo.
+static GLuint g_cur_program = 0;
 
 /*
  * Traza por-llamada de las funciones GL interceptadas. Fue la herramienta que permitio
@@ -46,12 +51,19 @@ static void gl_blend_draw_check(const char *who, GLsizei count);
 #endif
 
 /*
- * Traza GRUESA, siempre activa. A diferencia de gl_trace() (una linea por draw), esta es una
- * linea por evento raro -- compilar/linkear un shader, tocar un FBO, un latido cada N frames.
- * El costo es despreciable y es lo que permite ubicar un cuelgue en el log que se baja por
- * FTP despues, sin tener que reproducirlo con la traza pesada puesta.
+ * Traza GRUESA. Log 060: compilar/linkear son CIENTOS de eventos por carga
+ * (138 shaders / 69 programas) y cada linea es un sceIoWrite a la SD sin
+ * buffering -- el propio diagnostico frenaba la carga varios segundos y
+ * ensuciaba el log real. Practica de Rinnegatamante: en Release solo fallos
+ * y latidos; el detalle por-shader queda para builds Debug. El latido de
+ * gl_swap() y los fallos de compilado/linkeado usan l_error directo (siempre
+ * activos); todo lo demas pasa por gl_info (solo Debug).
  */
+#ifdef DEBUG_SOLOADER
 #define gl_info(...) l_error(__VA_ARGS__)
+#else
+#define gl_info(...) do {} while (0)
+#endif
 
 // Cuenta cuantas veces se presento un frame en pantalla. main.c lo usa para saber si el
 // motor ya hizo swap por su cuenta durante nativeRender (via el callback JNI
@@ -70,7 +82,9 @@ unsigned int gl_swap_count = 0;
 extern SceGxmShaderPatcher *gxm_shader_patcher;
 
 void gl_report_mem(const char *tag) {
-    gl_info("[gl-mem] %s | vitaGL libres: RAM %u KiB, VRAM %u KiB, PHYCONT %u KiB | "
+    // Solo se llama en puntos contados (boot + tras nativeInit): se mantiene
+    // siempre activa aunque gl_info sea solo-Debug.
+    l_error("[gl-mem] %s | vitaGL libres: RAM %u KiB, VRAM %u KiB, PHYCONT %u KiB | "
             "patcher: buffer %u KiB, USSE vert %u KiB, USSE frag %u KiB, host %u KiB",
             tag,
             (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024),
@@ -155,6 +169,10 @@ void gl_init() {
     // 24 MiB de pool interno para vitaGL (paridad con optimizacion de Dungeon Hunter 2):
     // asegura espacio suficiente para compilacion de shaders GLSL en caliente y VBOs dinamicos.
     vglInitExtended(0, 960, 544, 24 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    // NOTA (log 061): se probo glPixelStorei(GL_UNPACK_ALIGNMENT, 1) aca y vitaGL
+    // lo rechaza con GL_INVALID_ENUM (solo acepta GL_UNPACK_ROW_LENGTH) dejando
+    // ademas el flag de error pegado (rompio el err=0x0000 del upload de video a
+    // err=0x0500). Revertido: no aporta nada porque la llamada es rechazada.
 }
 
 /*
@@ -179,7 +197,7 @@ void gl_swap() {
     // cuando el log se corta: si después del último evento siguen apareciendo latidos, el
     // hilo principal sigue girando y el problema está en otro lado.
     if ((gl_swap_count % GL_HEARTBEAT_EVERY) == 0)
-        gl_info("[gl] latido: %u frames presentados", gl_swap_count);
+        l_error("[gl] latido: %u frames presentados", gl_swap_count);
 }
 
 void glShaderSource_soloader(GLuint shader, GLsizei count,
@@ -243,11 +261,14 @@ void glLinkProgram_soloader(GLuint program) {
 
     // Con VGL_MODE_POSTPONED el registro real de los programas en el shader patcher pasa
     // acá adentro, así que este es el punto donde se ve crecer sus buffers fijos.
+    // Solo en Debug: en Release son 69 writes a la SD por carga (log 060).
+#ifdef DEBUG_SOLOADER
     {
         char tag[32];
         snprintf(tag, sizeof(tag), "tras link prog=%u", (unsigned)program);
         gl_report_mem(tag);
     }
+#endif
     GLint status = 0;
     glGetProgramiv(program, GL_LINK_STATUS, &status);
     if (!status) {
@@ -264,6 +285,7 @@ void glUseProgram_soloader(GLuint program) {
     BC_SCOPE("glUseProgram");
     gl_trace("[gl] glUseProgram program=%u", (unsigned)program);
 #endif
+    g_cur_program = program;
     glUseProgram(program);
 }
 
@@ -397,19 +419,57 @@ static int gl_cap_benigno(GLenum cap) {
 // (candidato a malla de auto, no un quad de UI) sale con blending prendido.
 static GLboolean g_blend_enabled = GL_FALSE;
 static GLenum g_blend_sfactor = 1, g_blend_dfactor = 0; // GL_ONE, GL_ZERO (default real de GLES2)
-#define GL_BLEND_DRAW_LOG_MAX 40
+// Log 062: usuario reporta que el auto SOLO aparece bajo sombra/techo y jamas al aire
+// libre (sin corrupcion visual, ya no es el race del buffer triple-buffereado -- es una
+// ausencia consistente, no intermitente, atada a la zona). Hipotesis a confirmar con
+// datos reales: el skybox de zonas abiertas se dibuja DESPUES del auto con el test/mascara
+// de profundidad mal configurado y lo tapa entero (en tuneles/interiores no hay skybox que
+// pueda taparlo). Se agrega rastreo de profundidad igual que el de blending de arriba --
+// mismos wrappers _soloader, sin cambiar el comportamiento real.
+static GLboolean g_depth_test_enabled = GL_FALSE; // default real de GLES2
+static GLboolean g_depth_mask = GL_TRUE; // default real de GLES2
+static GLenum g_depth_func = GL_LESS; // default real de GLES2
+// Log 059: el cupo de 40->200 se agotaba siempre durante la carga de menu/garage (los
+// ~90 primeros draws grandes de todo el proceso). Log 062: se corrio una carrera ENTERA
+// en Release, donde este diagnostico estaba compilado AFUERA por completo (detras de
+// DEBUG_SOLOADER) -- cero datos de blend reales pese a terminar la carrera. Se reactiva
+// para Release (LOG_ERRORS ya esta siempre prendido; el costo es un sceIoWrite de vez en
+// cuando, no por-llamada) y se cambia de "las primeras N veces y despues nada" a un
+// muestreo periodico que jamas se detiene: las primeras GL_BLEND_DRAW_LOG_HEAD confirman
+// la linea de base de siempre (menu), y despues 1 de cada GL_BLEND_DRAW_LOG_SAMPLE para
+// que una corrida larga deje muestras durante TODA la sesion (incluida pista real,
+// tuneles/sombra vs cielo abierto). gl_swap_count en cada linea permite filtrar por fase.
+// Log 063: el auto entero (no solo intermitente) esta ausente al sol y presente en sombra
+// -- para pescar la transicion exacta con una prueba corta (manejar entrando/saliendo de
+// sombra durante 10-20s) hace falta mas resolucion que 1 de cada 2048 en una sesion corta,
+// asi que baja a 512 (con ~300 draws grandes/seg estimados en carrera son <1 linea/seg,
+// perfectamente seguro sostenido toda una sesion larga).
+#define GL_BLEND_DRAW_LOG_HEAD 16
+#define GL_BLEND_DRAW_LOG_SAMPLE 512
 #define GL_BLEND_DRAW_VERTS_MIN 300 // filtra quads/HUD; una malla de auto tiene muchos mas
 
 void glEnable_soloader(GLenum cap) {
     if (gl_cap_benigno(cap)) return;
     if (cap == GL_BLEND) g_blend_enabled = GL_TRUE;
+    else if (cap == GL_DEPTH_TEST) g_depth_test_enabled = GL_TRUE;
     glEnable(cap);
 }
 
 void glDisable_soloader(GLenum cap) {
     if (gl_cap_benigno(cap)) return;
     if (cap == GL_BLEND) g_blend_enabled = GL_FALSE;
+    else if (cap == GL_DEPTH_TEST) g_depth_test_enabled = GL_FALSE;
     glDisable(cap);
+}
+
+void glDepthMask_soloader(GLboolean flag) {
+    g_depth_mask = flag;
+    glDepthMask(flag);
+}
+
+void glDepthFunc_soloader(GLenum func) {
+    g_depth_func = func;
+    glDepthFunc(func);
 }
 
 void glBlendFunc_soloader(GLenum sfactor, GLenum dfactor) {
@@ -419,23 +479,25 @@ void glBlendFunc_soloader(GLenum sfactor, GLenum dfactor) {
 }
 
 static void gl_blend_draw_check(const char *who, GLsizei count) {
-    static int logged_on = 0, logged_off = 0;
     if (count < GL_BLEND_DRAW_VERTS_MIN) return;
+    static uint32_t n_on = 0, n_off = 0;
 
     if (g_blend_enabled) {
-        if (logged_on >= GL_BLEND_DRAW_LOG_MAX) return;
-        logged_on++;
-        l_error("[gl-blend] %s BLEND ON  count=%d sfactor=0x%x dfactor=0x%x (%d/%d)",
-                who, (int)count, (unsigned)g_blend_sfactor, (unsigned)g_blend_dfactor,
-                logged_on, GL_BLEND_DRAW_LOG_MAX);
+        uint32_t i = n_on++;
+        if (i < GL_BLEND_DRAW_LOG_HEAD || (i % GL_BLEND_DRAW_LOG_SAMPLE) == 0)
+            l_error("[gl-blend] %s BLEND ON  count=%d sfactor=0x%x dfactor=0x%x depth_test=%d depth_mask=%d depth_func=0x%x program=%u frame=%u (#%u)",
+                    who, (int)count, (unsigned)g_blend_sfactor, (unsigned)g_blend_dfactor,
+                    g_depth_test_enabled, g_depth_mask, (unsigned)g_depth_func,
+                    (unsigned)g_cur_program, gl_swap_count, i);
     } else {
         // Contraparte del caso de arriba: si NINGUN draw grande sale nunca con blend
         // apagado, el problema no es "algunos objetos mal clasificados como
         // transparentes" sino algo mas sistemico (blend que nunca se apaga de verdad).
-        if (logged_off >= GL_BLEND_DRAW_LOG_MAX) return;
-        logged_off++;
-        l_error("[gl-blend] %s blend off count=%d (%d/%d)",
-                who, (int)count, logged_off, GL_BLEND_DRAW_LOG_MAX);
+        uint32_t i = n_off++;
+        if (i < GL_BLEND_DRAW_LOG_HEAD || (i % GL_BLEND_DRAW_LOG_SAMPLE) == 0)
+            l_error("[gl-blend] %s blend off count=%d depth_test=%d depth_mask=%d depth_func=0x%x program=%u frame=%u (#%u)",
+                    who, (int)count, g_depth_test_enabled, g_depth_mask, (unsigned)g_depth_func,
+                    (unsigned)g_cur_program, gl_swap_count, i);
     }
 }
 
@@ -484,23 +546,29 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
 }
 
 /*
- * Paridad con Asphalt-5-Vita: glCopyTexImage2D/glCopyTexSubImage2D implican un
- * readback CPU del framebuffer (lento en vitaGL/GXM). El motor los usa para efectos
- * (el menú tiene cadena de post-procesado con blur/threshold); degradan el efecto a
- * una textura dummy / no-op en vez de frenar el frame. Mismo trade-off aceptado en A5.
+ * glCopyTexImage2D/glCopyTexSubImage2D: se restauran las llamadas REALES.
+ *
+ * Entre el log 060 y este cambio iban como dummy 1x1 / no-op para evitar el
+ * readback CPU del framebuffer (lento en vitaGL/GXM), trade-off heredado de
+ * Asphalt-5-Vita. Pero en ESTE motor rompen visuales de frente: la reflexion
+ * de la carroceria (Car_Body_Reflection / garage_car_body_reflection_forshader),
+ * la cadena de post-procesado del menu (shaders con blurOffsetX/threshold) y el
+ * fondo atenuado del menu de pausa ingame leen el framebuffer con estas
+ * llamadas -- con el dummy el vehiculo sale mal y al abrir el menu ingame
+ * "todo se rompe". Practica de Rinnegatamante: primero correccion, despues se
+ * mide FPS y se recorta solo lo que el profiler justifique.
  */
 void glCopyTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
                                GLint x, GLint y, GLsizei width, GLsizei height,
                                GLint border) {
     BC_SCOPE("glCopyTexImage2D");
-    // Textura dummy 1x1 para satisfacer a la GPU sin el costo del readback.
-    glTexImage2D(target, level, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glCopyTexImage2D(target, level, internalformat, x, y, width, height, border);
 }
 
 void glCopyTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                                   GLint x, GLint y, GLsizei width, GLsizei height) {
     BC_SCOPE("glCopyTexSubImage2D");
-    // No-op a propósito: evita el readback lento.
+    glCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
 }
 
 void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,
@@ -516,6 +584,18 @@ void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internal
     BC_SCOPE("glCompressedTexImage2D");
     glCompressedTexImage2D(target, level, internalformat, width, height, border,
                            imageSize, data);
+    // Las texturas de pista/menu son *.PVRTC4.tga: si vitaGL/GXM rechaza el
+    // formato, la malla sale rota/negra. Los fallos son raros, asi que se
+    // loguean siempre (acotado) para que el proximo log diga si PVRTC pasa o no.
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        static int n = 0;
+        if (n < 8)
+            l_error("[gl] glCompressedTexImage2D fmt=0x%x %dx%d size=%d -> err=0x%x (%d/8)",
+                    (unsigned)internalformat, (int)width, (int)height,
+                    (int)imageSize, (unsigned)err, n + 1);
+        n++;
+    }
 }
 
 void glDeleteTextures_soloader(GLsizei n, const GLuint *textures) {

@@ -117,9 +117,29 @@ void hooked_RenderFX_SetRenderCachingEnabled() {
  * mismo esta terminando con este driver nulo (lo que explicaria que no se vea
  * el vehiculo en carrera).
  */
+// Forward declarations (definidos mas abajo junto a la tabla de hooks): los
+// stubs le pasan a cnulldriver_log_this los punteros de estos mismos arrays,
+// asi que comparar punteros es exacto y gratis en el bucle caliente.
+static const char __attribute__((used)) s_cnd_draw2dline[];
+static const char __attribute__((used)) s_cnd_getmaxclip[];
+static const char __attribute__((used)) s_cnd_createbuffer[];
 void cnulldriver_log_this(const char *method, uint32_t this_ptr, uint32_t caller_lr) {
-    l_error("[patch] CNullDriver::%s this=0x%08X llamador=libasphalt6.so+0x%X",
-            method, (unsigned)this_ptr, (unsigned)(caller_lr - (uint32_t)so_mod.text_base));
+    // Log 060: durante la carga de pista (Bahamas) createBuffer se llama MILES de
+    // veces en un bucle cerrado (llamadores 0x7E77C8/0x7E7F7C alternados) y cada
+    // llamada era un sceIoWrite a la SD -- el propio diagnostico frenaba la carga
+    // y el menu ingame se rompia con el hilo de render atascado escribiendo el log
+    // (frames a +3/5s, strcmp por las nubes). Practica de Rinnegatamante: jamas
+    // loguear por-llamada en un bucle caliente. Se loguean las 4 primeras por
+    // metodo (ya identifican this/llamador) y despues solo un latido cada 4096.
+    static uint32_t n_draw = 0, n_clip = 0, n_buf = 0;
+    uint32_t *n = (method == s_cnd_createbuffer) ? &n_buf :
+                  (method == s_cnd_getmaxclip) ? &n_clip : &n_draw;
+    uint32_t i = (*n)++;
+    if (i < 4 || (i % 4096) == 0)
+        l_error("[patch] CNullDriver::%s this=0x%08X llamador=libasphalt6.so+0x%X%s",
+                method, (unsigned)this_ptr,
+                (unsigned)(caller_lr - (uint32_t)so_mod.text_base),
+                (i >= 4) ? " (latido, silenciado entremedio)" : "");
 }
 
 __attribute__((naked, target("arm")))
@@ -582,6 +602,12 @@ void hooked_CNullDriver_createBuffer() {
 #define W2_LDR_R3_48 0xe5903030u // ldr r3, [r0, #48]    (StringManager::GetLanguageString)
 #define W2_SUB_SP68  0xe24dd044u // sub sp, sp, #68      (StringManager::SetLanguage)
 
+// NOTA (log 061, build Release): estos simbolos solo se referencian desde
+// strings de basic-asm opaco (".word s_tr_x"), invisibles para el analisis de
+// liveness de GCC -- con -O3 los elimina y el link falla con undefined
+// reference (en Debug/-O0 si se emiten, por eso antes linkeaba). 'used' fuerza
+// su emision en cualquier nivel de optimizacion.
+__attribute__((used))
 static uint32_t g_resume_c1, g_resume_c2, g_resume_rm, g_resume_grid,
                 g_resume_anim, g_resume_light, g_resume_frame,
                 g_resume_run, g_resume_update, g_resume_render,
@@ -601,36 +627,38 @@ static uint32_t g_resume_c1, g_resume_c2, g_resume_rm, g_resume_grid,
                 g_resume_igm, g_skip_igm,
                 g_resume_cnd_createbuffer,
                 g_resume_getpackfilename;
+__attribute__((used))
 static uint32_t g_emu_c1, g_emu_c2, g_emu_anim, g_emu_light, g_emu_frame,
                 g_emu_dfret1, g_emu_dfret2, g_emu_cxathrow;
 // Puntero de datos del string vacio inmortal del motor (mismo allocator que
 // BaseCarManager::packNames), resuelto por simbolo en so_patch() -- ver Bug #033.
+__attribute__((used))
 static uint32_t g_empty_rep_data;
 
-static const char s_tr_c1[] = "MenuScene::MenuScene";
-static const char s_tr_rm[] = "RemoveChildNodeType";
-static const char s_tr_grid[] = "CustomBatchGrid";
-static const char s_tr_anim[] = "createAnimator";
-static const char s_tr_light[] = "CLightSceneNode";
-static const char s_tr_frame[] = "DisplayFrame";
-static const char s_tr_run[] = "IDevice::run";
-static const char s_tr_update[] = "RenderFX::Update";
-static const char s_tr_render[] = "RenderFX::Render";
-static const char s_tr_endgl[] = "endScene-GL";
-static const char s_tr_endiv[] = "endScene-IV";
-static const char s_cnd_draw2dline[] = "draw2DLine";
-static const char s_cnd_getmaxclip[] = "getMaxUserClipPlanes";
-static const char s_cnd_createbuffer[] = "createBuffer";
-static const char s_tr_rt[] = "getRealTime";
-static const char s_tr_dfret[] = "AfterDF";
-static const char s_tr_strdrop[] = "StrDrop";
-static const char s_tr_carseed[] = "CarSeed";
-static const char s_tr_carfind[] = "CarFind";
-static const char s_tr_packfile[] = "PackFileNull";
-static const char s_tr_menucar[] = "MenuCarNull";
-static const char s_tr_trackcopy[] = "TrackCopy";
-static const char s_tr_staterender[] = "StateRenderNull";
-static const char s_tr_getpackfilename[] = "PackFilenameNull";
+static const char __attribute__((used)) s_tr_c1[] = "MenuScene::MenuScene";
+static const char __attribute__((used)) s_tr_rm[] = "RemoveChildNodeType";
+static const char __attribute__((used)) s_tr_grid[] = "CustomBatchGrid";
+static const char __attribute__((used)) s_tr_anim[] = "createAnimator";
+static const char __attribute__((used)) s_tr_light[] = "CLightSceneNode";
+static const char __attribute__((used)) s_tr_frame[] = "DisplayFrame";
+static const char __attribute__((used)) s_tr_run[] = "IDevice::run";
+static const char __attribute__((used)) s_tr_update[] = "RenderFX::Update";
+static const char __attribute__((used)) s_tr_render[] = "RenderFX::Render";
+static const char __attribute__((used)) s_tr_endgl[] = "endScene-GL";
+static const char __attribute__((used)) s_tr_endiv[] = "endScene-IV";
+static const char __attribute__((used)) s_cnd_draw2dline[] = "draw2DLine";
+static const char __attribute__((used)) s_cnd_getmaxclip[] = "getMaxUserClipPlanes";
+static const char __attribute__((used)) s_cnd_createbuffer[] = "createBuffer";
+static const char __attribute__((used)) s_tr_rt[] = "getRealTime";
+static const char __attribute__((used)) s_tr_dfret[] = "AfterDF";
+static const char __attribute__((used)) s_tr_strdrop[] = "StrDrop";
+static const char __attribute__((used)) s_tr_carseed[] = "CarSeed";
+static const char __attribute__((used)) s_tr_carfind[] = "CarFind";
+static const char __attribute__((used)) s_tr_packfile[] = "PackFileNull";
+static const char __attribute__((used)) s_tr_menucar[] = "MenuCarNull";
+static const char __attribute__((used)) s_tr_trackcopy[] = "TrackCopy";
+static const char __attribute__((used)) s_tr_staterender[] = "StateRenderNull";
+static const char __attribute__((used)) s_tr_getpackfilename[] = "PackFilenameNull";
 
 // Bug #019: aviso en vivo cuando la guarda omite un drop (raro: una vez por
 // corrida como mucho, sin costo de timing).
@@ -1219,8 +1247,8 @@ static void hook_cxa_throw(void) {
     );
 }
 
-static const char s_english_str[] = "english";
-static const char s_empty_str[] = "";
+static const char __attribute__((used)) s_english_str[] = "english";
+static const char __attribute__((used)) s_empty_str[] = "";
 
 /*
  * Bug #022 (log 030) — FIX REAL de la excepcion C++ en "First time launch".
@@ -1560,9 +1588,6 @@ void so_patch(void) {
 #ifdef RENDER_CULLING_BYPASS
     // Bypass culling de ISceneNode y bounding box para evitar que el vehiculo / entidades
     // parpadeen o se borren durante la carrera (optimizacion/fix de Dungeon Hunter 2).
-    // Especulativo, sin confirmar en consola que arregle nada -- ver
-    // RENDER_CULLING_BYPASS en CMakeLists.txt para apagarlo y aislar el sintoma real
-    // (candidato principal: el spam de CNullDriver::createBuffer, ver logs 054/055).
     uintptr_t sym_is_culled_node = (uintptr_t)so_symbol(&so_mod, "_ZNK6glitch5scene13CSceneManager8isCulledEPKNS0_10ISceneNodeE");
     if (sym_is_culled_node) {
         hook_addr(sym_is_culled_node, (uintptr_t)&ret0);
@@ -1572,6 +1597,30 @@ void so_patch(void) {
     if (sym_is_culled_box) {
         hook_addr(sym_is_culled_box, (uintptr_t)&ret0);
         l_info("[patch] Hooked CSceneManager::isCulled(aabbox3d, E_CULLING_TYPE) -> ret0");
+    }
+
+    // Causa raiz real de vehiculos (jugador, rivales, trafico) y poderes (nitro, cash, emp, etc.)
+    // que desaparecian o eran intermitentes durante la carrera:
+    // NINGUNO de ellos consulta CSceneManager::isCulled(). Todos llaman a Camera::IsInViewFrustrum(&bbox):
+    // 1) RaceCar::UpdateMeshes: si IsInViewFrustrum devuelve 0, ejecuta setVisible(false) en los 43 nodos
+    //    del auto, haciendolo completamente invisible (tanto al jugador como a los competidores).
+    // 2) TrafficCar::IsViewable: devuelve Camera::IsInViewFrustrum(&bbox); si es 0, el auto de calle se oculta.
+    // 3) BaseSceneObject::SceneObjUpdateCull: calcula *(item+0x1a) = IsInViewFrustrum ^ 1; si es 0,
+    //    marca isCulled=1 y llama setVisible(false) sobre el nodo del poder/pickup.
+    // Forzar Camera::IsInViewFrustrum -> ret1 (1 = dentro del frustum = visible) garantiza que los vehiculos
+    // y poderes se mantengan siempre visibles y actualizados.
+    uintptr_t sym_is_in_view_frustum = (uintptr_t)so_symbol(&so_mod, "_ZN6Camera16IsInViewFrustrumERKN6glitch4core8aabbox3dIfEE");
+    if (sym_is_in_view_frustum) {
+        hook_addr(sym_is_in_view_frustum, (uintptr_t)&ret1);
+        l_info("[patch] Hooked Camera::IsInViewFrustrum -> ret1 (Vehiculos y poderes siempre visibles)");
+    }
+
+    // CustomSceneManager::isCulledCustom devuelve 1 si culled, 0 si visible.
+    // Al forzarlo a ret0, ningun nodo de escena personalizado es descartado por el culling frustum custom.
+    uintptr_t sym_is_culled_custom = (uintptr_t)so_symbol(&so_mod, "_ZNK18CustomSceneManager14isCulledCustomEPKN6glitch5scene10ISceneNodeE9CULL_TYPE");
+    if (sym_is_culled_custom) {
+        hook_addr(sym_is_culled_custom, (uintptr_t)&ret0);
+        l_info("[patch] Hooked CustomSceneManager::isCulledCustom -> ret0");
     }
 #else
     l_info("[patch] RENDER_CULLING_BYPASS off -- isCulled() sin tocar (build de diagnostico)");
