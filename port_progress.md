@@ -4,6 +4,46 @@
 > escribieron aunque después se hayan demostrado equivocadas -- saber qué hipótesis se
 > descartó, y por qué, vale tanto como el fix. Lo que está vigente hoy está acá arriba.
 
+## Sesión 2026-09-20 (tarde): Bug #038 + remap de botones pedido por el usuario
+
+**Bug #038 (log 069 + dump 1789937337) — Data abort en
+`glitch::video::CCommonGLDriverBase::getRenderState` al soltar BACK (CIRCLE) en
+el menú.** El dump dice PC = `libasphalt6.so+0x95a6e0` con R0 (this) =
+0x00000000. El abort de ARM reporta PC = instrucción que falló + 8, o sea la
+que falla es `0x95a6d8: ldrb r4,[r0,#461]` (verificado con objdump ARM real:
+`push {r4,r5,r6}` + `ldrb r4,[r0,#461]` + `ldrb ip,[r0,#462]` + ...). El LR del
+dump (0xb277d0) cae en `.rodata` (un typeinfo) -- basura, sin llamador
+identificable, misma firma que el Bug #037. El log se corta justo después de
+`KEYUP 4` (soltar BACK) tras `SaveCurrentProfile`/`Saved Backup Profile` --
+BACK en menú dispara una transición de estado y el dibujo 2D/UI siguiente corre
+con el driver en NULL. Es la misma enfermedad del Bug #037 (driver NULL en
+dibujo 2D de menú) por OTRO camino: la guarda de `draw2DRectangle` quedó
+instalada ("hook en +0x7F653C") pero nunca disparó (cero `Draw2DRectNull` en el
+log 069) y el crash igual ocurrió.
+
+**Fix (misma técnica que #037, equivalencia exacta):**
+`CNullDriver::getRenderState` es un no-op vacío (`return;`,
+out_ghidra.c:60978) -- el propio motor define que con driver nulo no se escribe
+nada en el `SRenderState&`. Hook en la ENTRADA de la función (0x95A6D4, función
+normal con prólogo propio, no thunk compartido: cubre todos los caminos): con
+r0 NULL se retorna sin tocar nada (`bx lr`, pila balanceada porque el push aún
+no corrió); con r0 válido se emulan las 2 palabras y se resume en +8. Un solo
+aviso (`GetRenderStateNull`, con once-flag porque puede ser camino caliente).
+Build Debug OK. Sin probar en consola (FTP caído al desplegar -- VitaShell con
+FTP cerrado): el eboot quedó en `build/eboot.bin` para subirlo a mano, y el
+próximo log debería mostrar `hook en +0x95A6D4` al arrancar y
+`[patch] GetRenderStateNull` en vez de cortarse al cambiar de estado en el menú.
+
+**Remap de botones (pedido del usuario, según HUD de carrera en
+screenshots/eh/2026-09-20/2026-09-20-030001.jpg):** CROSS (X) = nitro flotante
+táctil únicamente (sin tecla 105, sin freno derecho); TRIANGLE/CIRCLE/START/
+SELECT no hacen nada; cruceta (más L1/R1 y stick) y SQUARE (freno izq + tecla
+106) quedan igual. OJO: CIRCLE (BACK) y START (MENU) quedan muertos -- la
+navegación del menú/pantalla de pausa depende 100% del táctil (botones
+on-screen como `back_btn_main`); si algún menú no tiene botón on-screen para
+volver, habrá que devolver BACK a CIRCLE. `FAKE_IDX_BRAKE_R` queda sin cablear
+(ranura conservada documentada).
+
 ## Estado actual — 2026-09-11
 
 **¡El juego ya llega hasta el menú principal con renderizado y presentación activa!**
@@ -4138,3 +4178,134 @@ la pelicula (r5, viva en el sitio) y UNA vez por arranque se loguea
 `IGMProbe: movie=%p main_menu=%p hud.container=%p menu_main=%p
 menu_custom_controls=%p` (Find es solo-lectura; el log colapsa el resto). El próximo log
 dirá si la peli es la correcta (main_menu presente) y falta solo el attach dinámico.
+
+### Bug #037 — Data abort en `C2DDriver::draw2DRectangle(IVideoDriver*,...)`, driver NULL en el menú principal (log 067 + dump 1789887462) — 2026-09-20
+
+**Contexto:** log 067 llega sano hasta frame 2899 en el menú principal (input
+físico/touch funcionando, `SaveCurrentProfile()` OK, dinero 36412), con el spam ya
+conocido de `StateRenderNull`/`IGMUpdate: Find devolvió NULL` (log 040/041, sin
+cambios) y `methodIntCall method ID 0 not found` (audio `GLMediaPlayer` sin
+resolver todavía). El log se corta sin mensaje de abort explícito -- la causa real
+salió del `.psp2dmp` de la misma corrida.
+
+**Confirmado con `psvita-toolkit analyze` (vita-parse-core, sin adivinar):**
+- Data abort. `PC = 0x9841253c` → `libasphalt6.so + 0x7f653c` →
+  `glitch::video::C2DDriver::draw2DRectangle(IVideoDriver*, rect<int> const&,
+  rect<int> const&, SColor const*, rect<int> const*) + 0x8`. `R0 = 0x00000000`.
+- Instrucción causante: `ldr ip, [r0]` (leer la vtable del driver para el dispatch
+  virtual). `LR` cae en `vox::SegmentGroup::SegmentGroup` -- descartado como pista
+  real (valor residual de LR de una llamada anterior, no el llamador verdadero; el
+  volcado de pila alrededor del crash también trae direcciones de
+  `CColladaDatabase::constructScene`/`pixel_format::unpackPalettized` que son datos
+  de pila viejos, no un backtrace confiable -- el abort ocurre en el prólogo mismo
+  de la función, antes de que exista un frame propio).
+- Pseudo-C (Ghidra, `out_ghidra.c:610440`) confirma que la función ENTERA es un
+  thunk: `(**(code **)(*(int *)param_1 + 0x34))();` -- ni siquiera intenta usar los
+  demás argumentos si el primero (el `IVideoDriver*`) es inválido.
+- Overload distinta de las ~90 llamadas normales a `C2DDriver::draw2DRectangle` que
+  ya aparecen en el binario (esas son variantes `__thiscall` con el driver ya
+  resuelto como campo de objeto, offset `+0x114`); ésta es la variante que recibe
+  el driver EXPLÍCITO como primer argumento -- no se pudo aislar con certeza el
+  call site exacto en el pseudo-C (resolución de overloads de Ghidra no es
+  confiable ahí, mismo motivo de cautela que con `thisAppendBatch`), así que el fix
+  va en el sitio del crash mismo, no en el llamador.
+
+**Fix, primer intento (`source/patch.c`, `OFF_DRAW2DRECT_IVD` = `0x7F6534`):** hook
+ENTER sobre las 2 primeras palabras de la función (`push {lr}` + `sub sp, sp, #12`,
+ninguna toca `r0`). Si `r0` (driver) es NULL, la función es un no-op seguro: como
+el prólogo real todavía no corrió, un `bx lr` directo es un retorno 100% válido al
+llamador (sin necesidad de `g_skip`, a diferencia de otros hooks de esta familia).
+Si `r0` es válido, se emulan las 2 palabras reales y se resume en +8 para que el
+dispatch virtual siga como siempre. Build OK (`psvita-toolkit build`).
+
+**Log 068 + dump 1789928259 (2026-09-20): el primer intento NO alcanzó.** El
+usuario reportó otro crash idéntico al pulsar START y tocar la pantalla en
+carrera. `psvita-toolkit analyze` mostró el MISMO `PC = 0x9841253c` (`+0x7f653c`,
+`ldr ip,[r0]`), mismo `R0 = 0x00000000` -- pero el log 068 confirma
+`[patch] hook en +0x7F6534` (el hook SÍ se instaló) y CERO líneas
+`Draw2DRectNull`. Conclusión: el hook de entrada nunca corrió para este crash.
+Lectura de los bytes crudos del `.so` (`push{lr}; sub sp,#12; ldr ip,[r0]; ldr
+lr,[sp,#16]; str lr,[sp]; mov lr,pc; ldr pc,[ip,#52]; add sp,sp,#12; ldmfd
+sp!,{pc}`) confirma que la función es un thunk de 5 instrucciones de dispatch
+virtual que el compilador fusionó como bloque COMPARTIDO (cross-jumping/ICF de
+GCC): algún otro caller salta DIRECTO a `0x7f653c`, sin pasar por el prólogo de
+`0x7f6534` -- un hook en la entrada "oficial" del símbolo no cubre ese camino.
+El backtrace del dump (que ya en el Bug original se marcó como sospechoso) lo
+confirma: el valor en `SP+0xC` es el PROPIO PC del crash, dato de pila residual
+de una invocación anterior, no un frame real -- coherente con que el abort
+ocurre en un punto de entrada compartido sin prólogo propio.
+
+**Fix real (Bug #037, `OFF_DRAW2DRECT_IVD` ahora = `0x7F653C`):** el hook se
+mueve a la INSTRUCCIÓN QUE CRASHEA (`ldr ip,[r0]` + `ldr lr,[sp,#16]`) en vez de
+a la entrada del símbolo -- así cubre cualquier camino que llegue ahí, sea por
+la entrada de la función o por el salto directo compartido. Si `r0` es NULL, se
+salta directo al epílogo real en `0x7f6550` (`add sp,sp,#12` + `ldmfd sp!,{pc}`)
+-- el mismo retorno que produciría un dispatch virtual que no dibujó nada, sin
+reconstruir el unwind a mano. Si `r0` es válido, se emulan las 2 palabras reales
+y se resume en +8. Build OK (`psvita-toolkit build`). Sin probar en consola
+todavía -- el próximo log debería mostrar `[patch] Draw2DRectNull: ...` en vez
+de cortarse.
+
+## Sesión 2026-09-20 (noche): X físico también dispara nitro + opacidad 1% en nitro/frenos táctiles del HUD
+
+**Pedido del usuario:** el botón CROSS (✕) del control físico debería tocar el
+nitro (hasta ahora solo lo hacía TRIANGLE), y los widgets táctiles de nitro y
+freno del HUD de carrera (`hud.btn_nitro`/`hud.btn_nitro2`/`hud.btn_pedal_brake`/
+`hud.btn_pedal_brake_right`, strings reales confirmados en el `.so`) deberían
+quedar casi invisibles (~1% opacidad) ya que los controles físicos los
+reemplazan y estorban visualmente.
+
+**Input (`source/input.c`, `poll_pad()`):** `nitro_down` ahora es
+`SCE_CTRL_TRIANGLE | SCE_CTRL_CROSS` (antes solo TRIANGLE). CROSS sigue
+disparando también su freno de esquina existente (`FAKE_IDX_BRAKE_R` + tecla
+105) sin cambios -- es aditivo, no reemplaza nada.
+
+**Opacidad HUD (`source/patch.c`, `hud_touch_controls_fade()`, llamada desde el
+bucle principal en `main.c` junto a `input_poll()`):** usa la API real del
+motor, `RenderFX::SetAlpha(char const*, float)` (`0x685320`), confirmada en el
+pseudo-C (`Find(this,name)` + escritura de un `gameswf::cxform` "custom" con el
+alpha pisado -- el mismo mecanismo de fundidos de UI del propio gameswf, no un
+draw call parcheado a ciegas). `this` = puntero estático de
+`Singleton<T_SWFManager>` leído DIRECTO (sin pasar por `Game::GetSWFMgr()`, que
+lo crea de forma perezosa si es NULL) para no forzar su construcción antes de
+que el juego mismo lo haga; si todavía es NULL se sale sin tocar nada.
+`GetFxByByFlashFile(swf_mgr, 9)` (peli 9 = HUD/`178hud.swf`, confirmado en el
+Bug de IGMUpdate/log 065) da el `RenderFX*` de la película del HUD.
+
+ABI: Ghidra decompila el 3er parámetro de `SetAlpha` como `float in_r2` --
+confirma soft-float real (el valor va en `r2` como bits crudos, no en `s0`). El
+puntero a función se tipea con `uint32_t` en vez de `float` para ese parámetro,
+forzando que el compilador lo pase por `r2` sin importar el ABI de punto
+flotante de ESTE proyecto.
+
+Nombre del widget: el string real en el `.so` lleva el prefijo `hud.` (ej.
+`hud.btn_nitro`), pero no está confirmado si `RenderFX::Find()` para la peli
+HUD resuelve desde una raíz compartida (necesita el prefijo) o desde la raíz
+local de esa película (el prefijo sobra) -- se prueban ambas formas por widget;
+la que no aplica es un no-op inofensivo dentro de `SetAlpha` (Find devuelve
+NULL). Build OK (`psvita-toolkit build`). Sin probar en consola todavía --
+el próximo log debería mostrar `[patch] HudFade: ...` una vez, y CROSS debería
+activar el nitro ademas del freno derecho.
+
+## Bug #039: CROSS (X) viraba el auto a la derecha en vez de activar el nitro
+
+**Reporte del usuario** (`screenshots/eh/2026-09-20/2026-09-20-030001.jpg`,
+captura en carrera real con el HUD táctil visible): al apretar CROSS el auto
+se iba hacia la derecha y el nitro nunca se activaba, reproducible incluso con
+los botones virtuales ocultos.
+
+**Causa:** `POS_NITRO_X/Y` en `source/input.c` estaba en `(800,350)`, un valor
+heredado del reescalado de Asphalt-5-Vita sin recalibrar contra el HUD real de
+este juego. Esa coordenada cae a solo ~54px de `POS_STEER_R` `(850,330)` --
+dentro de la zona táctil de "girar a la derecha", que es un área grande y no
+depende de que su widget esté dibujado. El tap sintético de `fake_touch_set()`
+para `FAKE_IDX_NITRO` terminaba entonces registrado por el motor como un tap
+de dirección, nunca como el ícono de nitro (confirmable con la línea
+`[pad] FAKE PRESS idx=4 ...` del log contra el rect real del widget).
+
+**Fix:** medido el centro real del ícono de nitro (glow cian) en la captura
+del usuario con un análisis de píxeles (`PIL`, threshold sobre el canal azul):
+bbox `x=[843..929] y=[366..430]`, centroide `(886,398)`. `POS_NITRO_X/Y`
+pasa de `(800,350)` a `(885,400)`, separándolo claramente de `POS_STEER_R`.
+Build pendiente de verificar en consola real -- el log debería mostrar el tap
+de CROSS activando el nitro sin virar el auto.

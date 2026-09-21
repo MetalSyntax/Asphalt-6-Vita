@@ -12,6 +12,7 @@
  *        for better compatibility.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <kubridge.h>
@@ -545,6 +546,78 @@ void hooked_CNullDriver_createBuffer() {
 #define W_LDR_R4R3R2       0xE7934002u // ldr r4, [r3, r2]
 #define W2_SUB_R4_12       0xE244400Cu // sub r4, r4, #12
 
+/*
+ * Bug #037 (log 067/068 + dumps 1789887462/1789928259) — Data abort en
+ * glitch::video::C2DDriver::draw2DRectangle(IVideoDriver*, rect const&, rect
+ * const&, SColor const*, rect const*), la variante que recibe el driver
+ * EXPLICITO (no "this") -- confirmado con vita-parse-core: PC cae en
+ * 0x7f653c, `ldr ip, [r0]` (leer la vtable del driver), R0 = 0x00000000.
+ * Cuerpo completo de la funcion (bytes crudos, leidos directo del .so):
+ *
+ *   7f6534: e52de004  push {lr}            ; str lr, [sp, #-4]!
+ *   7f6538: e24dd00c  sub sp, sp, #12
+ *   7f653c: e590c000  ldr ip, [r0]          ; CRASH si r0 (driver) es NULL
+ *   7f6540: e59de010  ldr lr, [sp, #16]     ; 5to arg (rect* clip) del caller
+ *   7f6544: e58de000  str lr, [sp]          ; ... reenviado como arg del virtual
+ *   7f6548: e1a0e00f  mov lr, pc            ; setup manual de retorno (lr=0x7f6550)
+ *   7f654c: e59cf034  ldr pc, [ip, #52]     ; dispatch virtual real (vtable+0x34)
+ *   7f6550: e28dd00c  add sp, sp, #12       ; <- vuelve aca tras el virtual
+ *   7f6554: e8bd8000  ldmfd sp!, {pc}       ; pop {pc}: retorno real al llamador
+ *
+ * PRIMER INTENTO (log 067): un hook ENTER en 0x7f6534 (push{lr}+sub sp,#12)
+ * que devolvia temprano con `bx lr` si r0 era NULL. NO FUE SUFICIENTE: el
+ * log 068 (mismo PC, mismo R0=0, hook confirmado instalado -- "hook en
+ * +0x7F6534" en el log -- pero CERO lineas "Draw2DRectNull") probo que ese
+ * hook nunca se ejecuto para este crash. Conclusion: el compilador fusiono
+ * esta cola de 5 instrucciones (el "thunk" de dispatch virtual) como bloque
+ * COMPARTIDO (cross-jumping/ICF de GCC) -- algun otro caller salta
+ * DIRECTO a 0x7f653c sin pasar por el prologo de 0x7f6534, así que un hook
+ * en la entrada "oficial" del simbolo no cubre ese camino.
+ *
+ * FIX REAL: el hook va sobre la instruccion que crashea (0x7f653c) en vez
+ * de sobre la entrada del simbolo -- asi cubre CUALQUIER camino que llegue
+ * ahi, sea por la entrada de la funcion o por un salto directo compartido.
+ * Ninguna de las dos palabras pisadas (`ldr ip,[r0]` + `ldr lr,[sp,#16]`)
+ * lee ni escribe r0 antes del chequeo. Si r0 es NULL, se salta directo al
+ * epilogo real en 0x7f6550 (`add sp,sp,#12` + `ldmfd sp!,{pc}`) -- un
+ * retorno identico al que produciria un dispatch virtual que no hizo nada,
+ * sin necesidad de reconstruir manualmente el unwind. Si r0 es valido, se
+ * emulan las 2 palabras reales y se resume en +8 para que el dispatch
+ * virtual corra como siempre.
+ */
+#define OFF_DRAW2DRECT_IVD 0x7F653Cu  // C2DDriver::draw2DRectangle(IVideoDriver*,...): ldr ip,[r0] + ldr lr,[sp,#16] (crash log 067/068)
+#define W_LDR_IP_R0        0xE590C000u // ldr ip, [r0]
+#define W2_LDR_LR_SP16     0xE59DE010u // ldr lr, [sp, #16]
+
+/*
+ * Bug #038 (log 069 + dump 1789937337) — Data abort en
+ * glitch::video::CCommonGLDriverBase::getRenderState(SRenderState&) const
+ * al soltar BACK (CIRCLE) en el menu: transicion de estado -> dibujo 2D/UI
+ * con el driver en NULL. Confirmado con vita-parse-core: PC cae en 0x95a6e0
+ * con R0 (this) = 0x00000000. El abort de ARM reporta PC = instruccion que
+ * fallo + 8, o sea la que falla es 0x95a6d8 (`ldrb r4,[r0,#461]`, primer
+ * acceso al this). LR apunta a .rodata (0xb277d0, dentro de un typeinfo) --
+ * basura, sin llamador identificable (misma firma que el Bug #037).
+ *
+ * Es la misma enfermedad que el Bug #037 (IVideoDriver* NULL en dibujo 2D de
+ * menu) por OTRO camino de llamada: la guarda de draw2DRectangle quedo
+ * instalada (log 069: "hook en +0x7F653C") pero nunca disparo (cero lineas
+ * Draw2DRectNull) y el crash igual ocurrio -- el driver NULL llega a
+ * getRenderState sin pasar por draw2DRectangle. Por eso el hook va en la
+ * ENTRADA de getRenderState (funcion normal con prologo propio, no un thunk
+ * compartido como la de #037): cubre todos los caminos de un tiro.
+ *
+ * Equivalencia exacta, no heuristica: CNullDriver::getRenderState es un no-op
+ * vacio (`return;`, out_ghidra.c:60978) -- o sea, el propio motor define que
+ * con driver nulo NO se escribe nada en el SRenderState&. Con r0 NULL se
+ * retorna sin tocar nada (el prologo aun no corrio: `bx lr` directo, pila
+ * balanceada); con r0 valido se emulan las 2 palabras reales y se resume en
+ * +8. Sin log por llamada (puede ser camino caliente): un solo aviso.
+ */
+#define OFF_GETRENDERSTATE 0x95A6D4u // CCommonGLDriverBase::getRenderState: push {r4-r6} + ldrb r4,[r0,#461] (crash log 069)
+#define W_PUSH456          0xE92D0070u // push {r4, r5, r6}
+#define W2_LDRB_R4_1CD    0xE5D041CDu // ldrb r4, [r0, #461]
+
 #define W_PUSH9  0xe92d4ff0u // push {r4-r9, sl, fp, lr}
 #define W_PUSH6a 0xe92d41f0u // push {r4-r8, lr}
 #define W_PUSH8  0xe92d47f0u // push {r4-r9, sl, lr}
@@ -626,7 +699,9 @@ static uint32_t g_resume_c1, g_resume_c2, g_resume_rm, g_resume_grid,
                 g_resume_sr0, g_resume_sr1, g_resume_sr2,
                 g_resume_igm, g_skip_igm,
                 g_resume_cnd_createbuffer,
-                g_resume_getpackfilename;
+                 g_resume_getpackfilename,
+                 g_resume_draw2drect, g_skip_draw2drect,
+                 g_resume_getrenderstate;
 __attribute__((used))
 static uint32_t g_emu_c1, g_emu_c2, g_emu_anim, g_emu_light, g_emu_frame,
                 g_emu_dfret1, g_emu_dfret2, g_emu_cxathrow;
@@ -1532,6 +1607,74 @@ static void hook_igm_vis(void) {
     );
 }
 
+void draw2drect_null_driver(void) {
+    l_error("[patch] Draw2DRectNull: IVideoDriver* NULL en C2DDriver::draw2DRectangle, "
+            "dibujo 2D omitido (log 067/068)");
+}
+
+// Bug #037 (log 067/068, segundo intento): guarda sobre la INSTRUCCION QUE
+// CRASHEA (0x7f653c, `ldr ip,[r0]`), no sobre la entrada del simbolo -- el
+// primer intento (hook en 0x7f6534) no cubria un salto directo compartido a
+// este punto (ver comentario largo junto a OFF_DRAW2DRECT_IVD). r0 = driver,
+// intacto porque ninguna de las 2 palabras pisadas (`ldr ip,[r0]` en si misma
+// se reemplaza recien despues del chequeo; `ldr lr,[sp,#16]`) lo toca antes
+// del cmp. Si r0 es NULL se salta directo al epilogo real (0x7f6550: `add
+// sp,sp,#12` + `ldmfd sp!,{pc}`) -- el mismo retorno que produciria un
+// dispatch virtual que no dibujo nada. Si r0 es valido se emulan las 2
+// palabras reales y se resume en +8 (`str lr,[sp]`, ya con r0 confirmado).
+__attribute__((naked, target("arm")))
+static void hook_draw2drect(void) {
+    __asm__ volatile(
+        "cmp r0, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "bl draw2drect_null_driver\n"
+        "pop {r0-r3, r12, lr}\n"
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"      // salto al epilogo real (0x7f6550, g_skip_draw2drect)
+        "1:\n"
+        ".word 0xe590c000\n"   // emu: ldr ip, [r0]
+        ".word 0xe59de010\n"   // emu: ldr lr, [sp, #16]
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"      // resume en +8 (str lr,[sp], dispatch virtual real)
+        "2: .word g_skip_draw2drect\n"
+        "3: .word g_resume_draw2drect\n"
+    );
+}
+
+// Bug #038 (log 069 + dump 1789937337): guarda sobre la ENTRADA de
+// CCommonGLDriverBase::getRenderState. r0 = this (driver), intacto porque
+// ninguna de las 2 palabras pisadas lo toca antes del cmp. Con r0 NULL se
+// retorna directo (`bx lr`: el push aun no corrio, pila balanceada) --
+// identico al no-op de CNullDriver::getRenderState. Con r0 valido se emulan
+// las 2 palabras reales y se resume en +8. Un solo aviso (camino caliente).
+void getrenderstate_null_driver(void) {
+    static int s_logged = 0;
+    if (!s_logged) {
+        s_logged = 1;
+        l_error("[patch] GetRenderStateNull: driver NULL en "
+                "CCommonGLDriverBase::getRenderState, lectura omitida (log 069)");
+    }
+}
+
+__attribute__((naked, target("arm")))
+static void hook_getrenderstate(void) {
+    __asm__ volatile(
+        "cmp r0, #0\n"
+        "bne 1f\n"
+        "push {r0-r3, r12, lr}\n"
+        "bl getrenderstate_null_driver\n"
+        "pop {r0-r3, r12, lr}\n"
+        "bx lr\n"                // driver NULL: retorno sin tocar nada
+        "1:\n"
+        ".word 0xe92d0070\n"   // emu: push {r4, r5, r6}
+        ".word 0xe5d041cd\n"   // emu: ldrb r4, [r0, #461]
+        "ldr r12, 2f\n"
+        "ldr pc, [r12]\n"      // resume en +8 (ldrb ip,[r0,#462])
+        "2: .word g_resume_getrenderstate\n"
+    );
+}
+
 // Bug #033: aviso en vivo (deberia ser raro -- una vez por auto/indice afectado,
 // no por frame, asi que no hace falta bc_event ni colapso de logger).
 void packfilename_null(void) {
@@ -1785,5 +1928,87 @@ void so_patch(void) {
                    0, &g_resume_getpackfilename, NULL);
     } else {
         l_error("[patch] sin hook en GetPackFilename: no se encontro _S_empty_rep_storage");
+    }
+
+    // Log 067/068 + dumps 1789887462/1789928259: IVideoDriver* NULL en
+    // C2DDriver::draw2DRectangle(IVideoDriver*,...), hook sobre la instruccion
+    // que crashea (no la entrada del simbolo -- ver comentario largo arriba).
+    g_skip_draw2drect = (uint32_t)(so_mod.text_base + 0x7F6550u);
+    hook_trace(OFF_DRAW2DRECT_IVD, W_LDR_IP_R0, W2_LDR_LR_SP16, hook_draw2drect, 0, &g_resume_draw2drect, NULL);
+
+    // Log 069 + dump 1789937337 (Bug #038): driver NULL en
+    // CCommonGLDriverBase::getRenderState al cambiar de estado en el menu.
+    hook_trace(OFF_GETRENDERSTATE, W_PUSH456, W2_LDRB_R4_1CD, hook_getrenderstate, 0, &g_resume_getrenderstate, NULL);
+}
+
+/*
+ * Pedido del usuario (2026-09-20): los controles fisicos ya cubren nitro
+ * (CROSS, ver poll_pad() en input.c) y freno (SQUARE/CROSS) -- los widgets
+ * TACTILES del HUD de carrera (`hud.btn_nitro`, `hud.btn_pedal_brake`,
+ * `hud.btn_pedal_brake_right`, confirmados como strings reales en el .so)
+ * quedan de estorbo visual y se pide bajarlos a ~1% de opacidad.
+ *
+ * RenderFX::SetAlpha(char const*, float) (0x685320) YA es la API real del
+ * motor para esto (confirmado en el pseudo-C: hace Find(this,name) y le
+ * escribe un gameswf::cxform "custom" con el alpha pisado -- el mismo
+ * mecanismo que gameswf usa para sus propios fundidos de UI). No hace falta
+ * tocar ningun draw call.
+ *
+ * ABI: Ghidra decompila el 3er parametro como "float in_r2" -- confirma que
+ * este build es soft-float (el valor va en r2 como bits crudos, no en s0).
+ * Por eso el prototipo del puntero a funcion usa uint32_t en vez de float:
+ * fuerza que el compilador lo pase por r2 sin importar el ABI de punto
+ * flotante que use ESTE proyecto, evitando un mismatch silencioso.
+ *
+ * this = Singleton<T_SWFManager>: se lee el puntero estatico DIRECTO (sin
+ * pasar por Game::GetSWFMgr(), que lo crea de forma perezosa si es NULL) para
+ * no forzar la construccion del manager antes de que el juego mismo lo haga
+ * -- si todavia es NULL (menu/carga temprana), se sale sin tocar nada.
+ *
+ * Nombre del widget: el string real en el .so tiene el prefijo "hud." (ej.
+ * "hud.btn_nitro"), pero no esta confirmado si RenderFX::Find() para la peli
+ * HUD (id 9, 178hud.swf) resuelve desde una raiz compartida (necesita el
+ * prefijo) o desde la raiz local de esa pelicula (el prefijo sobra). Se
+ * prueban ambas formas por widget: la que no aplica es un no-op inofensivo
+ * (Find devuelve NULL adentro de SetAlpha).
+ */
+typedef int (*fn_get_fx_by_flashfile)(void *this_, int flash_file);
+typedef void (*fn_renderfx_set_alpha)(void *this_, const char *name, uint32_t alpha_bits);
+
+#define SWF_FLASHFILE_HUD 9 // 178hud.swf (confirmado: Bug #IGM / log 065)
+
+void hud_touch_controls_fade(void) {
+    static bool s_logged = false;
+
+    void **swf_mgr_singleton = (void **)so_symbol(&so_mod,
+        "_ZZN9SingletonI12T_SWFManagerE14ManageInstanceEbE11m_sInstance");
+    if (!swf_mgr_singleton || !*swf_mgr_singleton)
+        return;
+
+    fn_get_fx_by_flashfile get_fx = (fn_get_fx_by_flashfile)
+        so_symbol(&so_mod, "_ZN12T_SWFManager18GetFxByByFlashFileE11eFlashFiles");
+    fn_renderfx_set_alpha set_alpha = (fn_renderfx_set_alpha)
+        so_symbol(&so_mod, "_ZN8RenderFX8SetAlphaEPKcf");
+    if (!get_fx || !set_alpha)
+        return;
+
+    void *hud = (void *)(uintptr_t)get_fx(*swf_mgr_singleton, SWF_FLASHFILE_HUD);
+    if (!hud)
+        return;
+
+    union { float f; uint32_t u; } alpha_1pct = { .f = 0.01f };
+
+    static const char *const s_names[] = {
+        "btn_nitro", "hud.btn_nitro",
+        "btn_nitro2", "hud.btn_nitro2",
+        "btn_pedal_brake", "hud.btn_pedal_brake",
+        "btn_pedal_brake_right", "hud.btn_pedal_brake_right",
+    };
+    for (unsigned i = 0; i < sizeof(s_names) / sizeof(s_names[0]); i++)
+        set_alpha(hud, s_names[i], alpha_1pct.u);
+
+    if (!s_logged) {
+        s_logged = true;
+        l_error("[patch] HudFade: opacidad 1%% aplicada a nitro/frenos tactiles del HUD");
     }
 }

@@ -221,6 +221,7 @@ int main() {
         // que están bloqueados el motor y vitaGL nunca vuelven -- parece un freeze.
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         input_poll(&jni, NULL);
+        hud_touch_controls_fade();
 
         unsigned int swaps_before = gl_swap_count;
         if (GameRenderer_nativeRender) {

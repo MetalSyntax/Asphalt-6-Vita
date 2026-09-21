@@ -49,11 +49,16 @@
 #define FREE_VITA_ID (-1)
 
 // Botones fisicos mapeados a taps sinteticos (estilo Asphalt-5-Vita).
+// Pedido del usuario (2026-09-20, ver HUD en screenshots/eh/2026-09-20/):
+// CROSS (X) = nitro unicamente; TRIANGLE/CIRCLE/START/SELECT no hacen nada;
+// cruceta y SQUARE se quedan igual. BRAKE_R queda sin cablear (el pedal
+// derecho solo existe como widget tactil): la ranura se conserva documentada
+// por si se quiere reasignar sin renumerar.
 #define FAKE_IDX_LEFT    0 // direccion izquierda
 #define FAKE_IDX_RIGHT   1 // direccion derecha
 #define FAKE_IDX_BRAKE_L 2 // freno, esquina inferior izquierda (SQUARE)
-#define FAKE_IDX_BRAKE_R 3 // freno, esquina inferior derecha (CROSS)
-#define FAKE_IDX_NITRO   4 // nitro flotante (TRIANGLE)
+#define FAKE_IDX_BRAKE_R 3 // (sin cablear: ningun boton fisico)
+#define FAKE_IDX_NITRO   4 // nitro flotante (CROSS)
 #define FAKE_COUNT 5
 
 /*
@@ -66,13 +71,13 @@
  *     CarControl::UpdateSteeringOnscreenButtons: `ands r6,r3,#4` /
  *     `tst r3,#8`. CUAL es izquierda y cual derecha depende del signo del
  *     angulo -- si van al reves, intercambiar KEY_STEER_L/R, una linea.)
- *   106 (BUTTON_THUMBL) -> mascara 1 | 105 (BUTTON_R2) -> mascara 2
- *     (par de accion independiente: freno/nitro segun el modo de control;
- *     SetManualInputFlags los mezcla en TODOS los modos, asi que valen tanto
- *     en botones en pantalla como en inclinacion.)
- *   4 (BACK) -> ignorado al pulsar, al SOLTAR hace el back/pausa propio del
- *     estado actual (compara el estado interno contra 0x32/0x19/0x18/0x1e).
- *   82 (MENU) -> al soltar setea el flag de menu (bit 0x100000).
+ *   106 (BUTTON_THUMBL) -> mascara 1 (freno segun el modo de control;
+ *     SetManualInputFlags la mezcla en TODOS los modos, asi que vale tanto
+ *     en botones en pantalla como en inclinacion). La tecla de accion del
+ *     nitro/freno derecho (105, BUTTON_R2) ya NO se manda: CROSS solo toca el
+ *     widget tactil del nitro y TRIANGLE/CIRCLE/START no mandan nada (pedido
+ *     del usuario 2026-09-20).
+ *   4 (BACK) y 82 (MENU) ya NO se mandan: ningun boton fisico los dispara.
  *   19-22 (DPAD_UP/DOWN/LEFT/RIGHT) -> IGNORADOS (retornan sin efecto).
  *
  * Por eso la cruceta NO se manda como DPAD sino como estos botones de
@@ -81,9 +86,6 @@
 #define KEY_STEER_L 103
 #define KEY_STEER_R 108
 #define KEY_ACT_A   106
-#define KEY_ACT_B   105
-#define KEY_BACK    4
-#define KEY_MENU    82
 
 /*
  * Posiciones de los taps sinteticos en el espacio 960x544. Son el equivalente
@@ -93,6 +95,15 @@
  * A5 steer (100,240)/(700,240) -> (120,272)/(840,272); freno (50,430) ->
  * (60,487); nitro (715,380) -> (858,431). Aca se redondean a numeros
  * cerrados y el nitro se separa del freno derecho para que no se solapen.
+ *
+ * Bug (2026-09-20, screenshots/eh/2026-09-20/2026-09-20-030001.jpg): con
+ * (800,350) el tap sintetico de CROSS caia adentro de la zona tactil de
+ * "girar a la derecha" (POS_STEER_R esta a solo ~54px) en vez de la del
+ * icono de nitro real, asi que CROSS viraba el auto y nunca prendia el
+ * nitro -- reproducible incluso con los botones virtuales ocultos, porque
+ * la zona de "girar" no depende de que su widget se dibuje. Recalibrado
+ * midiendo el centro real del icono (glow cian) en esa captura: bbox
+ * x=[843..929] y=[366..430] -> centro (886,398), redondeado a (885,400).
  *
  * CALIBRACION: si un boton fisico "no hace nada" o pega en otro widget, las
  * lineas `[pad] FAKE ...` del log dan la coordenada exacta que se mando --
@@ -106,8 +117,8 @@
 #define POS_BRAKE_L_Y 470
 #define POS_BRAKE_R_X 880
 #define POS_BRAKE_R_Y 470
-#define POS_NITRO_X 800
-#define POS_NITRO_Y 350
+#define POS_NITRO_X 885
+#define POS_NITRO_Y 400
 
 // Deadzone del stick analogico (rango ANALOG_WIDE 0-255, centro 128).
 // Misma que Asphalt-5-Vita (pad.lx < 64 / > 192).
@@ -339,8 +350,7 @@ static bool dispatch_key(void *env, void *clazz, bool is_down, bool was_down, in
 }
 
 static bool s_key_left_down, s_key_right_down;
-static bool s_key_brakel_down, s_key_braker_down;
-static bool s_key_circle_down, s_key_start_down;
+static bool s_key_brakel_down;
 
 static void poll_pad(void *env, void *clazz) {
     SceCtrlData pad;
@@ -348,24 +358,21 @@ static void poll_pad(void *env, void *clazz) {
         return;
 
     /*
-     * Mapeo fisico -> tactil+gamepad (estilo Asphalt-5-Vita):
+     * Mapeo fisico -> tactil+gamepad (estilo Asphalt-5-Vita, pedido del
+     * usuario 2026-09-20 segun el HUD de carrera):
      * - Cruceta IZQ/DER (mas L1/R1 y stick izquierdo) = direccion: tap en la
      *   zona tactil izq/der de la pantalla + key de gamepad (bits 4/8, el par
      *   de direccion de CarControl en todos los modos de control).
-     * - SQUARE/CROSS = frenos en las esquinas inferiores + keys (bits 1/2).
-     * - TRIANGLE = nitro flotante (solo tactil, one-shot con prioridad).
-     * - CIRCLE = BACK (atras en menus, pausa en carrera al soltar).
-     * - START = MENU (flag de menu al soltar).
+     * - SQUARE = freno de la esquina inferior izquierda + key (bit 1).
+     * - CROSS (X) = nitro flotante (solo tactil, one-shot con prioridad).
+     * - TRIANGLE/CIRCLE/START/SELECT = nada (muertos a proposito).
      */
     bool left_down = (pad.buttons & (SCE_CTRL_LEFT | SCE_CTRL_LTRIGGER)) != 0
         || pad.lx < STICK_LOW;
     bool right_down = (pad.buttons & (SCE_CTRL_RIGHT | SCE_CTRL_RTRIGGER)) != 0
         || pad.lx > STICK_HIGH;
     bool brakel_down = (pad.buttons & SCE_CTRL_SQUARE) != 0;
-    bool braker_down = (pad.buttons & SCE_CTRL_CROSS) != 0;
-    bool nitro_down = (pad.buttons & SCE_CTRL_TRIANGLE) != 0;
-    bool circle_down = (pad.buttons & SCE_CTRL_CIRCLE) != 0;
-    bool start_down = (pad.buttons & SCE_CTRL_START) != 0;
+    bool nitro_down = (pad.buttons & SCE_CTRL_CROSS) != 0;
 
     // Primero el flanco de tecla, despues el tap: al soltar se libera el tap
     // antes de la tecla, en orden espejo.
@@ -378,13 +385,7 @@ static void poll_pad(void *env, void *clazz) {
     s_key_brakel_down = dispatch_key(env, clazz, brakel_down, s_key_brakel_down, KEY_ACT_A);
     fake_touch_set(env, clazz, FAKE_IDX_BRAKE_L, brakel_down);
 
-    s_key_braker_down = dispatch_key(env, clazz, braker_down, s_key_braker_down, KEY_ACT_B);
-    fake_touch_set(env, clazz, FAKE_IDX_BRAKE_R, braker_down);
-
     fake_touch_set(env, clazz, FAKE_IDX_NITRO, nitro_down);
-
-    s_key_circle_down = dispatch_key(env, clazz, circle_down, s_key_circle_down, KEY_BACK);
-    s_key_start_down = dispatch_key(env, clazz, start_down, s_key_start_down, KEY_MENU);
 }
 
 void input_poll(void *env, void *clazz) {
