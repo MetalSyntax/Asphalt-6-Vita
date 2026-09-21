@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Title%20ID-ASPHALT06-ff69b4.svg?style=flat-square" alt="Title ID ASPHALT06" />
   <img src="https://img.shields.io/badge/Engine-Gameloft%20Glitch-brightgreen.svg?style=flat-square" alt="Engine" />
   <img src="https://img.shields.io/badge/Renderer-vitaGL%20%28GLES%202.0%2FGLSL%29-orange.svg?style=flat-square" alt="Renderer" />
-  <img src="https://img.shields.io/badge/Status-Playable%20(Alpha)-yellow.svg?style=flat-square" alt="Status: Playable (Alpha)" />
+  <img src="https://img.shields.io/badge/Status-Alpha%20%E2%80%94%20Testing%20Only-red.svg?style=flat-square" alt="Status: Alpha, testing only" />
 </p>
 
 ---
@@ -34,12 +34,15 @@ already-"licensed" archive (`copy.inject`) bundled in the offline APK release, a
 `pack.info` and the save-data defaults. See [`PORTING_PLAN.md`](PORTING_PLAN.md) for the full
 engine-detection write-up.
 
-### 🎮 Current Status: Playable (Alpha)
+### 🎮 Current Status: Alpha — Testing Only
 
-The game **boots to the main menu and races are playable**, but this is an early port with
-open, actively-tracked bugs rather than a polished release. See
-[`port_progress.md`](port_progress.md) for the full bug-by-bug diagnosis log (every fix is
-backed by a real console log/crash-dump — no guessing).
+> **This is an early alpha.** The game boots, reaches the main menu, and races are
+> technically playable, but the overall experience is **far from acceptable** for regular
+> play: frequent graphical glitches, aggressive FPS drops, and largely broken audio (see
+> below). Only worth trying if you want to help test/debug the port — not as a way to
+> actually play Asphalt 6 on Vita yet. See [`port_progress.md`](port_progress.md) for the
+> full bug-by-bug diagnosis log (every fix is backed by a real console log/crash-dump — no
+> guessing) and [`RELEASES.md`](RELEASES.md) for versioned release notes.
 
 ### ✨ What Works
 
@@ -69,6 +72,26 @@ backed by a real console log/crash-dump — no guessing).
 
 ### ⚠️ Known Issues
 
+**Confirmed on real hardware — the experience is currently far from acceptable:**
+
+- **Audio: only the engine/motor sound plays.** `vox::DriverAndroid`'s race mix
+  (`source/reimpl/audiotrack.c`) is the only audio actually audible on console. Menu music
+  and SFX (`GLMediaPlayer`, samples packed in `file00a.bin`, mixed in
+  `source/reimpl/gmp_audio.c`/`source/reimpl/soundpack.c`) are implemented in code but
+  **don't come through on hardware** — no music, no crash/nitro/UI sound effects, just the
+  car engine. Root cause not yet isolated (the code compiles and the mixer/pool logic runs,
+  so this needs a fresh diagnosis pass against a real audio log, not another blind fix).
+- **Graphical errors while textures load**: visible glitches/corruption tied to texture
+  streaming during gameplay, separate from the vehicle-window issue below. Under active
+  investigation.
+- **Aggressive, frequent FPS drops during races**: frame pacing swings from a low-30s
+  ceiling down to single digits mid-race, independent of the loading-screen stalls (see
+  `port_progress.md`). A likely contributor (over-eager scene culling bypass) was split out
+  behind the `RENDER_SCENE_CULLING_BYPASS` CMake option, but this has **not yet been
+  confirmed on hardware** to fix the drops.
+- **World geometry pop-in**: houses, trees, and road signs used to render at a very short
+  distance and pop in right next to the car; a fix is in place (`port_progress.md`, Bug
+  #041) but unverified on hardware.
 - **In-race pause menu is broken**: the engine looks up its own pause-menu buttons
   (`menu_main`, `back_btn_main`, `custom_controls_btn`) by name and doesn't find them in this
   build's HUD/profile variant, so their visibility never updates correctly. A crash-avoidance
@@ -82,14 +105,10 @@ backed by a real console log/crash-dump — no guessing).
 - **Graphical glitch on vehicle windows**: caused by a car-reflection texture
   (`*_Fixed.PVRTC4.tga`) that was never extracted from the original APK data — a missing-asset
   issue, not a code bug.
-- **Audio (engine sound works; music/SFX pending hardware test)**: the race mix
-  (`vox::DriverAndroid` → `android/media/AudioTrack`) is emulated over SceAudio
-  (`source/reimpl/audiotrack.c`), and menu music + SFX (`GLMediaPlayer`, samples packed
-  in `file00a.bin`) run through a dedicated mixer (`source/reimpl/gmp_audio.c`,
-  `source/reimpl/soundpack.c`). A second batch of `GLMediaPlayer` methods
-  (audio-focus recovery, 3D emitters, pool swapping — found via disassembly of
-  `GLMediaPlayer_nativeInit`) was just registered; without them the engine thought
-  audio was "recovering" forever and stayed silent. Not yet verified on hardware.
+
+None of this is a "just needs polish" situation yet — treat this port as a debugging target,
+not a playable release. See [`RELEASES.md`](RELEASES.md) and `port_progress.md` for the full,
+evidence-backed status of every issue above.
 
 ---
 
@@ -174,6 +193,8 @@ parsing), use **psvita-port-toolkit** instead of raw `cmake`/`make`.
 - `PORTING_PLAN.md`: Living plan — engine findings, JNI export table, checklist.
 - `port_progress.md`: Bug-by-bug diagnosis log, one confirmed bug at a time, backed by real
   console logs and crash dumps.
+- [`RELEASES.md`](RELEASES.md): Versioned release notes — what works and what's known-broken
+  per release, distilled from `port_progress.md`.
 - [`README VITAGL.md`](README%20VITAGL.md): Reference for vitaGL's own build flags (including
   the speedhacks this port enables/avoids and why).
 
