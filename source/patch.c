@@ -24,6 +24,45 @@
 
 extern so_module so_mod;
 
+/*
+ * Bug #041 (pop-in de escenario en carrera: casas/arboles/carteles aparecen recien
+ * cuando el auto ya esta al lado): DeviceConfig::GetDeviceFactorLOD() (0x4316f8 real,
+ * disasm confirmado con objdump, no el .md desincronizado) hace
+ * `return aTablaSinNombre[s_DeviceType]`, con `s_DeviceType` fijado SIEMPRE a 3 tanto en
+ * SetupGameForDevice() (0x431470) como en InitDeviceCustomize() (0x43171c) -- no hay
+ * NINGUN otro sitio del .so que escriba s_DeviceType (grep sobre el pseudo-C completo).
+ * Volcando la tabla real del binario (.rodata en 0xac8bb0, direccion recalculada a mano
+ * desde la instruccion `add r3, pc, r3` de GetDeviceFactorLOD, NO el simbolo "UNK_" que
+ * infirio Ghidra) da: indices 0,1,2,4,5,6,7,8 = -1.0f, y SOLO el indice 3 (el unico que
+ * este .so puede devolver, ya que s_DeviceType nunca es otra cosa) = 0.4f.
+ *
+ * El unico llamador de GetDeviceFactorLOD() es TrackScene::LoadLevelObjects() (un solo
+ * call site en todo el .so): si el valor es -1.0 (el centinela, el camino que toman 8 de
+ * los 10 indices de la tabla -- o sea la enorme mayoria de dispositivos Android reales),
+ * usa el factor de LOD propio de la pista (BaseScene::m_currentTrack.campo_0x90 * 0.01,
+ * dato de nivel, pensado por Gameloft por circuito). Si NO es -1.0 (nuestro caso, 0.4
+ * fijo), ese valor de "device type 3" pisa el default de la pista y alimenta
+ * DeviceConfig::s_GameplayFactorLOD, que CustomSceneManager::drawAll() usa una vez por
+ * pista para interpolar entre getNearValue()/getFarValue() de la camara y construir una
+ * proyeccion aparte (`buildProjectionMatrixPerspectiveFov`, con calling convention que el
+ * propio Ghidra marca como "Unknown" -- exactamente el tipo de funcion "monstruo" que
+ * CLAUDE.md pide no tocar a ciegas) -- todo apunta a que ese numero gobierna hasta donde
+ * el motor considera "cerca" para mostrar geometria de escenario a full LOD.
+ *
+ * En vez de adivinar la aritmetica de drawAll (dificil de verificar sin consola: no esta
+ * confirmado si un factor mas alto es MAS o MENOS agresivo), se neutraliza el override en
+ * el origen: forzar que GetDeviceFactorLOD() siempre devuelva -1.0f hace que el juego use
+ * el mismo camino -- y el mismo dato de pista -- que ya usa la gran mayoria de telefonos
+ * Android reales, en vez de una tabla de 10 entradas donde el .so solo puede pisar 2 (3 y
+ * 9) con un valor de "telefono generico" que no tiene relacion con el hardware de Vita.
+ * Cambio minimo y reversible: no toca drawAll ni ninguna otra funcion "monstruo".
+ * PENDIENTE: confirmar en consola real que el pop-in mejora (no se pudo probar en este
+ * build). Ver port_progress.md.
+ */
+static float device_factor_lod_use_track_default(void) {
+    return -1.0f;
+}
+
 __attribute__((naked, target("arm")))
 void hooked_gameswf_root_advance() {
     __asm__ volatile(
@@ -48,6 +87,32 @@ void hooked_RenderFX_Find_pt() {
         "1:\n"
         "ldr pc, 2f\n"
         "2: .word 0x98683b00\n"
+    );
+}
+
+// Bug #040 (log 072 + dump 1789952996): mismo patron que Bug #012
+// (RenderFX::Find), pero en RenderFX::UpdateCursor(Cursor&, int). Cuando el
+// SWF de un RenderFX nunca cargo (ej. 178info_menu.swf ausente -> "menufx.cpp:
+// Load: 354" + "smart_ptr.h: operator->: 132" en el log), su smart_ptr<root>
+// en this+0x3c queda en NULL. UpdateCursor lo usa SIN chequear: en 0x6820e8
+// llama a smart_ptr<root>::operator->() (offset 0x68bb1c) y en 0x6820ec hace
+// "ldr r0,[r0,#16]" incondicional sobre el resultado -- Data Abort si es NULL
+// (confirmado con disasm real del .so, mismo "ldr rX,[r0,#16]" que Bug #012).
+// UpdateCursor corre cada frame por cada RenderFX activo para hit-testing de
+// cursor/touch, lo que explica que el crash llegue justo despues de un toque
+// en el menu principal, sin nada mas logueado entre el segundo ASSERT y el
+// abort. El codigo original YA maneja con gracia el caso r0==0 a partir de
+// 0x6820f0 (compara, loguea otro ASSERT no fatal y sigue en 0x681c00) -- el
+// hook solo evita la lectura NULL+0x10 y reusa ese camino existente en vez de
+// inventar uno nuevo.
+__attribute__((naked, target("arm")))
+void hooked_RenderFX_UpdateCursor_pt() {
+    __asm__ volatile(
+        "ldr r0, [r0]\n"        // r0 = *(this+0x3c) = puntero crudo del smart_ptr<root>
+        "cmp r0, #0\n"
+        "ldrne r0, [r0, #16]\n" // solo desreferenciar si no es NULL (predicado ARM)
+        "ldr pc, 1f\n"
+        "1: .word 0x986820f0\n" // resume: text_base(0x98000000 fijo, LOAD_ADDRESS) + 0x6820f0
     );
 }
 
@@ -1477,9 +1542,26 @@ static void hook_trackcopy(void) {
     );
 }
 
+// Log 072 (watchdog): en carrera esta guarda NO es transitoria como se asumio
+// originalmente -- Find() devuelve NULL en el mismo sitio TODOS los frames desde
+// que arranca la carrera hasta el final de la sesion (cientos de invocaciones
+// seguidas en el log, una por frame). logger.c (Bug #028) ya colapsa el
+// sceIoWrite a la SD a 1 cada 300 repeticiones identicas, pero cada llamada
+// SIGUE pagando el costo previo a esa decision: lock de mutex + dos
+// sceClibSnprintf/vsnprintf + memcmp de hasta 128 bytes, en el hilo de render,
+// todos los frames de la carrera. Mismo idioma que cnulldriver_log_this() de
+// mas arriba (log 060): loguear las primeras N veces por sitio (ya alcanza
+// para diagnosticar) y despues un latido bien espaciado, en vez de pagar el
+// costo de logueo en cada frame para una condicion que ya se confirmo permanente.
+#define STATERENDER_LOG_FIRST 4
+#define STATERENDER_LOG_EVERY 4096
 void staterender_null(uint32_t site) {
-    l_error("[patch] StateRenderNull: Find devolvio NULL en sitio %u, store omitido (log 040)",
-            (unsigned)site);
+    static uint32_t n[3] = {0, 0, 0};
+    uint32_t *cnt = (site < 3) ? &n[site] : &n[0];
+    uint32_t i = (*cnt)++;
+    if (i < STATERENDER_LOG_FIRST || (i % STATERENDER_LOG_EVERY) == 0)
+        l_error("[patch] StateRenderNull: Find devolvio NULL en sitio %u, store omitido (log 040)%s",
+                (unsigned)site, (i >= STATERENDER_LOG_FIRST) ? " (latido, silenciado entremedio)" : "");
 }
 
 // Guardas de GS_Race::StateRender (log 040 + dump 1789184428): el `mov r3,#N`
@@ -1547,9 +1629,16 @@ static void hook_sr2(void) {
     );
 }
 
+// Mismo razonamiento que staterender_null() de arriba: en carrera esta guarda
+// tambien dispara TODOS los frames (no una vez, como se asumio en el Bug #019
+// original), asi que se le aplica el mismo colapso por sitio de llamada.
 void igm_null(uint32_t menu_main, uint32_t back_btn, void *movie) {
-    l_error("[patch] IGMUpdate: Find devolvio NULL (menu_main=0x%08X, back_btn=0x%08X), copy omitido (log 041)",
-            (unsigned)menu_main, (unsigned)back_btn);
+    static uint32_t n = 0;
+    uint32_t i = n++;
+    if (i < STATERENDER_LOG_FIRST || (i % STATERENDER_LOG_EVERY) == 0)
+        l_error("[patch] IGMUpdate: Find devolvio NULL (menu_main=0x%08X, back_btn=0x%08X), copy omitido (log 041)%s",
+                (unsigned)menu_main, (unsigned)back_btn,
+                (i >= STATERENDER_LOG_FIRST) ? " (latido, silenciado entremedio)" : "");
     /*
      * Log 065: menu_main/back_btn_main/custom_controls_btn no existen como clips
      * estaticos en 178igMenu.swf (grep: solo en 178igMenu_test.swf + .dat packs) --
@@ -1747,6 +1836,7 @@ static void hook_trace(uint32_t off, uint32_t expect1, uint32_t expect2,
 void so_patch(void) {
     hook_addr((uintptr_t)so_symbol(&so_mod, "_ZN7gameswf4root7advanceEfb"), (uintptr_t)&hooked_gameswf_root_advance);
     hook_addr((uintptr_t)(so_mod.text_base + 0x683af8), (uintptr_t)&hooked_RenderFX_Find_pt);
+    hook_addr((uintptr_t)(so_mod.text_base + 0x6820e8), (uintptr_t)&hooked_RenderFX_UpdateCursor_pt);
 
     uintptr_t sym_tb = (uintptr_t)so_symbol(&so_mod, "_ZN8RenderFX23SetTextBufferingEnabledEb");
     if (sym_tb) hook_addr(sym_tb, (uintptr_t)&hooked_RenderFX_SetTextBufferingEnabled);
@@ -1755,9 +1845,17 @@ void so_patch(void) {
     uintptr_t sym_rc = (uintptr_t)so_symbol(&so_mod, "_ZN8RenderFX23SetRenderCachingEnabledEb");
     if (sym_rc) hook_addr(sym_rc, (uintptr_t)&hooked_RenderFX_SetRenderCachingEnabled);
 
-#ifdef RENDER_CULLING_BYPASS
+#ifdef RENDER_SCENE_CULLING_BYPASS
     // Bypass culling de ISceneNode y bounding box para evitar que el vehiculo / entidades
     // parpadeen o se borren durante la carrera (optimizacion/fix de Dungeon Hunter 2).
+    // Informe de performance 2026-09-20 (logs 067-072, ver port_progress.md): NINGUN
+    // vehiculo/trafico/poder pasa por CSceneManager::isCulled() (ver el bloque de abajo,
+    // que es el fix real para esos objetos) -- este bypass solo desactiva el culling de
+    // frustum de la geometria ESTATICA de escena (edificios, decorado), forzando a
+    // dibujar toda la geometria cargada este o no en camara. Es la causa mas probable
+    // del techo de FPS sostenido en carrera. Separado de RENDER_CULLING_BYPASS y
+    // apagado por defecto (ver CMakeLists.txt) -- sin confirmar en consola real que
+    // apagarlo sube el FPS sin reintroducir parpadeos.
     uintptr_t sym_is_culled_node = (uintptr_t)so_symbol(&so_mod, "_ZNK6glitch5scene13CSceneManager8isCulledEPKNS0_10ISceneNodeE");
     if (sym_is_culled_node) {
         hook_addr(sym_is_culled_node, (uintptr_t)&ret0);
@@ -1768,7 +1866,11 @@ void so_patch(void) {
         hook_addr(sym_is_culled_box, (uintptr_t)&ret0);
         l_info("[patch] Hooked CSceneManager::isCulled(aabbox3d, E_CULLING_TYPE) -> ret0");
     }
+#else
+    l_info("[patch] RENDER_SCENE_CULLING_BYPASS off -- CSceneManager::isCulled() con culling real (informe de performance 2026-09-20)");
+#endif
 
+#ifdef RENDER_CULLING_BYPASS
     // Causa raiz real de vehiculos (jugador, rivales, trafico) y poderes (nitro, cash, emp, etc.)
     // que desaparecian o eran intermitentes durante la carrera:
     // NINGUNO de ellos consulta CSceneManager::isCulled(). Todos llaman a Camera::IsInViewFrustrum(&bbox):
@@ -1793,8 +1895,19 @@ void so_patch(void) {
         l_info("[patch] Hooked CustomSceneManager::isCulledCustom -> ret0");
     }
 #else
-    l_info("[patch] RENDER_CULLING_BYPASS off -- isCulled() sin tocar (build de diagnostico)");
+    l_info("[patch] RENDER_CULLING_BYPASS off -- IsInViewFrustrum/isCulledCustom sin tocar (build de diagnostico)");
 #endif
+
+    // Bug #041: DeviceConfig::GetDeviceFactorLOD() esta fijada de fabrica a devolver
+    // 0.4f (device type 3, el unico que el .so puede producir) en vez del centinela
+    // -1.0f que usa la mayoria de dispositivos Android reales para heredar el factor
+    // de LOD propio de cada pista. Ver el comentario largo junto a
+    // device_factor_lod_use_track_default() arriba.
+    uintptr_t sym_get_device_factor_lod = (uintptr_t)so_symbol(&so_mod, "_ZN12DeviceConfig18GetDeviceFactorLODEv");
+    if (sym_get_device_factor_lod) {
+        hook_addr(sym_get_device_factor_lod, (uintptr_t)&device_factor_lod_use_track_default);
+        l_info("[patch] Hooked DeviceConfig::GetDeviceFactorLOD -> -1.0f (usa el LOD de la pista, no el de 'device type 3')");
+    }
 
     // Diagnostico CNullDriver (ver comentario arriba de los hooked_CNullDriver_*):
     // draw2DLine/getMaxUserClipPlanes se reemplazan 1:1 (son no-ops triviales).

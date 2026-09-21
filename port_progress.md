@@ -4309,3 +4309,209 @@ bbox `x=[843..929] y=[366..430]`, centroide `(886,398)`. `POS_NITRO_X/Y`
 pasa de `(800,350)` a `(885,400)`, separándolo claramente de `POS_STEER_R`.
 Build pendiente de verificar en consola real -- el log debería mostrar el tap
 de CROSS activando el nitro sin virar el auto.
+
+## Sesión 2026-09-20 (madrugada): 3 bugs en paralelo (crash al salir del menú, performance en carrera, pop-in de escenario)
+
+Tres diagnósticos independientes corridos en paralelo (un agente por bug, cada uno en su
+propio worktree aislado) a partir de: `logs/asphalt6_072.log` +
+`logs/asphalt6-psp2core-1789952996-0x002e1d3189-eboot.bin.psp2dmp` (crash reportado por el
+usuario al salir del juego desde el botón del menú principal), los logs `067`-`072`
+(reporte de mal rendimiento en partes de la carrera), y una descripción del usuario de
+pop-in de casas/árboles/señales que aparecen recién cuando el auto ya está al lado o muy
+cerca. Los tres worktrees se reconciliaron a mano sobre `master` (numeración de bugs y
+`source/patch.c`, que los tres tocan en funciones distintas sin solaparse).
+
+### Bug #040 — Data abort en `RenderFX::UpdateCursor` al tocar un botón del menú principal (log 072 + dump 1789952996)
+
+**Reporte del usuario:** "un nuevo crash al intentar salir del juego con el
+botón en el menú principal". `psvita-toolkit analyze` sobre el dump dio un
+`PC`/`LR` que no resuelven a código real del `.so` (caen dentro de
+`.dynsym`/`.dynstr`, ni siquiera texto ejecutable) y un backtrace por
+stack-scan lleno de basura (`ps_hints_apply`, `_tr_init`,
+`CColladaFactory::getShaderCompilerOptions`) -- el mismo patrón de
+"backtrace no confiable" ya documentado en el Bug #037, así que la causa
+real se reconstruyó desde el LOG (que sí es 100% secuencial y confiable) y
+se verificó cruzando el pseudo-C de Ghidra contra el disasm real del `.so`
+(`arm-vita-eabi-objdump -d`, el binario es ARM, no Thumb, pese a que
+`objdump -T` no marca el bit 0 en las direcciones).
+
+**Secuencia exacta del log (`logs/asphalt6_072.log`, últimas 5 líneas):**
+```
+[touch] PRESS slot=0 x=41 y=59
+[touch] RELEASE slot=0 x=40 y=57
+[WARNING] fopen(ux0:data/asphalt6/data/178info_menu.swf, rb): 0x0
+[ERROR] [ALOG][ASSERT] menufx.cpp: Load: 354
+[ERROR] [ALOG][ASSERT] smart_ptr.h: operator->: 132
+```
+`178info_menu.swf` (la pantalla "Info" del menú principal -- confirmado en
+el pseudo-C: al terminar de cargar ese SWF el motor cablea
+`menu_Info.btn_Help/btn_About/btn_Controls/btn_Reset/btn_info_back/
+btn_Twitter` y, si corresponde, empuja `menu_Confirm`) **no existe** en
+`ux0_data/asphalt6/data/` ni en ningún `.dat`/extracción del port (de los
+37 SWF reales que sí están empaquetados en los `fileNNNNNN.dat`, ninguno es
+`info_menu`). El toque del usuario cerca de la esquina superior izquierda
+(`x=40,y=58`) coincide con la zona típica del botón que el usuario asoció a
+"salir"/info en este menú.
+
+**Causa raíz confirmada con disasm real (no con el `PC` del dump, que
+resultó inútil):** `menufx::Load()` (`menufx.cpp:354`) y
+`gameswf::smart_ptr<gameswf::root>::operator->()` (`smart_ptr.h:132`, real
+en `0x68bb1c`) son AMBOS asserts blandos en este binario -- confirmado
+desasamblando `0x68bb1c` instrucción por instrucción: loguean vía
+`__android_log_print` (prioridad `ANDROID_LOG_ERROR`, con el literal
+`mov lr,#132` incrustado) y hacen `b` de vuelta al epílogo normal,
+**nunca llaman a `abort()`**. Por eso el log muestra las dos líneas y
+sigue -- el crash real está un nivel más arriba, en el PRIMER consumidor
+que usa el puntero que `operator->()` devuelve sin chequear si es `NULL`.
+
+De los 7 call-sites reales a `0x68bb1c` en todo el `.so` (confirmado con
+`objdump -d` completo, no solo grep del pseudo-C), la mayoría ya son
+seguros: `RenderFX::Find` (2-arg, `0x683acc`) ya estaba parcheado desde el
+**Bug #012** (2026-09-01, el mismo bug de fondo: "root" nulo por SWF sin
+cargar); `PreloadGlyphs` chequea `this+0x3c != 0` antes de llamar;
+`SetMember`/`SetLocalVariable` descartan el valor de retorno. El que
+FALTABA: **`RenderFX::UpdateCursor(Cursor&, int)`**, que corre cada frame
+por cada `RenderFX` activo para hit-testing de cursor/touch -- exactamente
+lo que dispara un toque en el menú. En `0x6820e8`:
+```
+6820e4: add  r0, r4, #0x3c        ; r0 = &this->rootSmartPtr
+6820e8: bl   0x68bb1c             ; operator->() -- log blando, devuelve 0 si root es NULL
+6820ec: ldr  r0, [r0, #16]        ; CRASH: Data Abort leyendo 0x10 si r0 (root) es NULL
+6820f0: cmp  r0, #0               ; el código YA maneja r0==0 con gracia a partir de aquí
+```
+Coincide con los registros del dump (`R0=0x00000000`, `R2=0x00000000`) y
+con que no se loguea nada más entre el segundo `ASSERT` y el corte.
+
+**Fix (`source/patch.c`):** mismo patrón "Naked Hook" del Bug #012, nueva
+función `hooked_RenderFX_UpdateCursor_pt()`, hookeada con `hook_addr` en
+`so_mod.text_base + 0x6820e8` (reemplaza las 2 instrucciones `bl` + `ldr`):
+lee el puntero crudo del `smart_ptr` directo (`ldr r0,[r0]`, evitando la
+llamada real y su log), y solo si no es `NULL` hace el `ldr r0,[r0,#16]`
+(con `ldrne`, predicado ARM) antes de saltar de vuelta a `0x6820f0`. No
+hizo falta inventar un camino de retorno nuevo: el código original YA
+maneja `r0==0` con gracia desde ahí (loguea otro `ASSERT` no fatal y sigue
+en `0x681c00`).
+
+**Nota:** se encontró un patrón idéntico sin parchear en
+`RenderFX::TraceHierarchy` (`0x687168`/`0x68716c`), pero esa función tiene
+un SEGUNDO NULL-deref encadenado inmediatamente después (`0x686eec`) que
+requeriría un fix de dos partes; el nombre y el `log_msg("Hierarchy:\n")`
+sugieren que es una utilidad de depuración sin camino de invocación normal
+en el menú, así que se deja sin tocar por ahora -- si reaparece un nuevo
+`ASSERT smart_ptr.h: 132` seguido de crash, es el próximo sospechoso.
+
+Build OK (`psvita-toolkit build --preset debug`). Sin probar en consola
+todavía -- el próximo log debería mostrar el segundo `ASSERT` de
+`UpdateCursor` (el que ya existía, no fatal) y seguir presentando frames
+en vez de cortarse, incluso al tocar el botón de Info/Salir del menú
+principal con `178info_menu.swf` ausente.
+
+### Informe de performance — cuellos de botella en carrera (logs 067-072)
+
+**Metodología:** el watchdog (`source/utils/watchdog.c`, tag `[wd]`) loguea cada 5s
+`frames presentados` -- se reconstruyó un FPS aproximado por ventana de 5s
+(`Δframes / 5`) y se cruzó con qué estaba pasando en esa ventana (`[gl]` compile/link,
+`[gl-blend]` draw calls, `[pad]` input, `[ALOG][HDVD]` carga de texturas).
+
+**1) Cuelgue de carga de pista (Bahamas), NO es el cuello de botella que reporta el
+usuario:** entre los frames watchdog ~1069-1223 del log 072 el FPS reconstruido cae de
+~56 fps a **0.4-1.2 fps** durante varios latidos seguidos mientras el log muestra
+cientos de `[ALOG][HDVD] Loaded texture...` intercalados con `[gl] compile/link
+shader=N` (12-17 ms c/u) -- carga de assets de pista + compilación GLSL en caliente (el
+motor "Glitch" no tiene shaders precompilados). Es una pantalla de carga bloqueante,
+coherente con el diseño del motor, no un stutter EN carrera. No se tocó nada acá.
+
+**2) Causa raíz más probable del techo de FPS EN carrera:** una vez terminada la carga,
+el FPS reconstruido en carrera real se estabiliza en **~20-33 fps** con caídas
+periódicas a **6-16 fps** (log 072, líneas 3009-3114), sin ningún `compile`/`link`/carga
+de textura cerca -- solo `[gl-blend] glDrawElements` y input. `RENDER_CULLING_BYPASS`
+(`CMakeLists.txt`, ON por defecto) forzaba a **siempre visible / nunca culled** cuatro
+funciones a la vez: `CSceneManager::isCulled(ISceneNode*)`, `isCulled(aabbox3d)`,
+`Camera::IsInViewFrustrum` y `CustomSceneManager::isCulledCustom` (commit `ba6efc0`). El
+propio comentario de ese commit documenta que autos/tráfico/poderes **NO** consultan
+`CSceneManager::isCulled()` -- consultan únicamente `Camera::IsInViewFrustrum`
+(`RaceCar::UpdateMeshes`, `TrafficCar::IsViewable`, `BaseSceneObject::SceneObjUpdateCull`).
+O sea: bypasear `isCulled(ISceneNode*)`/`isCulled(aabbox3d)` no protegía a ningún objeto
+de los que motivaron el fix de `ba6efc0` -- solo desactivaba el culling de frustum de la
+geometría de escena genérica (edificios, decorado de pista), forzando a dibujar TODA la
+geometría estática cargada esté o no en cámara, en cada frame de la carrera.
+
+**Fix aplicado (`CMakeLists.txt` + `source/patch.c`):** se separó el flag en dos --
+`RENDER_CULLING_BYPASS` (ON por defecto, sin cambios de comportamiento) ahora SOLO
+bypasea `Camera::IsInViewFrustrum`/`isCulledCustom` (el fix real y confirmado de
+vehículos/poderes); el nuevo `RENDER_SCENE_CULLING_BYPASS` (**OFF por defecto**) bypasea
+`CSceneManager::isCulled(ISceneNode*)`/`isCulled(aabbox3d)`, dejando el culling real del
+motor activo para la geometría estática de escena por defecto. Riesgo bajo: revierte una
+optimización especulativa heredada de Dungeon Hunter 2 (Bug #031) que nunca se confirmó
+necesaria para vehículos/poderes.
+
+**También aplicado (`source/patch.c`):** `[patch] StateRenderNull`/`IGMUpdate` disparan
+en CASI TODOS los frames de carrera (387 veces en el log 072) -- no transitorio como
+asumía el diseño original de esas guardas (Bugs #026/#027). `logger.c` (Bug #028) ya
+colapsa el `sceIoWrite` a 1/300, pero cada llamada seguía pagando mutex+2 snprintf+memcmp
+en el hilo de render antes de esa decisión, todos los frames. Se le aplicó a
+`staterender_null()`/`igm_null()` el mismo idioma que ya usa `cnulldriver_log_this()` en
+el mismo archivo: loguear las primeras 4 veces por sitio y después un latido cada 4096.
+No cambia lógica de juego, solo costo de diagnóstico -- ganancia menor, no explica por sí
+sola las caídas a 6-16 fps.
+
+Build OK (`psvita-toolkit build --preset debug`, confirmado con
+`RENDER_SCENE_CULLING_BYPASS=OFF` en la config de CMake). **Pendiente de verificar en
+consola real:** un log de carrera con `RENDER_SCENE_CULLING_BYPASS` en OFF para comparar
+el FPS reconstruido contra este informe y confirmar que no reintroduce parpadeos de
+vehículos/poderes (no debería, ya que ese fix quedó intacto en `RENDER_CULLING_BYPASS`).
+
+### Bug #041 — Pop-in de escenario en carrera (casas/árboles/carteles aparecen recién al lado del auto): `DeviceConfig::GetDeviceFactorLOD()` fuerza un factor de LOD de "teléfono genérico" en vez del propio de cada pista
+
+**Motivo:** el usuario reportó que, durante la carrera, elementos del escenario (casas,
+árboles, carteles de tránsito) aparecen ("pop-in") recién cuando el vehículo ya pasó al
+lado o está muy cerca. Se descartó explícitamente arreglar esto como síntoma de
+performance puro sin evidencia propia (ver informe de arriba, corrido en paralelo).
+
+**Investigación (cruzando el `.so` real con el pseudo-C):**
+
+1. **`CustomBatchGridSceneNode`** (geometría estática de nivel -- casas, árboles,
+   carteles, cargados una sola vez en `TrackScene::LoadLevelObjects`) NO hace streaming
+   asíncrono ni tiene radio de distancia propio: selecciona celdas por intersección
+   contra un view frustum -- es culling en tiempo de render sobre datos ya residentes,
+   no un cargador de assets por distancia. Se descarta como causa directa.
+2. **`CustomSceneManager::registerSceneNodes()`** usa `isCulledCustom(node, 1)` como gate
+   por subárbol; el commit `ba6efc0` ya fuerza esa función a devolver siempre 0 de forma
+   GLOBAL, así que hace más improbable que sea la causa del pop-in (si algo, hace que se
+   consideren MÁS nodos por frame, no menos).
+3. **Hallazgo real, confirmado con disasm directo (`objdump -d` sobre el `.so`
+   extraído):** `DeviceConfig::GetDeviceFactorLOD()` (`_ZN12DeviceConfig
+   18GetDeviceFactorLODEv`, en `0x4316f8`) hace `return tabla[s_DeviceType]`, con
+   `s_DeviceType` fijado **siempre a `3`** tanto en `DeviceConfig::SetupGameForDevice()`
+   (`0x431470`) como en `DeviceConfig::InitDeviceCustomize()` (`0x43171c`) -- no hay
+   ningún otro sitio en todo el `.so` que escriba `s_DeviceType`. Volcando a mano la
+   tabla real (`.rodata` en `0xac8bb0`, recalculada desde la instrucción
+   `add r3, pc, r3` de la función -- no el símbolo `UNK_00ad8bb0` que había inferido
+   Ghidra) da: índices `0,1,2,4,5,6,7,8` = `-1.0f`, y **solo el índice `3`** (el único
+   que este `.so` puede llegar a usar) = `0.4f`.
+
+   El único llamador de `GetDeviceFactorLOD()` en todo el `.so` es
+   `TrackScene::LoadLevelObjects()`: si el valor es `-1.0` (el centinela, el camino de 8
+   de los 10 índices de la tabla -- la inmensa mayoría de dispositivos Android reales),
+   usa el factor de LOD propio de la pista (`BaseScene::m_currentTrack.campo_0x90 *
+   0.01`, dato de nivel por circuito). Si no es `-1.0` (nuestro caso, `0.4` fijo por
+   "device type 3"), ese valor pisa el default de la pista y queda en
+   `DeviceConfig::s_GameplayFactorLOD`, que `CustomSceneManager::drawAll()` usa una vez
+   por pista para interpolar entre `getNearValue()`/`getFarValue()` de la cámara y
+   construir una proyección aparte (`buildProjectionMatrixPerspectiveFov`, calling
+   convention marcada "Unknown" por Ghidra -- función "monstruo", no tocada a ciegas).
+
+**Fix (`source/patch.c`):** en vez de adivinar la aritmética de `drawAll`, se neutraliza
+el override en el origen: nueva función `device_factor_lod_use_track_default()` (stub
+simple, mismo patrón que `ret0`/`ret1`), hookeada con `hook_addr()` sobre
+`_ZN12DeviceConfig18GetDeviceFactorLODEv` para que devuelva siempre `-1.0f`. El juego
+pasa a usar el mismo camino -- y el mismo dato de pista -- que la inmensa mayoría de
+teléfonos Android reales. Cambio mínimo y reversible, no toca `drawAll` ni los hooks de
+culling existentes (independiente de `ba6efc0`/`RENDER_CULLING_BYPASS`/
+`RENDER_SCENE_CULLING_BYPASS` de arriba: uno es LOD por distancia de carga de pista, el
+otro es culling de frustum en render).
+
+Build OK (`psvita-toolkit build --preset debug`). **Pendiente de verificar en consola
+real:** confirmar que el pop-in mejora visualmente; si no, loguear
+`DeviceConfig::s_GameplayFactorLOD` justo después de `LoadLevelObjects` para confirmar
+en vivo el valor real antes de tocar `drawAll` directamente.

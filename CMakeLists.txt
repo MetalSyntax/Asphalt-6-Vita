@@ -85,9 +85,26 @@ endif()
 # necesarias para llegar a in-game sin crashear (Bugs #015-#033) o son
 # puramente diagnostico (no cambian comportamiento), asi que apagar ESTE es lo
 # que da la build "con hacks minimos" para depurar visibilidad.
-option(RENDER_CULLING_BYPASS "Forzar isCulled() a 'nunca culled' (hack visual, no un guard anti-crash)" ON)
+option(RENDER_CULLING_BYPASS "Forzar Camera::IsInViewFrustrum/CustomSceneManager::isCulledCustom a 'siempre visible' (fix real y confirmado: sin esto, vehiculos/trafico/poderes desaparecen o parpadean en carrera)" ON)
 if (RENDER_CULLING_BYPASS)
   add_definitions(-DRENDER_CULLING_BYPASS)
+endif()
+
+# Informe de performance 2026-09-20 (logs 067-072, ver port_progress.md): el propio
+# comentario de mas arriba confirma que vehiculos/trafico/poderes SOLO consultan
+# Camera::IsInViewFrustrum/isCulledCustom (arriba), nunca CSceneManager::isCulled().
+# Bypasear isCulled(ISceneNode*)/isCulled(aabbox3d) -- heredado de Dungeon Hunter 2 sin
+# evidencia propia, ver Bug #031 -- no protege a ningun objeto de ese bug: solo apaga el
+# culling de frustum de TODA la geometria de escena generica (edificios, decorado de
+# pista), forzando a dibujar toda la geometria cargada este o no en camara, cada frame.
+# Es la causa mas probable del techo de FPS sostenido (~20-33 fps con caidas a 6-16) que
+# se ve en carrera en los logs reales. Separado de RENDER_CULLING_BYPASS y apagado por
+# defecto -- sin confirmar en consola real todavia que revertirlo sube el FPS sin volver
+# a introducir parpadeos (deberia ser inofensivo para vehiculos/poderes ya que ellos no
+# pasan por este camino, pero falta el log de carrera que lo confirme).
+option(RENDER_SCENE_CULLING_BYPASS "Forzar CSceneManager::isCulled() (geometria estatica de escena) a 'nunca culled' (especulativo, heredado de Dungeon Hunter 2, sin evidencia propia -- ver Bug #031)" OFF)
+if (RENDER_SCENE_CULLING_BYPASS)
+  add_definitions(-DRENDER_SCENE_CULLING_BYPASS)
 endif()
 
 # Unique debug definition for loader's logging to not interfere with anything
