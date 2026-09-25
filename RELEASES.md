@@ -7,6 +7,47 @@ known issues; this file is the dated, per-release history.
 
 ---
 
+## v0.2.0-beta — 2026-09-24
+
+**Status: Public beta.** The game is playable from start to finish: menus, races, pause menu,
+music and sound effects all work. Races run at about 20–30 fps.
+
+### Data changes you need to apply
+
+The VPK can't ship game data. If your `ux0:data/asphalt6/` was prepared with an older version,
+update these files (restore the first 4 bytes of each `.dat` by subtracting 1, 2, 3, 4):
+
+- **`data/178igMenu.swf` from `file000632.dat`** (pause menu). The old mapping used
+  `file000353.dat`, which is a different screen, so the pause menu was broken.
+- **`data/178info_menu.swf` from `file000338.dat`** (Info/Exit screen). It was missing, so
+  opening it from the main menu crashed the game.
+- Make sure `data/file00a.bin` (143,543,426 bytes) and `data/soundinfo.bin` copied fully —
+  a truncated copy means no music or sound effects.
+
+The other `.swf` names were also matched by content. If a screen looks wrong, check its
+mapping first.
+
+### Fixed
+
+- Menu music and all sound effects now play.
+- Crash when a trophy unlocked (`std::ifstream` reads failed in the loader).
+- Crash when opening the tuning menu (invalid car index, falls back to the default car).
+- Crash when using the Exit/Info button in the main menu (missing `178info_menu.swf`).
+- Pause menu works: Resume, Restart, Options and Main Menu; START opens and closes it; the
+  "Resume" label no longer shows a box.
+- Intro video runs faster, and a loading screen shows after it instead of a frozen frame.
+- Graphical errors while textures load.
+- Close-range geometry pop-in (the LOD value read from the track data was broken).
+- Graphical glitch on vehicle windows.
+
+### Known issues
+
+- Races run at about 20–30 fps (median ~27 fps), with occasional drops.
+- Some far-away scenery still pops in (original LOD 0.4 kept for performance).
+- Elements may briefly disappear during races during engine stalls (not seen recently).
+
+---
+
 ## v0.1.0-alpha — 2026-09-20
 
 **Status: Alpha, testing only. Relatively playable, but the overall experience is far from
@@ -49,8 +90,6 @@ Use this release to help test/debug the port, not to actually play the game.
 - **Elements intermittently disappear during races, including the player's car.** Traced to
   real, CPU-bound multi-second stalls inside the engine's mesh-batching code; root cause
   narrowed down, dedicated fix still pending.
-- **Graphical glitch on vehicle windows**, caused by a car-reflection texture missing from
-  the original APK data (a missing-asset issue, not a code bug).
 
 ### Fixed in this release
 
@@ -71,6 +110,7 @@ Use this release to help test/debug the port, not to actually play the game.
 ## Versioning
 
 This project doesn't follow strict SemVer yet — version numbers track port maturity
-(`0.x.y-alpha` while core systems are still being stabilized). A `1.0.0` tag will only be
+(`0.x.y-alpha` while core systems were being stabilized, `0.x.y-beta` now that the game is
+playable end to end). A `1.0.0` tag will only be
 cut once the known-issues list above is empty and a full race, menu-to-menu, has been
 verified glitch-free on real hardware.

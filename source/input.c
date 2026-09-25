@@ -86,6 +86,11 @@
 #define KEY_STEER_L 103
 #define KEY_STEER_R 108
 #define KEY_ACT_A   106
+// START = tecla MENU de Android (log 080, pedido del usuario): GS_Race::StateUpdate lee
+// isMenuKeyPressed() (bMenuKey, que notifyKeyPressed pone con keycode 82) como
+// interruptor: en carrera abre la pausa (PauseToIGM) y con la pausa abierta, si
+// menu_main esta visible, llama a ResumeFromIGM.
+#define KEY_MENU    82
 
 /*
  * Posiciones de los taps sinteticos en el espacio 960x544. Son el equivalente
@@ -351,6 +356,7 @@ static bool dispatch_key(void *env, void *clazz, bool is_down, bool was_down, in
 
 static bool s_key_left_down, s_key_right_down;
 static bool s_key_brakel_down;
+static bool s_key_menu_down;
 
 static void poll_pad(void *env, void *clazz) {
     SceCtrlData pad;
@@ -365,7 +371,8 @@ static void poll_pad(void *env, void *clazz) {
      *   de direccion de CarControl en todos los modos de control).
      * - SQUARE = freno de la esquina inferior izquierda + key (bit 1).
      * - CROSS (X) = nitro flotante (solo tactil, one-shot con prioridad).
-     * - TRIANGLE/CIRCLE/START/SELECT = nada (muertos a proposito).
+     * - START = tecla MENU (82): abre/cierra el menu de pausa.
+     * - TRIANGLE/CIRCLE/SELECT = nada (muertos a proposito).
      */
     bool left_down = (pad.buttons & (SCE_CTRL_LEFT | SCE_CTRL_LTRIGGER)) != 0
         || pad.lx < STICK_LOW;
@@ -373,6 +380,7 @@ static void poll_pad(void *env, void *clazz) {
         || pad.lx > STICK_HIGH;
     bool brakel_down = (pad.buttons & SCE_CTRL_SQUARE) != 0;
     bool nitro_down = (pad.buttons & SCE_CTRL_CROSS) != 0;
+    bool menu_down = (pad.buttons & SCE_CTRL_START) != 0;
 
     // Primero el flanco de tecla, despues el tap: al soltar se libera el tap
     // antes de la tecla, en orden espejo.
@@ -386,6 +394,8 @@ static void poll_pad(void *env, void *clazz) {
     fake_touch_set(env, clazz, FAKE_IDX_BRAKE_L, brakel_down);
 
     fake_touch_set(env, clazz, FAKE_IDX_NITRO, nitro_down);
+
+    s_key_menu_down = dispatch_key(env, clazz, menu_down, s_key_menu_down, KEY_MENU);
 }
 
 void input_poll(void *env, void *clazz) {

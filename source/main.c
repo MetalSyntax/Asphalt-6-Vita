@@ -3,6 +3,7 @@
 #include "utils/glutil.h"
 #include "utils/logger.h"
 #include "utils/watchdog.h"
+#include "utils/perf.h"
 #include "input.h"
 #include "video.h"
 
@@ -60,6 +61,9 @@ int main() {
     // imprimen como "libasphalt6.so+0xNNNN" -- el offset que se busca directo en el
     // pseudo-C de Ghidra (decompiled/) para sacar el nombre de la funcion del motor.
     bc_set_base(so_mod.text_base, (uint32_t)so_mod.text_size);
+    perf_init();
+    g_perf_lod_factor = (const volatile float *)so_symbol(&so_mod, "_ZN12DeviceConfig19s_GameplayFactorLODE");
+    g_perf_cur_track = (const volatile int *)so_symbol(&so_mod, "_ZN9BaseScene14m_currentTrackE");
     watchdog_start();
     bc_set_main_tid(sceKernelGetThreadId());
     watchdog_mark("jni_onload", 0);
@@ -103,6 +107,7 @@ int main() {
         l_info("video: nativeLoadMovie @ %p, llamando con \"intro.mp4\"...", nativeLoadMovie);
         nativeLoadMovie("intro.mp4");
         l_info("video: nativeLoadMovie retornó");
+        video_show_loading_screen();
     } else {
         l_error("video: so_symbol(nativeLoadMovie) no encontró el símbolo");
     }
@@ -231,7 +236,9 @@ int main() {
             // el hilo testigo tiene que poder distinguirlos.
             watchdog_mark("nativeRender ENTRA", (int)frame);
             bc_enter("nativeRender", 0);
+            uint32_t _pt = perf_now();
             GameRenderer_nativeRender(&jni, NULL);
+            perf_add(PERF_RENDER, _pt);
             bc_exit("nativeRender");
             watchdog_mark("nativeRender sale", (int)frame);
         }

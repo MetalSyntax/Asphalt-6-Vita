@@ -485,11 +485,11 @@ so_default_dynlib default_dynlib[] = {
         { "ftello", (uintptr_t)&ftello_soloader },
         { "ftruncate", (uintptr_t)&ftruncate },
         { "getcwd", (uintptr_t)&getcwd },
-        { "lseek", (uintptr_t)&lseek },
+        { "lseek", (uintptr_t)&lseek_soloader },
         { "lstat", (uintptr_t)&lstat },
         { "mkdir", (uintptr_t)&mkdir },
         { "pipe", (uintptr_t)&pipe },
-        { "read", (uintptr_t)&read },
+        { "read", (uintptr_t)&read_soloader },
         { "realpath", (uintptr_t)&realpath },
         { "remove", (uintptr_t)&remove_soloader },
         { "rename", (uintptr_t)&rename },
@@ -497,7 +497,7 @@ so_default_dynlib default_dynlib[] = {
         { "rmdir", (uintptr_t)&rmdir },
         { "truncate", (uintptr_t)&truncate },
         { "unlink", (uintptr_t)&unlink_soloader },
-        { "write", (uintptr_t)&write },
+        { "write", (uintptr_t)&write_soloader },
 
 
         // *printf, *scanf

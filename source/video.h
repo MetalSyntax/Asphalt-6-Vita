@@ -23,6 +23,9 @@ void video_shutdown(void);
 // call.
 void video_play(const char *name);
 
+// Presenta una imagen estática de "cargando" (app0:loading.rgb565) antes del init del motor.
+void video_show_loading_screen(void);
+
 #ifdef __cplusplus
 }
 #endif

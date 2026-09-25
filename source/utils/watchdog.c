@@ -10,6 +10,7 @@
 #include "utils/breadcrumb.h"
 #include "utils/glutil.h"
 #include "utils/logger.h"
+#include "utils/perf.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -181,6 +182,27 @@ static int watchdog_thread(SceSize args, void *argp) {
                 atomic_load_explicit(&s_tag, memory_order_relaxed),
                 atomic_load_explicit(&s_value, memory_order_relaxed),
                 since);
+
+        // Bug #045: desglose del tiempo de frame (solo si hubo frames: en un cuelgue ya
+        // esta el volcado de hilos). cpu_main = CPU real del hilo principal en el latido:
+        // ~5000 ms => el motor esta limitado por CPU; mucho menos => esperando GPU/display.
+        {
+            static uint64_t last_main_clocks = 0;
+            uint32_t main_cpu = 0;
+            int uid = g_perf_main_tid;
+            if (uid > 0) {
+                SceKernelThreadInfo info;
+                memset(&info, 0, sizeof(info));
+                info.size = sizeof(info);
+                if (sceKernelGetThreadInfo(uid, &info) >= 0) {
+                    uint64_t c = (uint64_t)info.runClocks;
+                    main_cpu = last_main_clocks ? (uint32_t)(c - last_main_clocks) : 0;
+                    last_main_clocks = c;
+                }
+            }
+            if (swaps != last_swaps)
+                perf_report(WATCHDOG_PERIOD_US / 1000, main_cpu);
+        }
 
         if (swaps == last_swaps) {
             stalled_beats++;

@@ -29,6 +29,49 @@
 #include "utils/logger.h"
 #include "utils/utils.h"
 
+static FILE *fake_fd_file(int fd);
+static void fake_fd_release(FILE *f);
+
+/*
+ * [sndprobe] Sonda de diagnostico del audio (RELEASES.md, issue #1: solo suena el motor).
+ * vox::SoundManager carga los sonidos desde file00a.bin: los `mem_od_*` (PCM, motor) van a
+ * RAM y SI suenan; la musica (m_title.wav) y los SFX son IMA ADPCM en modo stream
+ * (vox::StreamCFile -> FileLimited sobre un fopen propio de file00a.bin) y NO suenan.
+ * Esto registra que hace vox con cada handle de file00a.bin (seek/tell/read + resultado)
+ * para ver si el stream llega a leerse. Cap global de lineas para no inundar el log.
+ */
+#define SNDPROBE_MAX_HANDLES 16
+#define SNDPROBE_LINE_CAP 400
+static struct { FILE *f; int ops; int reads; long bytes; } s_sndprobe[SNDPROBE_MAX_HANDLES];
+static volatile int s_sndprobe_lines = 0;
+
+static int sndprobe_slot(FILE *f) {
+    for (int i = 0; i < SNDPROBE_MAX_HANDLES; i++)
+        if (s_sndprobe[i].f == f) return i;
+    return -1;
+}
+
+static void sndprobe_track(const char *filename, FILE *f) {
+    if (!f || !strstr(filename, "file00a.bin")) return;
+    for (int i = 0; i < SNDPROBE_MAX_HANDLES; i++) {
+        if (s_sndprobe[i].f == NULL) {
+            s_sndprobe[i].f = f; s_sndprobe[i].ops = 0;
+            s_sndprobe[i].reads = 0; s_sndprobe[i].bytes = 0;
+            return;
+        }
+    }
+}
+
+// Loguea las primeras 24 operaciones de cada handle y despues 1 de cada 512 lecturas.
+static int sndprobe_should_log(int slot) {
+    if (__atomic_load_n(&s_sndprobe_lines, __ATOMIC_RELAXED) >= SNDPROBE_LINE_CAP) return 0;
+    int ops = ++s_sndprobe[slot].ops;
+    if (ops > 24 && (s_sndprobe[slot].reads % 512) != 0) return 0;
+    __atomic_add_fetch(&s_sndprobe_lines, 1, __ATOMIC_RELAXED);
+    return 1;
+}
+
+
 // Includes the following inline utilities:
 // int oflags_musl_to_newlib(int flags);
 // dirent64_bionic * dirent_newlib_to_bionic(struct dirent* dirent_newlib);
@@ -317,6 +360,7 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
         if (fcache_is_cacheable_mode(mode)) {
             fcache_populate(filename, ret);
         }
+        sndprobe_track(filename, ret);
         l_debug("fopen(%s, %s): %p", filename, mode, ret);
     } else {
         // Record non-existent file in negative cache to eliminate repeated SD searches
@@ -380,6 +424,18 @@ int open_soloader(const char * path, int oflag, ...) {
 
 int fstat_soloader(int fd, stat64_bionic * buf) {
     struct stat st;
+    FILE *ff = fake_fd_file(fd);
+    if (ff) {
+        long cur = ftell_soloader(ff);
+        fseek_soloader(ff, 0, SEEK_END);
+        long size = ftell_soloader(ff);
+        fseek_soloader(ff, cur, SEEK_SET);
+        memset(&st, 0, sizeof(st));
+        st.st_mode = S_IFREG | 0666;
+        st.st_size = size;
+        stat_newlib_to_bionic(&st, buf);
+        return 0;
+    }
     int res = fstat(fd, &st);
 
     if (res == 0)
@@ -435,6 +491,7 @@ int stat_soloader(const char * path, stat64_bionic * buf) {
 }
 
 int fclose_soloader(FILE * f) {
+    fake_fd_release(f);
     if (fcache_is_handle(f)) {
         pthread_mutex_lock(&s_fcache_lock);
         ((FCacheHandle *)f)->entry_idx = -1;
@@ -448,9 +505,16 @@ int fclose_soloader(FILE * f) {
     int ret = fclose(f);
 #endif
 
+    int ps = sndprobe_slot(f);
+    if (ps >= 0) {
+        l_info("[sndprobe] fclose(%p): reads=%d bytes=%ld", f, s_sndprobe[ps].reads,
+               s_sndprobe[ps].bytes);
+        s_sndprobe[ps].f = NULL;
+    }
     l_debug("fclose(%p): %i", f, ret);
     return ret;
 }
+
 
 size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *f) {
     if (fcache_is_handle(f)) {
@@ -469,10 +533,20 @@ size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *f) {
         return items;
     }
 #ifdef USE_SCELIBC_IO
-    return sceLibcBridge_fread(ptr, size, nmemb, f);
+    size_t r = sceLibcBridge_fread(ptr, size, nmemb, f);
 #else
-    return fread(ptr, size, nmemb, f);
+    size_t r = fread(ptr, size, nmemb, f);
 #endif
+    int ps = sndprobe_slot(f);
+    if (ps >= 0) {
+        s_sndprobe[ps].reads++;
+        s_sndprobe[ps].bytes += (long)(r * size);
+        if (sndprobe_should_log(ps))
+            l_info("[sndprobe] fread(%p, %u x %u) = %u (reads=%d, bytes=%ld, lr=0x%08x)", f,
+                   (unsigned)size, (unsigned)nmemb, (unsigned)r, s_sndprobe[ps].reads,
+                   s_sndprobe[ps].bytes, (unsigned)__builtin_return_address(0));
+    }
+    return r;
 }
 
 size_t fwrite_soloader(const void *ptr, size_t size, size_t nmemb, FILE *f) {
@@ -500,10 +574,14 @@ int fseek_soloader(FILE *f, long offset, int whence) {
         return ok ? 0 : -1;
     }
 #ifdef USE_SCELIBC_IO
-    return sceLibcBridge_fseek(f, offset, whence);
+    int r = sceLibcBridge_fseek(f, offset, whence);
 #else
-    return fseek(f, offset, whence);
+    int r = fseek(f, offset, whence);
 #endif
+    int ps = sndprobe_slot(f);
+    if (ps >= 0 && sndprobe_should_log(ps))
+        l_info("[sndprobe] fseek(%p, %ld, %d) = %d", f, offset, whence, r);
+    return r;
 }
 
 long ftell_soloader(FILE *f) {
@@ -511,10 +589,14 @@ long ftell_soloader(FILE *f) {
         return ((FCacheHandle *)f)->pos;
     }
 #ifdef USE_SCELIBC_IO
-    return sceLibcBridge_ftell(f);
+    long r = sceLibcBridge_ftell(f);
 #else
-    return ftell(f);
+    long r = ftell(f);
 #endif
+    int ps = sndprobe_slot(f);
+    if (ps >= 0 && sndprobe_should_log(ps))
+        l_info("[sndprobe] ftell(%p) = %ld", f, r);
+    return r;
 }
 
 int fseeko_soloader(FILE *f, off_t offset, int whence) {
@@ -635,15 +717,68 @@ int fputs_soloader(const char *str, FILE *f) {
 #endif
 }
 
+/*
+ * Bug #043: libstdc++ (estatica dentro del .so) implementa std::ifstream/ofstream con
+ * __basic_file: fopen() + fileno() y despues read()/write()/lseek() sobre ese fd. Con
+ * USE_SCELIBC_IO el FILE* es de SceLibc (y el de fcache ni siquiera tiene fd), pero
+ * read/write/lseek iban a newlib -> read() fallaba -> ios_base::failure
+ * "basic_filebuf::underflow error reading the file" -> abort (log 076, trofeo
+ * androidTrophy.dat en nativeNotifyTrophy_update). fileno() ahora devuelve un fd
+ * "falso" que referencia el FILE*, y los syscalls de fd lo redirigen a las funciones
+ * stdio (que ya saben manejar SceLibc y fcache).
+ */
+#define FAKE_FD_BASE 0x4000
+#define FAKE_FD_MAX 64
+static FILE *s_fake_fds[FAKE_FD_MAX];
+static pthread_mutex_t s_fake_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static FILE *fake_fd_file(int fd) {
+    if (fd < FAKE_FD_BASE || fd >= FAKE_FD_BASE + FAKE_FD_MAX) return NULL;
+    return s_fake_fds[fd - FAKE_FD_BASE];
+}
+
+static void fake_fd_release(FILE *f) {
+    pthread_mutex_lock(&s_fake_fd_lock);
+    for (int i = 0; i < FAKE_FD_MAX; i++)
+        if (s_fake_fds[i] == f) s_fake_fds[i] = NULL;
+    pthread_mutex_unlock(&s_fake_fd_lock);
+}
+
 int fileno_soloader(FILE *f) {
-    if (fcache_is_handle(f)) {
-        return -1;
+    if (!f) return -1;
+    int fd = -1;
+    pthread_mutex_lock(&s_fake_fd_lock);
+    for (int i = 0; i < FAKE_FD_MAX && fd < 0; i++)
+        if (s_fake_fds[i] == f) fd = FAKE_FD_BASE + i;
+    for (int i = 0; i < FAKE_FD_MAX && fd < 0; i++)
+        if (!s_fake_fds[i]) { s_fake_fds[i] = f; fd = FAKE_FD_BASE + i; }
+    pthread_mutex_unlock(&s_fake_fd_lock);
+    if (fd < 0) l_error("fileno(%p): tabla de fds falsos llena", f);
+    return fd;
+}
+
+ssize_t read_soloader(int fd, void *buf, size_t count) {
+    FILE *f = fake_fd_file(fd);
+    if (f) return (ssize_t)fread_soloader(buf, 1, count, f);
+    return read(fd, buf, count);
+}
+
+ssize_t write_soloader(int fd, const void *buf, size_t count) {
+    FILE *f = fake_fd_file(fd);
+    if (f) {
+        size_t n = fwrite_soloader(buf, 1, count, f);
+        return (n == 0 && count > 0) ? -1 : (ssize_t)n;
     }
-#ifdef USE_SCELIBC_IO
-    return sceLibcBridge_fileno(f);
-#else
-    return fileno(f);
-#endif
+    return write(fd, buf, count);
+}
+
+off_t lseek_soloader(int fd, off_t offset, int whence) {
+    FILE *f = fake_fd_file(fd);
+    if (f) {
+        if (fseek_soloader(f, (long)offset, whence) != 0) return -1;
+        return (off_t)ftell_soloader(f);
+    }
+    return lseek(fd, offset, whence);
 }
 
 int setvbuf_soloader(FILE *f, char *buf, int mode, size_t size) {
@@ -682,6 +817,8 @@ int unlink_soloader(const char *pathname) {
 }
 
 int close_soloader(int fd) {
+    FILE *ff = fake_fd_file(fd);
+    if (ff) return fclose_soloader(ff);
     int ret = close(fd);
     l_debug("close(%i): %i", fd, ret);
     return ret;
@@ -740,6 +877,8 @@ int fcntl_soloader(int fd, int cmd, ...) {
 }
 
 int ioctl_soloader(int fd, int request, ...) {
+    // fd falso (FILE*): fallar para que libstdc++ (showmanyc/FIONREAD) caiga a fstat.
+    if (fake_fd_file(fd)) return -1;
     l_warn("ioctl(%i, %i, ...): not implemented", fd, request);
     return 0;
 }

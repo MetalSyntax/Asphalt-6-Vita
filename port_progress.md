@@ -4515,3 +4515,200 @@ Build OK (`psvita-toolkit build --preset debug`). **Pendiente de verificar en co
 real:** confirmar que el pop-in mejora visualmente; si no, loguear
 `DeviceConfig::s_GameplayFactorLOD` justo después de `LoadLevelObjects` para confirmar
 en vivo el valor real antes de tocar `drawAll` directamente.
+
+## Bug #042: sin música ni SFX (solo motor) — datos truncados en la consola, NO un bug de código (log 075)
+
+**Síntoma (RELEASES.md issue #1):** solo suena el motor; sin música de menú, golpes ni nitro.
+El sonido de rampa/salto queda "pegado" y se apila con cada salto.
+
+**Descartado primero:** `reimpl/gmp_audio.c` es código muerto en este build -- los
+`nativePlayMusic`/`nativeLoadMusic`/`nativePlaySound` del `.so` están vacíos (pseudo-C
+~10178). Todo el audio pasa por `vox::SoundManager` → `file00a.bin` (zip ofuscado, magic
+`QL\x04\x05`) → `vox::DriverAndroid` → AudioTrack.
+
+**Evidencia (sonda `[sndprobe]` en `reimpl/io.c`, log 075):** el `CZipReader` de vox escanea
+el índice de `file00a.bin` y corta tras ~270 de 630 entradas (fclose con `reads=541`, ~19.8 MB).
+Listado FTP: en la Vita `file00a.bin` = 19 791 872 bytes vs 143 543 426 el original. Las
+entradas 0-270 son justo los `mem_gp_*`/`mem_od_*` de motor (lo único que suena); música
+(`m_*.wav`), `sfx_*` y `vfx_*` quedaban fuera del índice. También truncados:
+`soundinfo.bin` (0 bytes, local 17 130), `oconf.bar` (0), `intro.mp4` (12.7 MB de 30.7 MB).
+
+**Fix:** volver a subir esos 4 archivos por FTP. Sin cambio de código salvo la sonda.
+**Pendiente de verificar en consola:** música/SFX, y si los sonidos "pegados" eran por
+`soundinfo.bin` vacío.
+
+## Bug #043: abort por `ios_base::failure` al desbloquear un trofeo (log 076)
+
+`nativeNotifyTrophy_update` lee `androidTrophy.dat` con `std::ifstream`. La libstdc++
+estática del `.so` hace `fopen()` + `fileno()` y después `read(fd)`. Con `USE_SCELIBC_IO`,
+`fileno` devolvía un fd de SceLibc (o -1 para handles de fcache) y `read` iba a newlib → fallo
+→ `basic_filebuf::underflow error reading the file` → `abort()`. Afecta a TODO
+`std::fstream` del motor. **Fix (`reimpl/io.c`):** `fileno()` devuelve un fd falso
+(0x4000+slot) que referencia el `FILE*`; `read`/`write`/`lseek`/`fstat`/`close`/`ioctl`
+lo redirigen a las funciones stdio. **Pendiente de verificar en consola.**
+**Log 077: siguió crasheando igual.** `std::__basic_file<char>::fd()` (0xa6d46c) no llama a
+`fileno`: lee `(short) FILE->_file` en +0xe (layout `__sFILE` de Bionic) → basura con FILE*
+de SceLibc/fcache. **Fix 2 (`patch.c`):** `hook_addr` reemplaza `fd()` entera por
+`fileno_soloader(this->_M_cfile)`; `xsgetn`/`xsputn`/`seekoff`/`showmanyc` la llaman con `bl`.
+
+## Video: conversión YUV en GPU + pantalla de carga tras el intro
+
+- `ring_push` ya no convierte con NEON (~23 ms/frame a 427x240, log 072/076, más que el
+  decode): empaqueta Y/U/V y `draw_video_frame` sube una textura `VGL_YUV420P_BT601`.
+- Se sacó `video_log_startup_benchmark()` (~780 ms en negro antes de cada video).
+- Tras el intro, `GameRenderer_nativeInit` bloquea ~17 s sin presentar (136 archivos, 39
+  shaders; es trabajo real del motor, no un cuelgue). `video_show_loading_screen()`
+  presenta `app0:loading.rgb565` (pic0.png → RGB565 crudo, `extras/loading.rgb565`).
+**Pendiente de verificar en consola:** fps del intro, que la imagen de carga aparezca.
+
+## Bug #044: menú de pausa roto — `178igMenu.swf` instalado era OTRA pantalla (log 078)
+
+El mapeo `.dat` → nombre del Bug #012 era "estimado" y `igMenu` quedó cruzado: el
+`178igMenu.swf` instalado (file000353, 162 575 B) no tiene NINGÚN nodo que busca el motor
+(`menu_main`, `resume_btn`, `custom_controls_btn`, `component_controls`) — su contenido es
+"Touch Screen to Continue"/`error_screen`/`menu_Tutorial`. Por eso `IGMUpdate`/`StateRender`
+(peli 0xc) recibían NULL en cada `Find` (guardas #026-#028, `IGMProbe` log 065/078).
+Escaneo de los 37 SWF demangleados (`out[i]=in[i]-(i+1)` en los 4 primeros bytes): el
+único que es el menú de pausa es **file000632.dat** (246 593 B, 1152x768 = perfil 178):
+`PauseMenu:btnResume`, `Restart`, "Do you really want to quit ?", `menu_main` x11,
+`resume_btn` x4, `custom_controls_btn` x3, `component_controls` x2 (= el
+`178igMenu_test.swf` que ya estaba en disco, solo cambia el byte de versión).
+**Fix (datos, sin código):** `178igMenu.swf` ← file000632 demangleado; el anterior queda
+como `178igMenu_old.swf`. `back_btn_main` no aparece literal en ningún SWF (probable
+attach dinámico por ActionScript); la guarda de #027 lo sigue cubriendo.
+**Pendiente:** subir a la consola y verificar que `IGMProbe` muestre `menu_main != 0`.
+
+## Bug #045: FPS en carrera sin desglose -- perfilador `[perf]` por latido (log 078) — pendiente de verificar en consola
+
+**Evidencia del log 078 (Debug):** en carrera (latidos `[wd]` líneas 3178-5010) se presentan
+**87-135 frames/5 s (17-27 fps)**, con caídas a +52 (línea 4617, ~10 fps) y +26 (línea 4661,
+~5 fps). Descartado con el mismo log:
+- **Compilación de shaders en carrera:** el último `link prog=92` es la línea 3052, antes de
+  la carrera; en carrera no hay ni un `compile`/`link`.
+- **Presión de memoria vitaGL:** `[gl-mem]` VRAM libre estable en ~66 MB; el pool RAM de
+  vitaGL (1.1 MB, porque newlib se lleva 256 MB) no se agota (texturas/buffers van a VRAM).
+- **Cuelgue largo de `thisAppendBatch`:** no aparece en carrera en el 078 (ningún latido con
+  +0 frames después de la línea 3158).
+- **Cantidad de draws:** el contador `#` de `[gl-blend]` da ~19 draws grandes/frame con blend
+  apagado (#47104→#47616 entre frames 3517-3544) + ~11 con blend -- poco.
+- Contadores del testigo por frame: ~250 malloc, ~450 strcmp, ~90 gettimeofday -- menores.
+
+Con eso, el log NO alcanza para saber a dónde se va el frame (~40-50 ms): CPU del motor,
+espera de GPU/display, readbacks o streaming. Candidato concreto encontrado en el binario
+(sin confirmar): `CCommonGLDriver::CRenderTarget::unbind()` (pseudo-C ~849517) hace
+`glCopyTexSubImage2D` del backbuffer cuando el driver no tiene el flag `0x800` (FBO) -- en
+vitaGL eso es `scene_reset()` + **`sceGxmFinish()`** + copia CPU (`framebuffers.c`
+`glReadPixels`), o sea un stall total de GPU por render target por frame (reflejos/post).
+
+**Cambio (diagnóstico, sin tocar lógica del juego):** nuevo `source/utils/perf.c/.h`. El
+testigo imprime en cada latido (también en Release, 2-3 líneas cada 5 s):
+- `[perf] 5000ms: cpu_main=Nms` (CPU real del hilo principal por `runClocks`: ~5000 = motor
+  limitado por CPU; mucho menos = esperando GPU/display), `render` (nativeRender) y `motor
+  sin swap` en us/frame, `swap` (vglSwapBuffers, total/promedio/máx), `sleep` (usleep/
+  nanosleep reales del hilo principal), `frame max` y cuántos frames pasaron de 50/100/250 ms.
+- `[perf]   draws`, `bindfb`, `copytex` (llamadas/ms/máx), `texup` (glTexImage2D/
+  Compressed/SubImage: llamadas, KiB, ms, máx -- streaming de texturas en carrera, issue
+  "errores gráficos mientras cargan texturas"), `bufdata` (glBufferData: llamadas, KiB, ms --
+  recreación de buffers de `thisAppendBatch`), `flush`.
+- `[perf] s_GameplayFactorLOD=N/1000 m_currentTrack=T` una vez por cambio (valor REAL del
+  factor de LOD, ver abajo).
+Hooks: `utils/glutil.c` (wrappers existentes), `main.c` (alrededor de nativeRender +
+`perf_init`), `reimpl/sys.c` (sleeps), `utils/watchdog.c` (reporte). Costo: un
+`sceKernelGetProcessTimeLow` por llamada instrumentada (no por draw; los draws solo suman).
+
+**Nota LOD (Bug #041, pop-in que sigue en 078 con el hook activo, línea 11):**
+`CustomSceneManager::drawAll` (pseudo-C ~178246) arma una segunda proyección con far =
+`near + (far-near)*(1 - s_GameplayFactorLOD) - 1840`. O sea que el factor **acorta** la
+distancia; con `-1` se usa `campo_0x90 * 0.01` de la pista, que puede ser igual o más chico
+que el 0.4 anterior -- por eso #041 pudo no cambiar nada. No se tocó: el próximo log dice el
+valor real, y si es >0 el siguiente paso es forzar 0.0f (far completo) midiendo el costo con
+`[perf] draws`.
+
+## Bug #046: `glFlush()` del `endScene()` del motor abre una escena GXM extra por frame — pendiente de verificar en consola
+
+`CCommonGLDriver::endScene()` (pseudo-C ~845991) llama `glFlush()` antes del swap. En vitaGL
+(`gxm.c:980`) `glFlush` = `dirty_framebuffer = TRUE; scene_reset()`: cierra la escena del
+display y ABRE otra que `vglSwapBuffers` cierra enseguida -- una pasada de fragmentos extra
+(load/store de color+depth 960x544) por frame, sin utilidad: vitaGL ya corta la escena solo
+cuando cambia el framebuffer. **Fix:** opción CMake `GL_FLUSH_DISPLAY_NOOP` (ON):
+`glFlush_soloader` es no-op mientras el framebuffer bindeado sea 0 (display; se sigue en
+`glBindFramebuffer_soloader`); con un FBO bindeado pasa a vitaGL como antes. Mismo criterio
+que `glFinish` → `ret0` (paridad Asphalt-5-Vita). Build Debug OK.
+**Verificar en consola:** que no haya regresión visual (HUD/menú/pausa) y comparar
+`[perf] swap`/fps de carrera con y sin `-DGL_FLUSH_DISPLAY_NOOP=OFF`.
+
+## Bug #047: botón "Continuar" de la pausa muestra un recuadro (log 079)
+
+`IGMUpdate` hace `SetText("menu_main.resume_btn.mc_label.tf", GetString(0x20086))`. En la
+tabla de textos de estos datos (`file000820.dat`, formato: u16 n_packs, n×u32 tamaños, y por
+pack u16 n_strings + n×u16 offsets + datos) el pack 2 tiene solo 82 entradas → índice 0x86
+fuera de rango → `StringPack::GetString` devuelve basura (la sonda que la volcaba ni llegó a
+escribirse). El pack 8 es el del menú de pausa (`0x80000` "Resume", `0x80001` "Restart",
+`0x80002` "Main Menu", `0x80003` "Options"...). **Fix:** el stub `hook_igm_vis` emula
+`movw/movt r1` = `0x80000` en vez de `0x20086`. Los IDs del `.so` y los datos vienen de
+versiones distintas: otros `GetString` con índices fuera de rango pueden dar lo mismo.
+
+**Dato de rendimiento del mismo log (perf, Bug #045):** carrera estable 300 frames/5 s
+(60 fps), `cpu_main` ~4.1 s/5 s (motor limitado por CPU, ~11 ms/frame), `copytex` 0.
+`s_GameplayFactorLOD` = 0.6 en menú y **70.0 en carrera** (m_currentTrack=2): candidato
+directo para el pop-in (ver #041/#045).
+
+## Bug #048: pop-in — el fix #041 hacía que el LOD valiera 70.0 en carrera (log 079)
+
+La sonda `[perf]` midió `s_GameplayFactorLOD` = 0.6 en menú y **70.0 en carrera**. Con el
+hook de #041 (`GetDeviceFactorLOD` → -1.0f) `LoadLevelObjects` toma
+`m_currentTrack.campo_0x90 * 0.01`, que con estos datos da 70 (desajuste de versión,
+como #047). `CustomSceneManager::drawAll` (pseudo-C ~178246) arma el frustum de culling con
+`far' = near + (far-near)*(1-factor) - 1840` → con 70, `(1-70) = -69` → plano lejano negativo.
+En el `.so` original ese camino nunca corre (`s_DeviceType` siempre 3 → 0.4 fijo).
+**Fix (`patch.c`):** el hook devuelve **0.0f** (far' = far-1840, distancia máxima), con
+`__attribute__((pcs("aapcs")))` porque el `.so` es softfp y lee el float en r0 (verificado
+en el disasm del elf: `mov r0, #0`). **Pendiente de verificar en consola:** menos pop-in,
+`[perf]` debe mostrar `s_GameplayFactorLOD=0/1000` en carrera; vigilar `draws`/fps (más
+geometría visible → más CPU; hoy ~11 ms/frame de 16.6).
+
+## Bug #049: "Resume" de la pausa no reanuda + START abre/cierra la pausa (log 080)
+
+- `GS_Race::StateOnFlashEvent` solo llama a `ResumeFromIGM` si el nodo clickeado ==
+  `Find("back_btn_main")`, que no existe en el menú de pausa real (el botón es
+  `menu_main.resume_btn`). **Fix (`patch.c`):** hook al inicio de `RenderFX::Find(const char*)`
+  (0x683acc, emula `push {r4-r8,lr}` + `ldr r2,[r0,#0x40]`, sigue en 0x683ad4) que traduce
+  `back_btn_main` → `menu_main.resume_btn`. De paso `IGMUpdate` deja de caer en la guarda #027.
+- START: `GS_Race::StateUpdate` usa `isMenuKeyPressed()` (bMenuKey, keycode 82) como
+  interruptor pausa/reanudar. **Fix (`input.c`):** START → `KEY_MENU` 82.
+**Pendiente de verificar en consola.**
+
+**Rendimiento con LOD 0.0 (Bug #048, log 080):** pop-in y errores gráficos resueltos según el
+usuario, pero la carrera (pista 0) cae a ~18-20 fps: `motor sin swap` ~50 ms/frame,
+130-150 draws/frame (vs 43-65 con el LOD 70 roto). El valor original del `.so` es 0.4.
+- LOD final: 0.4f (elección del usuario tras log 080). Pendiente medir FPS/pop-in.
+
+## Bug #050: data abort en `PhysicCar::PhysicCar` al entrar al menú de tuning (log 081 + dump 1790300502)
+
+PC = `+0x4cf2e4` (`PhysicCar::PhysicCar+0x330`, `ldr r3,[r5]`), r5 = `BaseCarManager::GetPackFile()`
+= NULL (guardas #033/#021 justo antes en el log). `R10`/`sl` (índice de auto) = **-1**.
+`GarageManager::AddCarToGarage` (0x41fdac) construye el `RaceCar` con
+`CarManager::GetCarIdxFromId(id)` sin chequear -1 (auto no encontrado en estos datos);
+`GS_MenuMain::OnLoad3DScene` sí cae a `Game::m_defaultCarID`. **Fix (`patch.c`):**
+`hook_trace` en 0x41fdd8 (`mov sl,r0` + `movw r0,#0x2ba4`): si r0 == -1 usa el índice de
+`m_defaultCarID` (o 0) y loguea `GarageCarIdx` una vez. **Pendiente de verificar en consola**;
+queda por saber qué id de auto no existe (probable desajuste de versión de datos/perfil).
+**Log 082: mismo crash, la guarda nunca disparó** (el -1 no venía de `AddCarToGarage`; la pila
+del dump corta en `RaceCar::RaceCar+0x70` → `LogicCar` → `PhysicCar`). **Fix 2:** se quitó esa
+guarda y se puso en la ENTRADA de `RaceCar::RaceCar` C1 (0x447740) y C2 (0x4453c0): si
+r1 == -1 → índice de `m_defaultCarID`; emula `push {r4-fp,lr}` + `vpush {d8-d9}`. Loguea
+`RaceCarIdx` (hasta 4 veces).
+
+## Bug #051: crash con el botón Exit/Info del menú principal (log 083 + dump 1790303233)
+
+PC = `+0x4bf3dc` (`T_SWFManager::SWFLoad+0x150`, `strb r8,[r0,#0x9b]`), r0 =
+`RenderFX::Find("menu_Info.btn_About")` = NULL. Justo antes: `fopen(178info_menu.swf) = 0x0`
++ asserts `menufx.cpp: Load: 354` / `smart_ptr.h: operator->: 132` → la pantalla de Info/salida
+no existía en los datos (la misma que apuntaba el Bug #040). Escaneo de SWF demangleados:
+`file000338.dat` (1152x768, perfil 178; `menu_Info` x3, `btn_About` x2,
+`General:SP_EXIT_CONFIRMATION`) y `file000461.dat` (1024x768, perfil iPad). **Fix (datos):**
+`178info_menu.swf` ← file000338 demangleado, subido a la consola. Documentado en README/RELEASES.
+
+Log 083 también confirma: RaceCarIdx (#050) disparó 3 veces sin crash (idx 35 por defecto),
+START pausa y reanuda (KEYDOWN 82 x2), carrera con LOD 0.4 a mediana ~27 fps (p10 ~19 fps).
+README/RELEASES pasan a **v0.2.0-beta (beta pública)**.

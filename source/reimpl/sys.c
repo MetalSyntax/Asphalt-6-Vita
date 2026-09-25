@@ -20,6 +20,7 @@
 
 #include "utils/breadcrumb.h"
 #include "utils/logger.h"
+#include "utils/perf.h"
 #include "utils/utils.h"
 
 #define BIONIC_CLOCK_REALTIME           0
@@ -114,6 +115,12 @@ int usleep_soloader(useconds_t usec) {
     if (usec < 1000) {
         return 0; // Just return immediately to keep the spinlock fast.
     }
+    if (sceKernelGetThreadId() == g_perf_main_tid) {
+        uint32_t _pt = perf_now();
+        int r = sceKernelDelayThread(usec);
+        perf_add(PERF_SLEEP, _pt);
+        return r;
+    }
     return sceKernelDelayThread(usec);
 }
 
@@ -121,6 +128,12 @@ int nanosleep_soloader(const struct timespec *req, struct timespec *rem) {
     bc_event("nanosleep", BC_RA);
     if (req && req->tv_sec == 0 && req->tv_nsec < 1000000) {
         return 0; // Skip sleeps under 1ms
+    }
+    if (sceKernelGetThreadId() == g_perf_main_tid) {
+        uint32_t _pt = perf_now();
+        int r = nanosleep(req, rem);
+        perf_add(PERF_SLEEP, _pt);
+        return r;
     }
     return nanosleep(req, rem);
 }

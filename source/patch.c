@@ -14,6 +14,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <kubridge.h>
 #include <so_util/so_util.h>
@@ -21,6 +22,7 @@
 #include "utils/breadcrumb.h"
 #include "utils/logger.h"
 #include "utils/utils.h"
+#include "reimpl/io.h"
 
 extern so_module so_mod;
 
@@ -59,8 +61,21 @@ extern so_module so_mod;
  * PENDIENTE: confirmar en consola real que el pop-in mejora (no se pudo probar en este
  * build). Ver port_progress.md.
  */
+/*
+ * Bug #048 (log 079, sonda perf): con -1.0f el motor tomaba el LOD "de la pista"
+ * (m_currentTrack.campo_0x90 * 0.01) y en estos datos eso da 70.0 -- desajuste de
+ * version, igual que los IDs de texto del Bug #047. drawAll() arma el frustum de
+ * culling con far' = near + (far-near)*(1-factor) - 1840: con 70 queda (1-70) = -69,
+ * un plano lejano negativo. En el binario original este camino nunca corre (siempre
+ * devuelve 0.4 por s_DeviceType=3). 0.0f = distancia lejana maxima de la camara
+ * (far-1840): menos pop-in. pcs("aapcs"): el .so es softfp y espera el float en r0.
+ */
+// Log 080: con 0.0f no hay pop-in pero la carrera cae a ~18-20 fps (130-150 draws,
+// ~50 ms/frame de motor). Se vuelve al valor que el .so original devuelve siempre (0.4,
+// s_DeviceType=3), eleccion del usuario: algo de pop-in lejano, mucho mas FPS.
+__attribute__((pcs("aapcs")))
 static float device_factor_lod_use_track_default(void) {
-    return -1.0f;
+    return 0.4f;
 }
 
 __attribute__((naked, target("arm")))
@@ -87,6 +102,38 @@ void hooked_RenderFX_Find_pt() {
         "1:\n"
         "ldr pc, 2f\n"
         "2: .word 0x98683b00\n"
+    );
+}
+
+/*
+ * Bug #049 (log 080): "Resume" no reanudaba. GS_Race::StateOnFlashEvent solo llama a
+ * ResumeFromIGM si el nodo clickeado es Find("back_btn_main"), e IGMUpdate copia la
+ * visibilidad de menu_main a ese mismo nodo -- pero en el menu de pausa real
+ * (178igMenu.swf = file000632, Bug #044) el boton se llama menu_main.resume_btn y
+ * "back_btn_main" no existe. Hook al inicio de RenderFX::Find(const char*) (0x683acc):
+ * traduce el nombre y sigue con el original. Los 8 bytes pisados por hook_addr son
+ * push {r4-r8,lr} + ldr r2,[r0,#0x40], emulados aca antes de saltar a +8.
+ */
+const char *renderfx_find_name_alias(const char *name) {
+    if (name && strcmp(name, "back_btn_main") == 0)
+        return "menu_main.resume_btn";
+    return name;
+}
+
+__attribute__((naked, target("arm")))
+void hooked_RenderFX_Find_entry() {
+    __asm__ volatile(
+        "push {r0, r2, r3, lr}\n"
+        "mov r0, r1\n"
+        "ldr ip, 1f\n"
+        "blx ip\n"
+        "mov r1, r0\n"
+        "pop {r0, r2, r3, lr}\n"
+        ".word 0xe92d41f0\n"   // emu: push {r4, r5, r6, r7, r8, lr}
+        ".word 0xe5902040\n"   // emu: ldr r2, [r0, #0x40]
+        "ldr pc, 2f\n"
+        "1: .word renderfx_find_name_alias\n"
+        "2: .word 0x98683ad4\n"
     );
 }
 
@@ -1662,6 +1709,7 @@ void igm_null(uint32_t menu_main, uint32_t back_btn, void *movie) {
         l_error("[patch] IGMProbe: movie=%p main_menu=%p hud.container=%p menu_main=%p "
                 "menu_custom_controls=%p (log 065)",
                 movie, p_main_menu, p_hud_container, p_menu_main, p_custom);
+
     }
 }
 
@@ -1673,8 +1721,13 @@ void igm_null(uint32_t menu_main, uint32_t back_btn, void *movie) {
 __attribute__((naked, target("arm")))
 static void hook_igm_vis(void) {
     __asm__ volatile(
-        ".word 0xe3001086\n"   // emu: movw r1, #0x86
-        ".word 0xe3401002\n"   // emu: movt r1, #0x2  (r1 = 0x20086)
+        // Bug #047 (log 079): el original es movw r1,#0x86 + movt r1,#2 (r1 = 0x20086),
+        // pero en la tabla de textos de estos datos (file000820.dat) el pack 2 tiene
+        // solo 82 entradas: GetString(0x20086) leia fuera del arreglo y devolvia basura
+        // (el boton Continuar mostraba un recuadro). El pack 8 es el del menu de pausa:
+        // 0x80000 = "Resume". Se emula r1 = 0x80000 en su lugar.
+        ".word 0xe3001000\n"   // emu: movw r1, #0x0
+        ".word 0xe3401008\n"   // emu: movt r1, #0x8  (r1 = 0x80000)
         "cmp r7, #0\n"
         "beq 1f\n"
         "cmp r0, #0\n"
@@ -1806,6 +1859,56 @@ static void hook_getpackfilename(void) {
     );
 }
 
+/*
+ * Bug #050 (logs 081/082 + dumps 1790300502/1790300979): data abort en
+ * PhysicCar::PhysicCar+0x330 (0x4cf2e4, "ldr r3,[r5]" con r5 = GetPackFile() = NULL) al
+ * entrar al menu de tuning. El indice de auto llega en -1 (sl = 0xffffffff) desde
+ * RaceCar::RaceCar -> LogicCar -> PhysicCar: algun llamador pasa
+ * CarManager::GetCarIdxFromId(id) sin chequear -1 (auto no encontrado en estos datos).
+ * GS_MenuMain::OnLoad3DScene si lo chequea y cae a Game::m_defaultCarID; se aplica ese
+ * mismo respaldo en la ENTRADA de RaceCar::RaceCar (C1 0x447740 y C2 0x4453c0), que
+ * cubre a todos los llamadores. Primer intento (log 082): guarda solo en
+ * GarageManager::AddCarToGarage, nunca disparo -- el -1 venia de otro llamador.
+ * Los 8 bytes pisados son push {r4-fp,lr} + vpush {d8-d9}, emulados en el stub.
+ */
+uint32_t g_resume_racecar_c1, g_resume_racecar_c2;
+
+int racecar_idx_fallback(void) {
+    static int logged = 0;
+    void *(* get_car_mgr)(void) = (void *(*)(void))so_symbol(&so_mod, "_ZN4Game9GetCarMgrEv");
+    int (* get_idx)(void *, int) = (int (*)(void *, int))so_symbol(&so_mod, "_ZN10CarManager15GetCarIdxFromIdEi");
+    int *default_id = (int *)so_symbol(&so_mod, "_ZN4Game14m_defaultCarIDE");
+    int idx = (get_car_mgr && get_idx && default_id) ? get_idx(get_car_mgr(), *default_id) : -1;
+    if (idx < 0) idx = 0;
+    if (logged++ < 4)
+        l_error("[patch] RaceCarIdx: RaceCar::RaceCar con indice -1, se usa el auto por defecto (idx %d, Bug #050)", idx);
+    return idx;
+}
+
+#define RACECAR_IDX_STUB(name, resume)                                   \
+    __attribute__((naked, target("arm")))                                \
+    static void name(void) {                                             \
+        __asm__ volatile(                                                \
+            "cmn r1, #1\n"                                               \
+            "bne 1f\n"                                                   \
+            "push {r0, r2, r3, lr}\n"                                    \
+            "ldr ip, 2f\n"                                               \
+            "blx ip\n"                                                   \
+            "mov r1, r0\n"                                               \
+            "pop {r0, r2, r3, lr}\n"                                     \
+            "1:\n"                                                       \
+            ".word 0xe92d4ff0\n"  /* emu: push {r4-fp, lr} */            \
+            ".word 0xed2d8b04\n"  /* emu: vpush {d8-d9} */               \
+            "ldr ip, 3f\n"                                               \
+            "ldr pc, [ip]\n"                                             \
+            "2: .word racecar_idx_fallback\n"                            \
+            "3: .word " #resume "\n"                                     \
+        );                                                               \
+    }
+
+RACECAR_IDX_STUB(hook_racecar_c1, g_resume_racecar_c1)
+RACECAR_IDX_STUB(hook_racecar_c2, g_resume_racecar_c2)
+
 // Engancha text_base+off con stub tras verificar la primera palabra del prologo.
 // emu_lit_off = offset del literal que cargaba el ldr PC-relativo (0 si no hay).
 static void hook_trace(uint32_t off, uint32_t expect1, uint32_t expect2,
@@ -1833,9 +1936,23 @@ static void hook_trace(uint32_t off, uint32_t expect1, uint32_t expect2,
     l_error("[patch] hook en +0x%X", (unsigned)off);
 }
 
+/*
+ * Bug #043 (segunda parte, log 077): std::__basic_file<char>::fd() de la libstdc++
+ * estatica NO llama a fileno(): lee `(short) FILE->_file` (offset +0xe de la estructura
+ * __sFILE de Bionic). Nuestros FILE* son de SceLibc o del fcache, asi que ahi habia
+ * basura y read() fallaba igual -> ios_base::failure -> abort. Se reemplaza fd()
+ * entera (xsgetn/xsputn/seekoff/showmanyc la llaman con bl) por fileno_soloader(),
+ * que devuelve el fd falso que read/write/lseek/ioctl de reimpl/io.c redirigen al FILE*.
+ */
+static int basic_file_fd(void **self) {
+    return fileno_soloader((FILE *) *self);
+}
+
 void so_patch(void) {
+    hook_addr((uintptr_t)so_symbol(&so_mod, "_ZNSt12__basic_fileIcE2fdEv"), (uintptr_t)&basic_file_fd);
     hook_addr((uintptr_t)so_symbol(&so_mod, "_ZN7gameswf4root7advanceEfb"), (uintptr_t)&hooked_gameswf_root_advance);
     hook_addr((uintptr_t)(so_mod.text_base + 0x683af8), (uintptr_t)&hooked_RenderFX_Find_pt);
+    hook_addr((uintptr_t)(so_mod.text_base + 0x683acc), (uintptr_t)&hooked_RenderFX_Find_entry);
     hook_addr((uintptr_t)(so_mod.text_base + 0x6820e8), (uintptr_t)&hooked_RenderFX_UpdateCursor_pt);
 
     uintptr_t sym_tb = (uintptr_t)so_symbol(&so_mod, "_ZN8RenderFX23SetTextBufferingEnabledEb");
@@ -1906,7 +2023,7 @@ void so_patch(void) {
     uintptr_t sym_get_device_factor_lod = (uintptr_t)so_symbol(&so_mod, "_ZN12DeviceConfig18GetDeviceFactorLODEv");
     if (sym_get_device_factor_lod) {
         hook_addr(sym_get_device_factor_lod, (uintptr_t)&device_factor_lod_use_track_default);
-        l_info("[patch] Hooked DeviceConfig::GetDeviceFactorLOD -> -1.0f (usa el LOD de la pista, no el de 'device type 3')");
+        l_info("[patch] Hooked DeviceConfig::GetDeviceFactorLOD -> 0.4f (valor original del .so, Bug #048)");
     }
 
     // Diagnostico CNullDriver (ver comentario arriba de los hooked_CNullDriver_*):
@@ -2042,6 +2159,9 @@ void so_patch(void) {
     } else {
         l_error("[patch] sin hook en GetPackFilename: no se encontro _S_empty_rep_storage");
     }
+    hook_trace(0x447740, 0xE92D4FF0u /* push {r4-fp,lr} */, 0xED2D8B04u /* vpush {d8-d9} */,
+               hook_racecar_c1, 0, &g_resume_racecar_c1, NULL);
+    hook_trace(0x4453C0, 0xE92D4FF0u, 0xED2D8B04u, hook_racecar_c2, 0, &g_resume_racecar_c2, NULL);
 
     // Log 067/068 + dumps 1789887462/1789928259: IVideoDriver* NULL en
     // C2DDriver::draw2DRectangle(IVideoDriver*,...), hook sobre la instruccion

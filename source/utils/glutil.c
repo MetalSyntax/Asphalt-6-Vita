@@ -12,6 +12,7 @@
 #include "utils/breadcrumb.h"
 #include "utils/dialog.h"
 #include "utils/logger.h"
+#include "utils/perf.h"
 #include "utils/utils.h"
 #include "utils/watchdog.h"
 
@@ -36,6 +37,8 @@ static void gl_blend_draw_check(const char *who, GLsizei count);
 // de otro sin tener que mapear nombres de archivo de textura. Se guarda aca (no junto a
 // g_blend_enabled) porque glUseProgram_soloader esta mas arriba en este archivo.
 static GLuint g_cur_program = 0;
+// Framebuffer bindeado por el motor (0 = display). Lo usa glFlush_soloader (Bug #046).
+static GLuint g_bound_fb = 0;
 
 /*
  * Traza por-llamada de las funciones GL interceptadas. Fue la herramienta que permitio
@@ -190,7 +193,10 @@ void gl_init() {
 void gl_swap() {
     BC_SCOPE("vglSwapBuffers");
     watchdog_mark("swap", (int)gl_swap_count);
+    uint32_t _pt = perf_now();
     vglSwapBuffers(GL_FALSE);
+    perf_add(PERF_SWAP, _pt);
+    perf_frame_presented();
     gl_swap_count++;
 
     // Latido del bucle de render. Es la diferencia entre "colgado" y "vivo pero lentísimo"
@@ -295,6 +301,7 @@ void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
     gl_trace("[gl] glDrawArrays mode=0x%x first=%d count=%d",
              (unsigned)mode, (int)first, (int)count);
 #endif
+    g_perf_draws++;
     gl_blend_draw_check("glDrawArrays", count);
     glDrawArrays(mode, first, count);
 }
@@ -305,6 +312,7 @@ void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void
     gl_trace("[gl] glDrawElements mode=0x%x count=%d type=0x%x idx=%p",
              (unsigned)mode, (int)count, (unsigned)type, indices);
 #endif
+    g_perf_draws++;
     gl_blend_draw_check("glDrawElements", count);
     glDrawElements(mode, count, type, indices);
 }
@@ -322,7 +330,16 @@ void glFlush_soloader(void) {
     // volvio y el cuelgue esta despues (endScene/registerFrame/swap)".
     BC_SCOPE("glFlush");
     gl_trace("[gl] glFlush BEGIN");
+#ifdef GL_FLUSH_DISPLAY_NOOP
+    // Bug #046: ver CMakeLists.txt. Se cuenta igual (llamadas, 0 us) para el [perf].
+    if (g_bound_fb == 0) {
+        g_perf[PERF_FLUSH].calls++;
+        return;
+    }
+#endif
+    uint32_t _pt = perf_now();
     glFlush();
+    perf_add(PERF_FLUSH, _pt);
     gl_trace("[gl] glFlush END");
 }
 
@@ -364,6 +381,8 @@ GLint glGetAttribLocation_soloader(GLuint program, const GLchar *name) {
 void glBindFramebuffer_soloader(GLenum target, GLuint framebuffer) {
     BC_SCOPE("glBindFramebuffer");
     gl_trace("[gl] glBindFramebuffer fb=%u", (unsigned)framebuffer);
+    g_perf_bindfb++;
+    g_bound_fb = framebuffer;
     glBindFramebuffer(target, framebuffer);
 }
 
@@ -542,7 +561,10 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
         default:
             break;
     }
+    uint32_t _pt = perf_now();
     glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    perf_add(PERF_TEXUP, _pt);
+    g_perf_texup_bytes += (uint32_t)width * (uint32_t)height * 4u; // aprox (RGBA8)
 }
 
 /*
@@ -562,28 +584,38 @@ void glCopyTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat
                                GLint x, GLint y, GLsizei width, GLsizei height,
                                GLint border) {
     BC_SCOPE("glCopyTexImage2D");
+    uint32_t _pt = perf_now();
     glCopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+    perf_add(PERF_COPYTEX, _pt);
 }
 
 void glCopyTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                                   GLint x, GLint y, GLsizei width, GLsizei height) {
     BC_SCOPE("glCopyTexSubImage2D");
+    uint32_t _pt = perf_now();
     glCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
+    perf_add(PERF_COPYTEX, _pt);
 }
 
 void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                               GLsizei width, GLsizei height, GLenum format, GLenum type,
                               const void *pixels) {
     BC_SCOPE("glTexSubImage2D");
+    uint32_t _pt = perf_now();
     glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+    perf_add(PERF_TEXUP, _pt);
+    g_perf_texup_bytes += (uint32_t)width * (uint32_t)height * 4u; // aprox
 }
 
 void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
                                      GLsizei width, GLsizei height, GLint border,
                                      GLsizei imageSize, const void *data) {
     BC_SCOPE("glCompressedTexImage2D");
+    uint32_t _pt = perf_now();
     glCompressedTexImage2D(target, level, internalformat, width, height, border,
                            imageSize, data);
+    perf_add(PERF_TEXUP, _pt);
+    g_perf_texup_bytes += (uint32_t)imageSize;
     // Las texturas de pista/menu son *.PVRTC4.tga: si vitaGL/GXM rechaza el
     // formato, la malla sale rota/negra. Los fallos son raros, asi que se
     // loguean siempre (acotado) para que el proximo log diga si PVRTC pasa o no.
@@ -620,7 +652,10 @@ void glGenerateMipmap_soloader(GLenum target) {
 
 void glBufferData_soloader(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
     BC_SCOPE("glBufferData");
+    uint32_t _pt = perf_now();
     glBufferData(target, size, data, usage);
+    perf_add(PERF_BUFDATA, _pt);
+    g_perf_buf_bytes += (uint32_t)size;
 }
 
 void glClear_soloader(GLbitfield mask) {

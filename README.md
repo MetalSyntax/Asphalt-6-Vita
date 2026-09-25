@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Title%20ID-ASPHALT06-ff69b4.svg?style=flat-square" alt="Title ID ASPHALT06" />
   <img src="https://img.shields.io/badge/Engine-Gameloft%20Glitch-brightgreen.svg?style=flat-square" alt="Engine" />
   <img src="https://img.shields.io/badge/Renderer-vitaGL%20%28GLES%202.0%2FGLSL%29-orange.svg?style=flat-square" alt="Renderer" />
-  <img src="https://img.shields.io/badge/Status-Alpha%20%E2%80%94%20Testing%20Only-red.svg?style=flat-square" alt="Status: Alpha, testing only" />
+  <img src="https://img.shields.io/badge/Status-Public%20Beta-yellow.svg?style=flat-square" alt="Status: Public beta" />
 </p>
 
 ---
@@ -34,15 +34,13 @@ already-"licensed" archive (`copy.inject`) bundled in the offline APK release, a
 `pack.info` and the save-data defaults. See [`PORTING_PLAN.md`](PORTING_PLAN.md) for the full
 engine-detection write-up.
 
-### 🎮 Current Status: Alpha — Testing Only
+### 🎮 Current Status: Public Beta
 
-> **This is an early alpha.** The game boots, reaches the main menu, and races are
-> technically playable, but the overall experience is **far from acceptable** for regular
-> play: frequent graphical glitches, aggressive FPS drops, and largely broken audio (see
-> below). Only worth trying if you want to help test/debug the port — not as a way to
-> actually play Asphalt 6 on Vita yet. See [`port_progress.md`](port_progress.md) for the
-> full bug-by-bug diagnosis log (every fix is backed by a real console log/crash-dump — no
-> guessing) and [`RELEASES.md`](RELEASES.md) for versioned release notes.
+> **The game is playable from start to finish.** Menus, races, the pause menu, music and
+> sound effects all work. Expect lower frame rates in races (around 20–30 fps) and a few
+> rough edges. See [`RELEASES.md`](RELEASES.md) for release notes and
+> [`port_progress.md`](port_progress.md) for the full bug-by-bug log (every fix is backed by a
+> real console log or crash dump).
 
 ### ✨ What Works
 
@@ -57,12 +55,11 @@ engine-detection write-up.
 - **Touch Input**: the front touch panel is mapped 1:1 to the engine's own touch UI
   (`GLGame_nativeTouchPressed/Moved/Released`) — menus and in-race steering/controls work via
   touch.
-- **Physical controls (Asphalt-5 style)**: D-Pad/stick left-right (plus L1/R1) steer via
-  synthetic screen touches *and* the engine's native gamepad keys; SQUARE/CROSS hit the brake
-  corners, TRIANGLE fires the floating nitro button, CIRCLE is BACK and START is MENU
-  (`GLGame_nativeSetOnKeyDown/Up`, `source/input.c`). Synthetic touches share the same slot
-  allocator as real fingers, so they can never collide.
-- **Intro FMV**: the intro video plays through a software FFmpeg decoder.
+- **Physical controls**: D-Pad/stick left-right (plus L1/R1) steer, CROSS fires nitro,
+  SQUARE brakes and START opens/closes the pause menu (`source/input.c`).
+- **Audio**: menu music, sound effects and engine sound.
+- **Intro FMV**: the intro video plays through FFmpeg with GPU color conversion, followed by
+  a loading screen.
 - **Assets from `ux0:`**: resource loading reads the game's packed/loose asset files from
   `ux0:data/asphalt6/data/`.
 - **Extensive on-device diagnostics**: a watchdog thread that reports live thread state and
@@ -72,43 +69,14 @@ engine-detection write-up.
 
 ### ⚠️ Known Issues
 
-**Confirmed on real hardware — the experience is currently far from acceptable:**
-
-- **Audio: only the engine/motor sound plays.** `vox::DriverAndroid`'s race mix
-  (`source/reimpl/audiotrack.c`) is the only audio actually audible on console. Menu music
-  and SFX (`GLMediaPlayer`, samples packed in `file00a.bin`, mixed in
-  `source/reimpl/gmp_audio.c`/`source/reimpl/soundpack.c`) are implemented in code but
-  **don't come through on hardware** — no music, no crash/nitro/UI sound effects, just the
-  car engine. Root cause not yet isolated (the code compiles and the mixer/pool logic runs,
-  so this needs a fresh diagnosis pass against a real audio log, not another blind fix).
-- **Graphical errors while textures load**: visible glitches/corruption tied to texture
-  streaming during gameplay, separate from the vehicle-window issue below. Under active
-  investigation.
-- **Aggressive, frequent FPS drops during races**: frame pacing swings from a low-30s
-  ceiling down to single digits mid-race, independent of the loading-screen stalls (see
-  `port_progress.md`). A likely contributor (over-eager scene culling bypass) was split out
-  behind the `RENDER_SCENE_CULLING_BYPASS` CMake option, but this has **not yet been
-  confirmed on hardware** to fix the drops.
-- **World geometry pop-in**: houses, trees, and road signs used to render at a very short
-  distance and pop in right next to the car; a fix is in place (`port_progress.md`, Bug
-  #041) but unverified on hardware.
-- **In-race pause menu is broken**: the engine looks up its own pause-menu buttons
-  (`menu_main`, `back_btn_main`, `custom_controls_btn`) by name and doesn't find them in this
-  build's HUD/profile variant, so their visibility never updates correctly. A crash-avoidance
-  guard is in place (Bugs #026–#028), but the menu itself still needs its underlying cause
-  fixed — see `port_progress.md`.
-- **Elements intermittently disappear during races** (including the player's car): confirmed
-  via on-device diagnostics to correlate with real, CPU-bound multi-second stalls inside the
-  engine's mesh-batching code (`CBatchDriver::thisAppendBatch`). Root cause narrowed down;
-  actual fix still pending a dedicated reverse-engineering pass (see the Log 047 entry in
-  `port_progress.md`).
-- **Graphical glitch on vehicle windows**: caused by a car-reflection texture
-  (`*_Fixed.PVRTC4.tga`) that was never extracted from the original APK data — a missing-asset
-  issue, not a code bug.
-
-None of this is a "just needs polish" situation yet — treat this port as a debugging target,
-not a playable release. See [`RELEASES.md`](RELEASES.md) and `port_progress.md` for the full,
-evidence-backed status of every issue above.
+- **Frame rate in races**: races run at about 20–30 fps (median ~27 fps on hardware). The
+  engine is CPU-bound. The draw distance uses the game's original LOD value (0.4), so some
+  far-away scenery still pops in.
+- **Elements may briefly disappear during races** (including the player's car) during
+  engine stalls in its mesh-batching code. Not seen in recent tests, but not fixed yet.
+- **Game data mapping**: the game's Flash screens come from unnamed `.dat` files and were
+  matched by content (see the note in the installation steps). If a screen looks wrong or
+  crashes, check its mapping first.
 
 ---
 
@@ -137,6 +105,16 @@ To run this port on your PS Vita or PS TV, you will need:
    `libasphalt6.so` from the APK's hidden `copy.inject` archive and prepare the asset files —
    open the toolkit and select "Continuar con un port existente" pointing at this folder.
 4. Transfer the resulting game data to `ux0:data/asphalt6/` via FTP or USB using VitaShell.
+
+> **Important — pause menu file:** the game's Flash screens are stored in the APK as unnamed
+> `fileNNNNNN.dat` chunks. The pause menu must be `data/178igMenu.swf` created from
+> **`file000632.dat`** (restore the first 4 bytes by subtracting 1, 2, 3, 4 from each).
+> Older setups used `file000353.dat` for it, which is a different screen (a HUD/tutorial
+> overlay): with that file the in-race pause menu does not work. If you prepared your data
+> with an older version, replace that file.
+>
+> Also needed: `data/178info_menu.swf` from **`file000338.dat`** (same byte fix). Without it,
+> the Info/Exit screen of the main menu crashes the game.
 
 ### Final File Structure in `ux0:data/asphalt6/`
 

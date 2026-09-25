@@ -932,7 +932,7 @@ static void video_log_startup_benchmark(void) {
 // ---------------------------------------------------------------------------
 
 struct FrameSlot {
-    unsigned short *rgb;
+    unsigned char  *yuv;      // Y (w*h) + U (w/2*h/2) + V (w/2*h/2), packed, no stride
     unsigned        cap;      // bytes actually allocated
     unsigned        w, h;
     int64_t         pts_us;
@@ -1026,7 +1026,7 @@ static bool ring_push(const AVFrame *f, int64_t pts_us) {
     unsigned h = ((unsigned) f->height) & ~1u;
     if (!w || !h)
         return false;
-    unsigned need = w * h * (unsigned) sizeof(unsigned short);
+    unsigned need = w * h + 2 * ((w / 2) * (h / 2));
 
     while (ring_count() >= P.nslots) {
         if (P.quit)
@@ -1038,20 +1038,27 @@ static bool ring_push(const AVFrame *f, int64_t pts_us) {
 
     FrameSlot *s = &P.slots[P.tail];
     if (s->cap < need) {
-        free(s->rgb);
-        s->rgb = (unsigned short *) malloc(need);
-        s->cap = s->rgb ? need : 0;
+        free(s->yuv);
+        s->yuv = (unsigned char *) malloc(need);
+        s->cap = s->yuv ? need : 0;
     }
-    if (!s->rgb) {
-        l_error("video: out of memory for a %ux%u RGB565 frame slot", w, h);
+    if (!s->yuv) {
+        l_error("video: out of memory for a %ux%u YUV420P frame slot", w, h);
         return false;
     }
 
+    // La conversion YUV->RGB la hace el GPU (textura VGL_YUV420P_BT601 en
+    // draw_video_frame); aca solo se empaquetan los 3 planos sin stride. La
+    // conversion NEON costaba ~24 ms/frame a 427x240 (log 072) y era el cuello.
     uint64_t t0 = (uint64_t) now_us();
-    yuv420p_planar_to_rgb565(f->data[0], f->linesize[0],
-                              f->data[1], f->linesize[1],
-                              f->data[2], f->linesize[2],
-                              w, h, s->rgb);
+    unsigned hw = w / 2, hh = h / 2;
+    unsigned char *dy = s->yuv, *du = dy + w * h, *dv = du + hw * hh;
+    for (unsigned y = 0; y < h; y++)
+        memcpy(dy + y * w, f->data[0] + y * f->linesize[0], w);
+    for (unsigned y = 0; y < hh; y++) {
+        memcpy(du + y * hw, f->data[1] + y * f->linesize[1], hw);
+        memcpy(dv + y * hw, f->data[2] + y * f->linesize[2], hw);
+    }
     P.convert_us += (uint64_t) now_us() - t0;
 
     s->w = w;
@@ -1168,7 +1175,9 @@ static bool gFirstDrawLogged = false;
  * reason above. The NEON conversion this uses instead costs a few ms on a
  * core that is otherwise idle during an intro video.)
  */
-static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned h) {
+static void present_texture_quad(GLuint tex, unsigned w, unsigned h);
+
+static void draw_video_frame(const unsigned char *yuv, unsigned w, unsigned h) {
     FIRST_DRAW_LOG("video: draw_video_frame ENTER (%ux%u)", w, h);
 
     uint64_t t_upload0 = (uint64_t) now_us();
@@ -1181,20 +1190,34 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        FIRST_DRAW_LOG("video: about to glTexImage2D (%ux%u, RGB565)...", w, h);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, (GLsizei) w, (GLsizei) h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
-        FIRST_DRAW_LOG("video: glTexImage2D returned (err=0x%04x)", glGetError());
         gVideoTexW = w;
         gVideoTexH = h;
     }
     glBindTexture(GL_TEXTURE_2D, gVideoTex);
-    FIRST_DRAW_LOG("video: about to glTexSubImage2D...");
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) w, (GLsizei) h, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, rgb565);
-    FIRST_DRAW_LOG("video: glTexSubImage2D returned (err=0x%04x)", glGetError());
+    // Textura planar YUV420P: vitaGL (re)aloca el storage y el GPU convierte a RGB
+    // al samplear (SCE_GXM_TEXTURE_FORMAT_YUV420P3_CSC0). Sin glTexSubImage2D para
+    // formatos planares, se sube el frame completo cada vez.
+    FIRST_DRAW_LOG("video: about to glCompressedTexImage2D (%ux%u, YUV420P_BT601)...", w, h);
+    GLsizei yuv_size = (GLsizei) (w * h + 2 * ((w / 2) * (h / 2)));
+    glCompressedTexImage2D(GL_TEXTURE_2D, 0, VGL_YUV420P_BT601, (GLsizei) w, (GLsizei) h, 0, yuv_size, yuv);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    FIRST_DRAW_LOG("video: glCompressedTexImage2D returned (err=0x%04x)", glGetError());
 
     uint64_t t_draw0 = (uint64_t) now_us();
     P.upload_us += t_draw0 - t_upload0;
 
+    present_texture_quad(gVideoTex, w, h);
+
+    P.draw_us += (uint64_t) now_us() - t_draw0;
+}
+
+/**
+ * @brief Dibuja `tex` (w x h) como quad letterboxed a pantalla completa y hace swap,
+ * guardando/restaurando el estado GL que el motor espera. Compartido por los frames de
+ * video y por la pantalla de carga (video_show_loading_screen).
+ */
+static void present_texture_quad(GLuint tex, unsigned w, unsigned h) {
     float srcAspect = (float) w / (float) h;
     float dstAspect = (float) VIDEO_TARGET_W / (float) VIDEO_TARGET_H;
     float qx0 = 0, qy0 = 0, qx1 = VIDEO_TARGET_W, qy1 = VIDEO_TARGET_H;
@@ -1251,7 +1274,7 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     FIRST_DRAW_LOG("video: viewport/disables done");
 
     glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, gVideoTex);
+    glBindTexture(GL_TEXTURE_2D, tex);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
@@ -1308,8 +1331,6 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
 
     FIRST_DRAW_LOG("video: GL state restored");
     gFirstDrawLogged = true;
-
-    P.draw_us += (uint64_t) now_us() - t_draw0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,13 +1650,14 @@ void video_init() {
     pthread_mutex_init(&P.ring_lock, NULL);
     pthread_mutex_init(&P.aq_lock, NULL);
     l_success("video: FFmpeg software decoder ready (%s).", av_version_info());
-    video_log_startup_benchmark();
+    // video_log_startup_benchmark() ya no se llama: medía la conversión NEON que el
+    // GPU reemplazó, y sus 16 conversiones de prueba costaban ~780 ms en negro al arrancar.
 }
 
 static void free_frame_slots(void) {
     for (int i = 0; i < VIDEO_FRAME_SLOTS; i++) {
-        free(P.slots[i].rgb);
-        P.slots[i].rgb = NULL;
+        free(P.slots[i].yuv);
+        P.slots[i].yuv = NULL;
         P.slots[i].cap = 0;
     }
 }
@@ -2020,7 +2042,7 @@ void video_play(const char *name) {
                 }
             }
 
-            draw_video_frame(s->rgb, s->w, s->h);
+            draw_video_frame(s->yuv, s->w, s->h);
             P.presented++;
             last_present_us = now_us();
 
@@ -2081,4 +2103,43 @@ cleanup:
     P.presenting = false;
 
     l_success("video: %s (%s)", skipped ? "skipped" : "finished", path);
+}
+
+/*
+ * Pantalla de carga entre el intro y el primer frame del motor. Tras el video,
+ * GameRenderer_nativeInit bloquea el hilo principal ~17 s (136 archivos, 39 shaders,
+ * log 076) sin presentar nada: la pantalla quedaba congelada en el último frame del
+ * intro y parecía un cuelgue. `app0:loading.rgb565` es extras/livearea/pic0.png
+ * convertido en build a RGB565 crudo 960x544 (sin decoder de PNG en runtime).
+ */
+void video_show_loading_screen(void) {
+    const unsigned w = 960, h = 544;
+    SceUID fd = sceIoOpen("app0:loading.rgb565", SCE_O_RDONLY, 0);
+    // Si se actualizó solo el eboot.bin (deploy rápido), el VPK viejo no lo trae.
+    if (fd < 0) fd = sceIoOpen(DATA_PATH "loading.rgb565", SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        l_warn("video: no hay app0:loading.rgb565 (0x%08x), sin pantalla de carga", fd);
+        return;
+    }
+    unsigned size = w * h * 2;
+    unsigned short *px = (unsigned short *) malloc(size);
+    int rd = px ? sceIoRead(fd, px, size) : -1;
+    sceIoClose(fd);
+    if (rd != (int) size) {
+        l_warn("video: loading.rgb565 incompleto (%d de %u bytes)", rd, size);
+        free(px);
+        return;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, (GLsizei) w, (GLsizei) h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, px);
+    free(px);
+    // Varios swaps: que todos los buffers de la cadena de presentación tengan la imagen.
+    for (int i = 0; i < 3; i++)
+        present_texture_quad(tex, w, h);
+    glDeleteTextures(1, &tex);
+    l_info("video: pantalla de carga presentada");
 }

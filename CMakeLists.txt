@@ -107,6 +107,17 @@ if (RENDER_SCENE_CULLING_BYPASS)
   add_definitions(-DRENDER_SCENE_CULLING_BYPASS)
 endif()
 
+# Bug #046: CCommonGLDriver::endScene() del motor llama glFlush() una vez por escena, justo
+# antes del swap (pseudo-C ~845991). En vitaGL glFlush = dirty_framebuffer + scene_reset():
+# cierra la escena sceGxm del display y abre OTRA que vglSwapBuffers cierra enseguida -- una
+# pasada extra de GPU (load/store de color+depth de 960x544) por frame, sin ningun efecto
+# util (vitaGL ya parte la escena solo al cambiar de framebuffer). ON = glFlush es no-op
+# mientras el framebuffer bindeado sea el display (0); con un FBO bindeado se deja pasar.
+option(GL_FLUSH_DISPLAY_NOOP "glFlush no-op sobre el framebuffer de display (evita una escena GXM extra por frame)" ON)
+if (GL_FLUSH_DISPLAY_NOOP)
+  add_definitions(-DGL_FLUSH_DISPLAY_NOOP)
+endif()
+
 # Unique debug definition for loader's logging to not interfere with anything
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_definitions(-DDEBUG_SOLOADER)
@@ -152,6 +163,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/utils/settings.c
                source/utils/utils.c
                source/utils/watchdog.c
+               source/utils/perf.c
                lib/falso_jni/FalsoJNI.c
                lib/falso_jni/FalsoJNI_ImplBridge.c
                lib/falso_jni/FalsoJNI_Logger.c
@@ -281,6 +293,7 @@ vita_create_vpk(${VITA_VPKNAME}.vpk ${VITA_TITLEID} eboot.bin
                 VERSION ${VITA_VERSION}
                 NAME ${VITA_APP_NAME}
                 FILE ${CMAKE_SOURCE_DIR}/extras/cpuinfo cpuinfo
+                ${CMAKE_SOURCE_DIR}/extras/loading.rgb565 loading.rgb565
                 ${CMAKE_SOURCE_DIR}/extras/meminfo meminfo
                 ${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png sce_sys/icon0.png
                 ${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png sce_sys/pic0.png
