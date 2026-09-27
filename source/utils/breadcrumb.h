@@ -94,6 +94,10 @@ void bc_spin_strcmp(void);
 /** Total de strcmp()/strncmp()/memcmp() del .so desde el arranque. */
 unsigned bc_spin_strcmp_count(void);
 
+/** Contador barato de pthread_mutex_lock() del .so (sin syscalls), para medir su peso. */
+void bc_spin_mutex(void);
+unsigned bc_spin_mutex_count(void);
+
 /**
  * @brief Contador barato de gettimeofday()/clock_gettime() del .so, sin syscalls.
  *

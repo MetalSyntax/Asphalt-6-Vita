@@ -1290,8 +1290,24 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 			}
 		}
 #ifndef STRICT_DRAW_COMPLIANCE
-		if (is_packed && (!(cur_vao->vertex_attrib_offsets[p->attr_map[0]] + streams[0].stride > cur_vao->vertex_attrib_offsets[p->attr_map[1]] && cur_vao->vertex_attrib_offsets[p->attr_map[1]] > cur_vao->vertex_attrib_offsets[p->attr_map[0]])))
-			is_packed = GL_FALSE;
+		// The old check only compared attr_map[0] and [1], so planar layouts
+		// (attributes in separate regions, offsets far beyond one stride, e.g.
+		// 0/12/3812/3820/3832) were treated as packed and the single copy below
+		// missed the distant attributes. For client arrays, require every
+		// attribute to fit within one stride of the lowest offset.
+		if (is_packed && !is_full_vbo) {
+			uint32_t minoff = cur_vao->vertex_attrib_offsets[p->attr_map[0]];
+			for (int i = 1; i < p->attr_num; i++) {
+				uint32_t o = cur_vao->vertex_attrib_offsets[p->attr_map[i]];
+				if (o < minoff) minoff = o;
+			}
+			for (int i = 0; i < p->attr_num; i++) {
+				if (cur_vao->vertex_attrib_offsets[p->attr_map[i]] - minoff >= (uint32_t)streams[0].stride) {
+					is_packed = GL_FALSE;
+					break;
+				}
+			}
+		}
 	} else if (!target_vbo)
 		is_full_vbo = GL_FALSE;
 #endif
@@ -1353,22 +1369,35 @@ GLboolean _glDrawElements_CustomShadersIMPL(uint16_t *idx_buf, GLsizei count, ui
 				handle_packed_vbo_attrib();
 			}
 		} else {
+			// attr_map[0] is not necessarily the lowest offset: some meshes are
+			// interleaved as [TexCoord@0, Color@8, Position@12], so using it as
+			// the base underflowed the other offsets. Use the real minimum.
+			// (9mm-vita vitaGL 3c2efff, same Glitch engine)
+			uint32_t base_off = cur_vao->vertex_attrib_offsets[p->attr_map[0]];
+			for (int i = 1; i < p->attr_num; i++) {
+				uint32_t o = cur_vao->vertex_attrib_offsets[p->attr_map[i]];
+				if (o < base_off) base_off = o;
+			}
 #ifdef SAFER_DRAW_SPEEDHACK
 			if (top_idx * streams[0].stride > SAFE_DRAW_SIZE_THRESHOLD) {
 				vgl_log_speedhack_bypass("elements packed", top_idx * streams[0].stride);
-				ptrs[0] = (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]];
+				ptrs[0] = (void *)base_off;
 			} else
 #endif
 			{
 				ptrs[0] = gpu_alloc_mapped_temp(top_idx * streams[0].stride);
-				vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[p->attr_map[0]], top_idx * streams[0].stride);
+				vgl_fast_memcpy(ptrs[0], (void *)base_off, top_idx * streams[0].stride);
 			}
 			for (int i = 0; i < p->attr_num; i++) {
 				uint8_t attr_idx = p->attr_map[i];
 				attributes[i].regIndex = p->attr[attr_idx].regIndex;
-				handle_packed_attrib();
+				if (cur_vao->vertex_attrib_state & (1 << attr_idx)) {
+					attributes[i].offset = cur_vao->vertex_attrib_offsets[attr_idx] - base_off;
+				} else {
+					disable_draw_attrib(i)
+				}
 			}
-		}	
+		}
 	} else {
 		for (int i = 0; i < p->attr_num; i++) {
 			uint8_t attr_idx = p->attr_map[i];
@@ -1732,6 +1761,24 @@ void glShaderSource(GLuint handle, GLsizei count, const GLchar *const *string, c
 
 	for (int i = 0; i < count; i++) {
 		strncat(s->source, string[i], lengths[i]);
+	}
+
+	// Some GLSL shaders define their own lerp(), which collides with the Cg
+	// builtin of the same name: SceShaccCg rejects the redefinition and the
+	// shader fails to compile, leaving post-process passes bright magenta.
+	// GLSL has no builtin lerp (it is mix), so any lerp here belongs to the
+	// shader itself and can be renamed. Same length, different case, so the
+	// vitaGL prelude's "#define mix(a,b,c) lerp(a,b,c)" is left untouched.
+	{
+		char *p = s->source;
+		while ((p = strstr(p, "lerp")) != NULL) {
+			char b = (p == s->source) ? 0 : p[-1];
+			char a = p[4];
+			int wb = !((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_')
+			      && !((a >= 'A' && a <= 'Z') || (a >= 'a' && a <= 'z') || (a >= '0' && a <= '9') || a == '_');
+			if (wb) p[0] = 'L';
+			p += 4;
+		}
 	}
 
 	s->size = size - 1;
@@ -2194,12 +2241,20 @@ void glLinkProgram(GLuint progr) {
 			}
 			vgl_free(p->glsl_attr_map);
 			p->glsl_attr_map = NULL;
+			p->num_glsl_attr = 0; // otherwise a re-bind after link keeps stale entries
 		}
 		glsl_sema_mode = VGL_MODE_POSTPONED;
 	}
 
 	if (p->status == PROG_LINKED) {
 		vgl_log("%s:%d: %s: A program has been re-linked. vitaGL doesn't support re-linking, glitches may happen.\n", __FILE__, __LINE__, __func__);
+		return;
+	}
+
+	// If either shader failed to compile, the reflection below dereferences a
+	// null program inside sceGxm. Bail out instead: the program is unusable,
+	// but the caller gets a clean failure rather than a data abort.
+	if (!p->vshader->prog || !p->fshader->prog) {
 		return;
 	}
 	p->status = PROG_LINKED;
@@ -3246,10 +3301,22 @@ void glBindAttribLocation(GLuint prog, GLuint index, const GLchar *name) {
 	
 	// If we use VGL_MODE_POSTPONED, we perform attributes binding in glLinkProgram
 	if (glsl_sema_mode == VGL_MODE_POSTPONED && p->vshader->is_glsl) {
+		// An engine may bind well over VERTEX_ATTRIBS_NUM attribute names per
+		// program (position, normal, TexCoord0-N, binormal, tangent, blend...).
+		// In postponed mode they all have to be kept, since the real
+		// glBindAttribLocation at link time is what discards the ones the shader
+		// does not use; capping at 16 dropped attributes that were in use.
+		#define GLSL_ATTR_MAP_MAX 64
 		if (!p->glsl_attr_map)
-			p->glsl_attr_map = vglMalloc(sizeof(attr_mapping) * VERTEX_ATTRIBS_NUM);
+			p->glsl_attr_map = vglMalloc(sizeof(attr_mapping) * GLSL_ATTR_MAP_MAX);
+		if (p->num_glsl_attr >= GLSL_ATTR_MAP_MAX) {
+			vgl_log("glBindAttribLocation: attribute map full (attr \"%s\")\n", name);
+			return;
+		}
 		p->glsl_attr_map[p->num_glsl_attr].idx = index;
-		strcpy(p->glsl_attr_map[p->num_glsl_attr++].name, name);
+		strncpy(p->glsl_attr_map[p->num_glsl_attr].name, name, 63);
+		p->glsl_attr_map[p->num_glsl_attr].name[63] = 0;
+		p->num_glsl_attr++;
 		return;
 	}
 

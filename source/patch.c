@@ -802,7 +802,7 @@ static uint32_t g_resume_c1, g_resume_c2, g_resume_rm, g_resume_grid,
                 g_skip_strdrop1, g_skip_strdrop2,
                 g_resume_carseed, g_resume_carfind, g_skip_carfind,
                 g_resume_stars, g_skip_stars,
-                g_resume_packfile, g_skip_packfile,
+                g_resume_packfile, g_skip_packfile, g_ret_packfile,
                 g_resume_menucar, g_skip_menucar, g_emu_menucar,
                 g_resume_cxathrow, g_resume_sconstruct,
                 g_resume_getlang, g_resume_setlang,
@@ -1230,8 +1230,56 @@ void carseed_applied(uint32_t race_car, uint32_t array) {
             (unsigned)race_car, (unsigned)array);
 }
 
-void packfile_null(void) {
-    l_error("[patch] PackFileNull: createAndOpenFile devolvio NULL, retorno limpio (Bug #021)");
+/*
+ * Bug #052 (log 086 + dump 1790471729): data abort en PhysicCar::PhysicCar+0x330
+ * (0x4cf2e4, `ldr r3,[r5]`, r5 = GetPackFile() = NULL) al darle "Siguiente" tras
+ * ganar una carrera. Mismo sitio que el #050, pero ahora el indice de auto es VALIDO
+ * (sl = 4): el pack de ESE auto no abre en estos datos. El log ya lo anunciaba al
+ * arrancar: InitCarMng abre los packs de los autos 0-3 y 5+, y justo entre file000177
+ * y file000122 sale el unico PackFileNull de la corrida -> el auto 4. La siguiente
+ * carrera lo trae como rival y PhysicCar desreferencia el NULL sin chequeo.
+ *
+ * Fix: en vez de devolver NULL, GetPackFile se reintenta con el ultimo auto cuyo pack
+ * SI abrio (sustituto fijo por auto, para que stats de InitCarMng y fisica de carrera
+ * coincidan). El indice de auto ya no esta en ningun registro en 0x48DA84 (r4 se piso
+ * con el IReadFile*): lo deja hook_getpackfilename en g_last_pack_off (offset
+ * idx * 0x1C8 del array de autos), que se llama justo antes desde 0x48DA44. El nombre
+ * del pack sigue vivo en [sp,#16] (el string COW comparte buffer con packNames, el
+ * release de 0x48DA70 solo baja el refcount), asi que se loguea para poder arreglar
+ * los datos. Guarda de recursion: la llamada interna pasa otra vez por hook_packfile.
+ */
+#define CAR_INFO_STRIDE 0x1C8u
+uint32_t g_last_pack_off = UINT32_MAX, g_good_pack_off = UINT32_MAX;
+
+void *packfile_fallback(void *mgr, int pack_idx, const char *name) {
+    static int depth, logged;
+    static uint8_t subst[128]; // indice sustituto + 1 (0 = sin asignar)
+    uint32_t off = g_last_pack_off;
+    if (depth || off == UINT32_MAX || off % CAR_INFO_STRIDE)
+        return NULL;
+    int car = (int)(off / CAR_INFO_STRIDE);
+    int sub = -1;
+    if (car < (int)sizeof(subst) && subst[car])
+        sub = subst[car] - 1;
+    else if (g_good_pack_off != UINT32_MAX)
+        sub = (int)(g_good_pack_off / CAR_INFO_STRIDE);
+    if (sub < 0 || sub == car) {
+        l_error("[patch] PackFileNull: auto %d pack %d ('%.64s') no abre y no hay sustituto (Bug #021/#052)",
+                car, pack_idx, name ? name : "?");
+        return NULL;
+    }
+    if (car < (int)sizeof(subst))
+        subst[car] = (uint8_t)(sub + 1);
+
+    void *(* get_pack_file)(void *, int, int) =
+        (void *(*)(void *, int, int))(so_mod.text_base + 0x48D9D8u);
+    depth++;
+    void *f = get_pack_file(mgr, sub, pack_idx);
+    depth--;
+    if (logged++ < 16)
+        l_error("[patch] PackFileNull: auto %d pack %d ('%.64s') no abre -> se usa el pack del auto %d (%s, Bug #052)",
+                car, pack_idx, name ? name : "?", sub, f ? "ok" : "tambien NULL");
+    return f;
 }
 
 void menucar_null(void) {
@@ -1325,24 +1373,40 @@ static void hook_stars(void) {
 __attribute__((naked, target("arm")))
 static void hook_packfile(void) {
     __asm__ volatile(
-        "add r1, sp, #0x18\n"     // emu
-        "mov r5, #0\n"            // emu
         "cmp r4, #0\n"
-        "bne 2f\n"
+        "beq 2f\n"
+        // exito: este auto es sustituto valido para los que no abran (Bug #052).
+        // r1/r5 estan muertos aca (los pisa la emulacion de abajo).
+        "ldr r12, 5f\n"
+        "ldr r5, [r12]\n"
+        "ldr r12, 6f\n"
+        "str r5, [r12]\n"
+        "add r1, sp, #0x18\n"    // emu
+        "mov r5, #0\n"           // emu
+        "ldr r12, 3f\n"
+        "ldr pc, [r12]\n"
+        "2:\n"
         "push {r0-r3, r12, lr}\n"
         "ldr r0, 1f\n"
         "mov r1, #0\n"
         "bl bc_event\n"
-        "bl packfile_null\n"
+        "mov r0, r6\n"           // this (BaseCarManager*)
+        "mov r1, r7\n"           // indice de pack
+        "ldr r2, [sp, #40]\n"    // [sp_funcion,#16] = datos del nombre del pack
+        "bl packfile_fallback\n"
+        "mov r4, r0\n"
         "pop {r0-r3, r12, lr}\n"
-        "ldr r12, 4f\n"
-        "ldr pc, [r12]\n"         // -> 0x48DB84 (mov r4,#0 + epilogo propio)
-        "2:\n"
-        "ldr r12, 3f\n"
-        "ldr pc, [r12]\n"
+        "cmp r4, #0\n"
+        "ldreq r12, 4f\n"
+        "ldreq pc, [r12]\n"      // -> 0x48DB84 (mov r4,#0 + epilogo propio)
+        "ldr r12, 7f\n"
+        "ldr pc, [r12]\n"        // -> 0x48DB88 (mov r0,r4 + epilogo): pack sustituto
         "1: .word s_tr_packfile\n"
         "3: .word g_resume_packfile\n"
         "4: .word g_skip_packfile\n"
+        "5: .word g_last_pack_off\n"
+        "6: .word g_good_pack_off\n"
+        "7: .word g_ret_packfile\n"
     );
 }
 
@@ -1838,6 +1902,8 @@ void packfilename_null(void) {
 __attribute__((naked, target("arm")))
 static void hook_getpackfilename(void) {
     __asm__ volatile(
+        "ldr r12, 4f\n"          // Bug #052: recordar idx*0x1C8 para hook_packfile
+        "str r2, [r12]\n"
         "ldr r4, [r3, r2]\n"     // emu
         "cmp r4, #0\n"
         "bne 1f\n"
@@ -1856,6 +1922,7 @@ static void hook_getpackfilename(void) {
         "ldr pc, [r12]\n"         // resume en 0x48D36C
         "2: .word g_empty_rep_data\n"
         "3: .word g_resume_getpackfilename\n"
+        "4: .word g_last_pack_off\n"
     );
 }
 
@@ -2100,6 +2167,7 @@ void so_patch(void) {
     g_skip_stars = (uint32_t)(so_mod.text_base + 0x462AE0u);
     hook_trace(OFF_STARS, W_CMP_R4R0, W2_MOVGT_R0, hook_stars, 0, &g_resume_stars, NULL);
     g_skip_packfile = (uint32_t)(so_mod.text_base + 0x48DB84u);
+    g_ret_packfile = (uint32_t)(so_mod.text_base + 0x48DB88u);
     hook_trace(OFF_PACKFILE, W_ADD_R1SP, W2_MOV_R5_0, hook_packfile, 0, &g_resume_packfile, NULL);
     g_skip_menucar = (uint32_t)(so_mod.text_base + 0x3EF040u);
     hook_trace(OFF_MENUCAR, W_LDR_R3_3C, W2_LDR_R1PC, hook_menucar, 0x3EF460u, &g_resume_menucar, &g_emu_menucar);

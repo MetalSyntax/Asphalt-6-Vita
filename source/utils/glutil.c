@@ -520,6 +520,51 @@ static void gl_blend_draw_check(const char *who, GLsizei count) {
     }
 }
 
+/*
+ * Subidas de textura grandes en carrera (log 086): cada 5-10 s aparece un
+ * `texup 1x 16384KiB ~65ms` (hasta 6 seguidas = 417 ms) en pleno juego, sin ninguna
+ * carga de archivo cerca -- son los tirones que se notan como "bajones de FPS". Se
+ * loguean (con tope) tamano, formatos, si trae pixeles, textura bindeada y quien llama,
+ * para saber que las genera. Ademas, glTexImage2D(NULL) con la MISMA especificacion
+ * que ya tiene la textura (re-especificar un render target cada tanto) se saltea: el
+ * contenido tras un glTexImage2D(NULL) es indefinido por spec, asi que conservar el
+ * almacenamiento actual es valido y evita liberar/reservar VRAM a mitad de frame.
+ */
+#define BIG_TEXUP_PIXELS (1024u * 1024u)
+#define BIG_TEXUP_SLOW_US 20000u
+#define BIG_TEXUP_LOG_CAP 24
+#define TEXSPEC_SLOTS 32
+
+typedef struct { GLuint tex; GLsizei w, h; GLint ifmt; GLenum fmt, type; } texspec_t;
+static texspec_t s_texspec[TEXSPEC_SLOTS];
+static unsigned s_texspec_next = 0;
+static int s_big_texup_logged = 0;
+
+static GLuint bound_tex2d(void) {
+    GLint t = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &t);
+    return (GLuint)t;
+}
+
+static texspec_t *texspec_find(GLuint tex) {
+    for (unsigned i = 0; i < TEXSPEC_SLOTS; i++)
+        if (s_texspec[i].tex == tex) return &s_texspec[i];
+    return NULL;
+}
+
+static void big_texup_log(const char *who, GLuint tex, GLsizei w, GLsizei h, GLint ifmt,
+                          GLenum fmt, GLenum type, const void *pixels, uint32_t us,
+                          const void *ra, const char *what) {
+    if (s_big_texup_logged >= BIG_TEXUP_LOG_CAP) return;
+    s_big_texup_logged++;
+    uint32_t r = (uint32_t)(uintptr_t)ra;
+    l_error("[texup] %s tex=%u %dx%d ifmt=0x%x fmt=0x%x type=0x%x pixels=%s %u.%03u ms frame=%u %s=0x%X%s",
+            who, (unsigned)tex, (int)w, (int)h, (unsigned)ifmt, (unsigned)fmt, (unsigned)type,
+            pixels ? "si" : "NULL", (unsigned)(us / 1000), (unsigned)(us % 1000), gl_swap_count,
+            bc_in_so(r) ? "so+" : "ra", bc_in_so(r) ? (unsigned)(r - 0x98000000u) : (unsigned)r,
+            what ? what : "");
+}
+
 void glPixelStorei_soloader(GLenum pname, GLint param) {
     if (pname == 0x0D05 || pname == 0x0CF5) return;
     glPixelStorei(pname, param);
@@ -561,10 +606,33 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
         default:
             break;
     }
+    int big = target == GL_TEXTURE_2D && level == 0 &&
+              (uint32_t)width * (uint32_t)height >= BIG_TEXUP_PIXELS;
+    GLuint tex = 0;
+    if (big) {
+        tex = bound_tex2d();
+        texspec_t *ts = texspec_find(tex);
+        if (!pixels && ts && ts->w == width && ts->h == height && ts->ifmt == internalformat &&
+            ts->fmt == format && ts->type == type) {
+            big_texup_log("glTexImage2D", tex, width, height, internalformat, format, type,
+                          pixels, 0, BC_RA, " (misma especificacion, se saltea)");
+            return;
+        }
+        if (!ts) {
+            ts = &s_texspec[s_texspec_next++ % TEXSPEC_SLOTS];
+            ts->tex = tex;
+        }
+        ts->w = width; ts->h = height; ts->ifmt = internalformat;
+        ts->fmt = format; ts->type = type;
+    }
     uint32_t _pt = perf_now();
     glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    uint32_t _us = perf_now() - _pt;
     perf_add(PERF_TEXUP, _pt);
     g_perf_texup_bytes += (uint32_t)width * (uint32_t)height * 4u; // aprox (RGBA8)
+    if (big || _us >= BIG_TEXUP_SLOW_US)
+        big_texup_log("glTexImage2D", big ? tex : bound_tex2d(), width, height, internalformat,
+                      format, type, pixels, _us, BC_RA, NULL);
 }
 
 /*
@@ -603,8 +671,12 @@ void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint y
     BC_SCOPE("glTexSubImage2D");
     uint32_t _pt = perf_now();
     glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+    uint32_t _us = perf_now() - _pt;
     perf_add(PERF_TEXUP, _pt);
     g_perf_texup_bytes += (uint32_t)width * (uint32_t)height * 4u; // aprox
+    if ((uint32_t)width * (uint32_t)height >= BIG_TEXUP_PIXELS || _us >= BIG_TEXUP_SLOW_US)
+        big_texup_log("glTexSubImage2D", bound_tex2d(), width, height, 0, format, type,
+                      pixels, _us, BC_RA, NULL);
 }
 
 void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
@@ -632,6 +704,12 @@ void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internal
 
 void glDeleteTextures_soloader(GLsizei n, const GLuint *textures) {
     BC_SCOPE("glDeleteTextures");
+    // El id se puede reutilizar para una textura nueva sin almacenamiento: olvidar su
+    // especificacion para que el atajo de glTexImage2D(NULL) no la saltee.
+    for (GLsizei k = 0; textures && k < n; k++) {
+        texspec_t *ts = texspec_find(textures[k]);
+        if (ts) ts->tex = 0, ts->w = 0;
+    }
     glDeleteTextures(n, textures);
 }
 
@@ -641,7 +719,9 @@ void glGenTextures_soloader(GLsizei n, GLuint *textures) {
 }
 
 void glBindTexture_soloader(GLenum target, GLuint texture) {
-    BC_SCOPE("glBindTexture");
+#ifdef TRACE_GL_CALLS
+    BC_SCOPE("glBindTexture"); // cientos por frame: solo con la traza fina prendida
+#endif
     glBindTexture(target, texture);
 }
 

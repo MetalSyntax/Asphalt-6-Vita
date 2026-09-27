@@ -21,7 +21,6 @@
 #include "utils/utils.h"
 #include "utils/watchdog.h"
 
-#define PTHR_MAX_OBJECTS 1024
 
 #define BIONIC_PTHREAD_COND_INITIALIZER              0
 #define BIONIC_PTHREAD_MUTEX_INITIALIZER             0
@@ -41,7 +40,6 @@ enum {
 
 #define PTHR_INLINE static inline __attribute__((always_inline))
 
-void * initializedObjects[PTHR_MAX_OBJECTS] = {0};
 static SceKernelLwMutexWork pthr_mutex;
 static volatile short int pthr_mutex_inited = 0;
 
@@ -61,39 +59,94 @@ static volatile short int pthr_mutex_inited = 0;
         sceKernelUnlockLwMutex(&pthr_mutex, 1); \
     }
 
+/*
+ * Registro de mutex/cond ya inicializados (los de Bionic son 4 bytes que estas
+ * funciones reemplazan por un puntero al objeto real; los estaticos llegan en 0 y se
+ * inicializan en el primer uso).
+ *
+ * Antes era un array lineal de 1024 punteros recorrido ENTERO bajo un LwMutex global
+ * en CADA pthread_mutex_lock/cond_wait del motor: miles de veces por frame, cada una
+ * con hasta 1024 comparaciones y dos llamadas al kernel. Ahora es una tabla hash con
+ * sondeo lineal cuya LECTURA no toma lock (palabras alineadas, atomicas en ARM); solo
+ * alta/baja van bajo el LwMutex. Mismas semanticas que el array: "inicializado" =
+ * puntero presente en la tabla. Las bajas dejan una lapida; cuando las lapidas se
+ * acumulan se reconstruye en la OTRA tabla y se publica con un solo store, asi un
+ * lector que todavia recorre la vieja ve un estado valido.
+ */
+#define PTHR_HASH_SIZE 4096u              // potencia de 2; carga maxima 50%
+#define PTHR_HASH_MASK (PTHR_HASH_SIZE - 1u)
+#define PTHR_TOMBSTONE ((void *) 1)
+
+static void *pthr_table_a[PTHR_HASH_SIZE];
+static void *pthr_table_b[PTHR_HASH_SIZE];
+static void ** volatile pthr_table = pthr_table_a;
+static unsigned pthr_used = 0;            // vivos + lapidas en la tabla actual
+static unsigned pthr_live = 0;
+
+static inline unsigned pthr_hash(const void *p) {
+    return ((uint32_t)(uintptr_t) p * 2654435761u) >> 20; // 12 bits altos
+}
+
 int isObjectInitialized(const void * mut) {
-    PTHR_LOCK
-    for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
-        if (initializedObjects[i] == mut) {
-            PTHR_UNLOCK
-            return 1;
-        }
+    void **t = pthr_table;
+    for (unsigned n = 0, i = pthr_hash(mut); n < PTHR_HASH_SIZE; ++n, i = (i + 1) & PTHR_HASH_MASK) {
+        void *v = __atomic_load_n(&t[i], __ATOMIC_ACQUIRE);
+        if (v == mut) return 1;
+        if (v == NULL) return 0;
     }
-    PTHR_UNLOCK
     return 0;
+}
+
+// Bajo PTHR_LOCK. Reconstruye sin lapidas en la tabla que no esta en uso.
+static void pthr_rehash_locked(void) {
+    void **old = pthr_table;
+    void **nt = (old == pthr_table_a) ? pthr_table_b : pthr_table_a;
+    memset(nt, 0, sizeof(pthr_table_a));
+    unsigned live = 0;
+    for (unsigned j = 0; j < PTHR_HASH_SIZE; ++j) {
+        void *v = old[j];
+        if (v == NULL || v == PTHR_TOMBSTONE) continue;
+        unsigned i = pthr_hash(v);
+        while (nt[i]) i = (i + 1) & PTHR_HASH_MASK;
+        nt[i] = v;
+        live++;
+    }
+    __atomic_store_n(&pthr_table, nt, __ATOMIC_RELEASE);
+    pthr_used = pthr_live = live;
 }
 
 int rememberObject(void * mut) {
     PTHR_LOCK
-    for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
-        if (initializedObjects[i] == 0) {
-            initializedObjects[i] = mut;
-            PTHR_UNLOCK
-            return 1;
-        }
+    if (pthr_live >= PTHR_HASH_SIZE / 2) {
+        PTHR_UNLOCK
+        return 0;
+    }
+    if (pthr_used >= PTHR_HASH_SIZE / 2)
+        pthr_rehash_locked();
+    void **t = pthr_table;
+    unsigned i = pthr_hash(mut);
+    while (t[i] != NULL && t[i] != PTHR_TOMBSTONE && t[i] != mut)
+        i = (i + 1) & PTHR_HASH_MASK;
+    if (t[i] != mut) {
+        if (t[i] == NULL) pthr_used++;
+        __atomic_store_n(&t[i], mut, __ATOMIC_RELEASE);
+        pthr_live++;
     }
     PTHR_UNLOCK
-    return 0;
+    return 1;
 }
 
 int forgetObject(const void * mut) {
     PTHR_LOCK
-    for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
-        if (initializedObjects[i] == mut) {
-            initializedObjects[i] = 0;
+    void **t = pthr_table;
+    for (unsigned n = 0, i = pthr_hash(mut); n < PTHR_HASH_SIZE; ++n, i = (i + 1) & PTHR_HASH_MASK) {
+        if (t[i] == mut) {
+            __atomic_store_n(&t[i], PTHR_TOMBSTONE, __ATOMIC_RELEASE);
+            pthr_live--;
             PTHR_UNLOCK
             return 1;
         }
+        if (t[i] == NULL) break;
     }
     PTHR_UNLOCK
     return 0;
@@ -238,6 +291,13 @@ int pthread_mutex_lock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
     _mutex_t_static_init(mutex, NULL);
+    // Camino rapido sin migas: el motor (y vox) toman mutex miles de veces por frame y
+    // bc_push cuesta dos syscalls + registro en el testigo por cada ENTRA/SALE. Un
+    // cuelgue en un lock siempre es un lock CONTENDIDO, asi que las migas solo se dejan
+    // cuando trylock falla -- el diagnostico de cuelgues queda igual.
+    bc_spin_mutex();
+    if (pthread_mutex_trylock(mutex->real_ptr) == 0)
+        return 0;
     BC_SCOPE("pthread_mutex_lock");
     return pthread_mutex_lock(mutex->real_ptr);
 }

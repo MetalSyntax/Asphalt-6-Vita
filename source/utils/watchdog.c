@@ -152,6 +152,7 @@ static int watchdog_thread(SceSize args, void *argp) {
     unsigned int last_hot = 0;
     unsigned int last_spin = 0;
     unsigned int last_cmp = 0;
+    unsigned int last_mtx = 0;
     unsigned int last_time = 0;
     unsigned int stalled_beats = 0;
 
@@ -162,6 +163,7 @@ static int watchdog_thread(SceSize args, void *argp) {
         unsigned int hot = bc_hot_count();
         unsigned int spin = bc_spin_strstr_count();
         unsigned int cmp = bc_spin_strcmp_count();
+        unsigned int mtx = bc_spin_mutex_count();
         unsigned int time = bc_spin_time_count();
         unsigned int since = (sceKernelGetProcessTimeLow()
                               - atomic_load_explicit(&s_tag_time, memory_order_relaxed)) / 1000;
@@ -173,11 +175,12 @@ static int watchdog_thread(SceSize args, void *argp) {
         // "+N strcmp" cubre parseos (constructAnimator/XML: strcmp por tag, sin malloc
         // visible si opera sobre buffer ya cargado) y "+N gettod" las esperas activas
         // de tiempo (pacing de DisplayFrame con reloj congelado).
-        l_error("[wd] %u frames (+%u en %ds) | +%u reservas +%u strstr +%u strcmp +%u gettod | último hito: %s #%d hace %u ms",
+        l_error("[wd] %u frames (+%u en %ds) | +%u reservas +%u strstr +%u strcmp +%u mutex +%u gettod | último hito: %s #%d hace %u ms",
                 swaps, swaps - last_swaps, WATCHDOG_PERIOD_US / 1000000,
                 hot - last_hot,
                 spin - last_spin,
                 cmp - last_cmp,
+                mtx - last_mtx,
                 time - last_time,
                 atomic_load_explicit(&s_tag, memory_order_relaxed),
                 atomic_load_explicit(&s_value, memory_order_relaxed),
@@ -222,6 +225,7 @@ static int watchdog_thread(SceSize args, void *argp) {
         last_hot = hot;
         last_spin = spin;
         last_cmp = cmp;
+        last_mtx = mtx;
         last_time = time;
     }
 

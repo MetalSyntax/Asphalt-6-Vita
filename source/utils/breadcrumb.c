@@ -71,6 +71,16 @@ unsigned bc_spin_strcmp_count(void) {
     return atomic_load_explicit(&s_spin_strcmp, memory_order_relaxed);
 }
 
+static atomic_uint s_spin_mutex = ATOMIC_VAR_INIT(0);
+
+void bc_spin_mutex(void) {
+    atomic_fetch_add_explicit(&s_spin_mutex, 1, memory_order_relaxed);
+}
+
+unsigned bc_spin_mutex_count(void) {
+    return atomic_load_explicit(&s_spin_mutex, memory_order_relaxed);
+}
+
 static atomic_uint s_spin_time = ATOMIC_VAR_INIT(0);
 
 void bc_spin_time(void) {

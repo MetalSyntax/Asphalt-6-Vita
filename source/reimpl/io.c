@@ -20,6 +20,7 @@
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
+#include <psp2/io/fcntl.h>
 
 #ifdef USE_SCELIBC_IO
 #include <libc_bridge/libc_bridge.h>
@@ -294,6 +295,106 @@ void fcache_invalidate(const char *path) {
     pthread_mutex_unlock(&s_fcache_lock);
 }
 
+/*
+ * Handles con descriptor COMPARTIDO para file00a.bin (143 MB, todo el audio de vox).
+ * vox abre un FILE* propio por cada sonido que arranca (vox::FileLimited sobre fopen):
+ * log 086 = 868 aperturas en la sesion, ~2 por segundo en carrera. Cada una era un
+ * sceIoOpen + sceIoClose a la SD mas un buffer stdio de 64 KB que se llenaba entero
+ * aunque el sonido pesara 8 KB -- tirones de I/O en pleno juego. Ahora el archivo se
+ * abre UNA vez y cada fopen devuelve un handle liviano (posicion propia + buffer de
+ * 16 KB) que lee con sceIoPread, que toma el offset explicito y es seguro entre hilos.
+ * Solo lectura; cubre las mismas funciones stdio que los handles del fcache.
+ */
+#define SHF_SUFFIX "data/file00a.bin"
+#define SHF_MAX_HANDLES 32
+#define SHF_BUF_SIZE (16 * 1024)
+
+typedef struct {
+    int used;
+    long pos;
+    long buf_off;
+    int buf_len;
+    unsigned char buf[SHF_BUF_SIZE];
+} ShfHandle;
+
+static ShfHandle s_shf[SHF_MAX_HANDLES];
+static SceUID s_shf_fd = -1;
+static long s_shf_size = 0;
+static pthread_mutex_t s_shf_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline int shf_is_handle(void *f) {
+    uintptr_t p = (uintptr_t)f;
+    return p >= (uintptr_t)s_shf && p < (uintptr_t)s_shf + sizeof(s_shf);
+}
+
+static FILE *shf_open(const char *filename, const char *mode) {
+    size_t len = strlen(filename), sl = sizeof(SHF_SUFFIX) - 1;
+    if (len < sl || strcmp(filename + len - sl, SHF_SUFFIX) != 0) return NULL;
+    if (strcmp(mode, "r") != 0 && strcmp(mode, "rb") != 0) return NULL;
+
+    FILE *ret = NULL;
+    pthread_mutex_lock(&s_shf_lock);
+    if (s_shf_fd < 0) {
+        SceUID fd = sceIoOpen(filename, SCE_O_RDONLY, 0);
+        if (fd >= 0) {
+            long size = (long)sceIoLseek(fd, 0, SCE_SEEK_END);
+            if (size > 0) {
+                s_shf_fd = fd;
+                s_shf_size = size;
+                l_info("[shf] %s abierto una vez (%ld bytes), fopen sin tocar la SD", filename, size);
+            } else {
+                sceIoClose(fd);
+            }
+        }
+    }
+    if (s_shf_fd >= 0) {
+        for (int i = 0; i < SHF_MAX_HANDLES; i++) {
+            if (!s_shf[i].used) {
+                s_shf[i].used = 1;
+                s_shf[i].pos = 0;
+                s_shf[i].buf_off = 0;
+                s_shf[i].buf_len = 0;
+                ret = (FILE *)&s_shf[i];
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s_shf_lock);
+    return ret; // NULL = pool lleno o sin archivo: fopen normal
+}
+
+static size_t shf_read(void *ptr, size_t size, size_t nmemb, ShfHandle *h) {
+    if (size == 0 || nmemb == 0) return 0;
+    long want = (long)(size * nmemb);
+    long left = s_shf_size - h->pos;
+    if (left <= 0) return 0;
+    if (want > left) want = left - (left % (long)size);
+
+    unsigned char *dst = (unsigned char *)ptr;
+    long done = 0;
+    while (done < want) {
+        long need = want - done;
+        if (h->pos >= h->buf_off && h->pos < h->buf_off + h->buf_len) {
+            long n = h->buf_off + h->buf_len - h->pos;
+            if (n > need) n = need;
+            memcpy(dst + done, h->buf + (h->pos - h->buf_off), (size_t)n);
+            h->pos += n;
+            done += n;
+        } else if (need >= SHF_BUF_SIZE) {
+            int r = sceIoPread(s_shf_fd, dst + done, (SceSize)need, (SceOff)h->pos);
+            if (r <= 0) break;
+            h->pos += r;
+            done += r;
+        } else {
+            int r = sceIoPread(s_shf_fd, h->buf, SHF_BUF_SIZE, (SceOff)h->pos);
+            if (r <= 0) break;
+            h->buf_off = h->pos;
+            h->buf_len = r;
+        }
+    }
+    return (size_t)done / size;
+}
+
 FILE * fopen_soloader(const char * filename, const char * mode) {
     bc_event("fopen", BC_RA);
     if (strcmp(filename, "/proc/cpuinfo") == 0) {
@@ -331,6 +432,9 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
             return cached;
         }
     }
+
+    FILE *shared = shf_open(filename, mode);
+    if (shared) return shared;
 
 #ifdef USE_SCELIBC_IO
     FILE* ret = sceLibcBridge_fopen(filename, mode);
@@ -492,6 +596,12 @@ int stat_soloader(const char * path, stat64_bionic * buf) {
 
 int fclose_soloader(FILE * f) {
     fake_fd_release(f);
+    if (shf_is_handle(f)) {
+        pthread_mutex_lock(&s_shf_lock);
+        ((ShfHandle *)f)->used = 0;
+        pthread_mutex_unlock(&s_shf_lock);
+        return 0;
+    }
     if (fcache_is_handle(f)) {
         pthread_mutex_lock(&s_fcache_lock);
         ((FCacheHandle *)f)->entry_idx = -1;
@@ -517,6 +627,7 @@ int fclose_soloader(FILE * f) {
 
 
 size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *f) {
+    if (shf_is_handle(f)) return shf_read(ptr, size, nmemb, (ShfHandle *)f);
     if (fcache_is_handle(f)) {
         pthread_mutex_lock(&s_fcache_lock);
         FCacheHandle *h = (FCacheHandle *)f;
@@ -550,7 +661,7 @@ size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *f) {
 }
 
 size_t fwrite_soloader(const void *ptr, size_t size, size_t nmemb, FILE *f) {
-    if (fcache_is_handle(f)) {
+    if (fcache_is_handle(f) || shf_is_handle(f)) {
         l_warn("fwrite(%p): refused, read-only cache handle", f);
         return 0;
     }
@@ -562,6 +673,13 @@ size_t fwrite_soloader(const void *ptr, size_t size, size_t nmemb, FILE *f) {
 }
 
 int fseek_soloader(FILE *f, long offset, int whence) {
+    if (shf_is_handle(f)) {
+        ShfHandle *h = (ShfHandle *)f;
+        long base = (whence == SEEK_SET) ? 0 : (whence == SEEK_CUR) ? h->pos : s_shf_size;
+        if (base + offset < 0) return -1;
+        h->pos = base + offset;
+        return 0;
+    }
     if (fcache_is_handle(f)) {
         pthread_mutex_lock(&s_fcache_lock);
         FCacheHandle *h = (FCacheHandle *)f;
@@ -585,6 +703,7 @@ int fseek_soloader(FILE *f, long offset, int whence) {
 }
 
 long ftell_soloader(FILE *f) {
+    if (shf_is_handle(f)) return ((ShfHandle *)f)->pos;
     if (fcache_is_handle(f)) {
         return ((FCacheHandle *)f)->pos;
     }
@@ -608,6 +727,10 @@ off_t ftello_soloader(FILE *f) {
 }
 
 void rewind_soloader(FILE *f) {
+    if (shf_is_handle(f)) {
+        ((ShfHandle *)f)->pos = 0;
+        return;
+    }
     if (fcache_is_handle(f)) {
         pthread_mutex_lock(&s_fcache_lock);
         ((FCacheHandle *)f)->pos = 0;
@@ -618,6 +741,7 @@ void rewind_soloader(FILE *f) {
 }
 
 int feof_soloader(FILE *f) {
+    if (shf_is_handle(f)) return ((ShfHandle *)f)->pos >= s_shf_size;
     if (fcache_is_handle(f)) {
         pthread_mutex_lock(&s_fcache_lock);
         FCacheHandle *h = (FCacheHandle *)f;
@@ -633,7 +757,7 @@ int feof_soloader(FILE *f) {
 }
 
 int ferror_soloader(FILE *f) {
-    if (fcache_is_handle(f)) return 0;
+    if (fcache_is_handle(f) || shf_is_handle(f)) return 0;
 #ifdef USE_SCELIBC_IO
     return sceLibcBridge_ferror(f);
 #else
@@ -642,7 +766,7 @@ int ferror_soloader(FILE *f) {
 }
 
 int fflush_soloader(FILE *f) {
-    if (fcache_is_handle(f)) return 0;
+    if (fcache_is_handle(f) || shf_is_handle(f)) return 0;
 #ifdef USE_SCELIBC_IO
     return sceLibcBridge_fflush(f);
 #else
@@ -651,7 +775,7 @@ int fflush_soloader(FILE *f) {
 }
 
 int fgetc_soloader(FILE *f) {
-    if (fcache_is_handle(f)) {
+    if (fcache_is_handle(f) || shf_is_handle(f)) {
         unsigned char c;
         return fread_soloader(&c, 1, 1, f) == 1 ? (int)c : EOF;
     }
@@ -667,7 +791,7 @@ int getc_soloader(FILE *f) {
 }
 
 int fputc_soloader(int c, FILE *f) {
-    if (fcache_is_handle(f)) {
+    if (fcache_is_handle(f) || shf_is_handle(f)) {
         l_warn("fputc(%p): refused, read-only cache handle", f);
         return EOF;
     }
@@ -683,7 +807,7 @@ int putc_soloader(int c, FILE *f) {
 }
 
 char *fgets_soloader(char *str, int n, FILE *f) {
-    if (fcache_is_handle(f)) {
+    if (fcache_is_handle(f) || shf_is_handle(f)) {
         if (n <= 0) return NULL;
         int i = 0;
         for (; i < n - 1; i++) {
@@ -706,7 +830,7 @@ char *fgets_soloader(char *str, int n, FILE *f) {
 }
 
 int fputs_soloader(const char *str, FILE *f) {
-    if (fcache_is_handle(f)) {
+    if (fcache_is_handle(f) || shf_is_handle(f)) {
         l_warn("fputs(%p): refused, read-only cache handle", f);
         return EOF;
     }
@@ -782,7 +906,7 @@ off_t lseek_soloader(int fd, off_t offset, int whence) {
 }
 
 int setvbuf_soloader(FILE *f, char *buf, int mode, size_t size) {
-    if (fcache_is_handle(f)) return 0;
+    if (fcache_is_handle(f) || shf_is_handle(f)) return 0;
 #ifdef USE_SCELIBC_IO
     return sceLibcBridge_setvbuf(f, buf, mode, size);
 #else
@@ -791,6 +915,12 @@ int setvbuf_soloader(FILE *f, char *buf, int mode, size_t size) {
 }
 
 int ungetc_soloader(int c, FILE *f) {
+    if (shf_is_handle(f)) {
+        ShfHandle *h = (ShfHandle *)f;
+        if (h->pos <= 0) return EOF;
+        h->pos--;
+        return c;
+    }
     if (fcache_is_handle(f)) {
         pthread_mutex_lock(&s_fcache_lock);
         FCacheHandle *h = (FCacheHandle *)f;

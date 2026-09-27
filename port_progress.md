@@ -4712,3 +4712,41 @@ no existía en los datos (la misma que apuntaba el Bug #040). Escaneo de SWF dem
 Log 083 también confirma: RaceCarIdx (#050) disparó 3 veces sin crash (idx 35 por defecto),
 START pausa y reanuda (KEYDOWN 82 x2), carrera con LOD 0.4 a mediana ~27 fps (p10 ~19 fps).
 README/RELEASES pasan a **v0.2.0-beta (beta pública)**.
+
+## Bug #052: data abort en `PhysicCar::PhysicCar` al darle "Siguiente" tras ganar una carrera (log 086 + dump 1790471729)
+
+Mismo PC que el #050 (`+0x4cf2e4`, `ldr r3,[r5]`, r5 = `BaseCarManager::GetPackFile()` = NULL), pero
+ahora `sl` (índice de auto) = **4**, válido. El `.psp2dmp` resuelto con `--so-base 0x98000000` (la
+autodetección del toolkit dio 0x97ab8000, mal) da la pila `RaceCar::RaceCar` → `LogicCar` →
+`PhysicCar`. El log ya lo anunciaba al arrancar: `InitCarMng` abre los packs de los autos en orden
+(file000034, 080, 351, 177, **PackFileNull**, 122...) → el pack del auto 4 no abre en estos datos. La
+carrera siguiente lo trae como rival. No es el #033 (nombre NULL): el nombre existe, pero
+`createAndOpenFile` falla.
+**Fix (`patch.c`):** `hook_getpackfilename` guarda `idx*0x1C8` en `g_last_pack_off`; `hook_packfile`
+registra el último auto cuyo pack SÍ abrió y, si `createAndOpenFile` da NULL, llama de nuevo a
+`GetPackFile(this, sustituto, pack)` (sustituto fijo por auto, con guarda de recursión) y retorna
+por `0x48DB88`. Loguea `PackFileNull: auto N pack P ('nombre') -> se usa el pack del auto M` con el
+nombre real del pack, para poder arreglar los datos. **Pendiente de verificar en consola.**
+
+## Rendimiento (log 086): carrera CPU-bound en el hilo principal (~45-55 ms/f de motor, 18-24 fps)
+
+- `pthread_mutex_lock`/`cond_*`: cada llamada del motor recorría linealmente un array de 1024
+  punteros bajo un LwMutex global (`isObjectInitialized`). Ahora tabla hash de 4096 con lectura sin
+  lock (`pthr.c`), mismas semánticas. `pthread_mutex_lock` además intenta `trylock` antes de dejar
+  migas (un cuelgue siempre es un lock contendido). Nuevo contador `+N mutex` en el latido `[wd]`.
+- `file00a.bin` (143 MB de audio vox): 868 `fopen` en la sesión (~2/s en carrera), cada uno
+  `sceIoOpen`+`sceIoClose`+buffer stdio de 64 KB. Ahora un solo descriptor compartido y handles
+  livianos con `sceIoPread` + buffer de 16 KB (`io.c`, `[shf]`).
+- Subidas de textura de ~16 MB (60-77 ms) cada 5-10 s en carrera, sin carga de archivo cerca: se
+  loguean (`[texup]`, tope 24) con tamaño/formatos/pixeles/llamador, y `glTexImage2D(NULL)` con la
+  misma especificación se saltea (contenido indefinido por spec). Invalidado en `glDeleteTextures`.
+- `glBindTexture` ya no deja migas salvo con `TRACE_GL_CALLS`.
+- vitaGL: portado el commit `3c2efff` de 9mm-vita (mismo motor Glitch): chequeo de atributos
+  "packed" por stride completo + base offset real (UVs/atributos de mallas planares o con
+  TexCoord antes que Position), `lerp` renombrado en GLSL, mapa de `glBindAttribLocation` de 64
+  entradas (antes 16 con `strcpy`: desborde de heap si el motor bindea más), early-return en link.
+  **Ojo:** la regla de CMake no recompila vitaGL por cambios en su fuente; hay que borrar
+  `lib/vitaGL/source/custom_shaders.o` + `libvitaGL.a` (o `make` a mano en `lib/vitaGL`).
+- Se evaluó y NO se tocó: `Camera::IsInViewFrustrum -> 1` (arregla autos/poderes invisibles,
+  sesión 2026-09-20). 9mm no tiene más técnicas de loader que A6 no use ya (relojes, afinidad,
+  `sceClibMemcpy`, cache de shaders, fcache).

@@ -71,7 +71,11 @@ engine-detection write-up.
 
 - **Frame rate in races**: races run at about 20–30 fps (median ~27 fps on hardware). The
   engine is CPU-bound. The draw distance uses the game's original LOD value (0.4), so some
-  far-away scenery still pops in.
+  far-away scenery still pops in. v0.2.1-beta reduces stutter (cheaper mutex locks, the sound
+  archive opened once, fewer texture re-uploads), but this isn't measured on console yet.
+- **Missing car pack**: one car's data pack doesn't open with this game data. Since
+  v0.2.1-beta the game uses another car's pack instead of crashing, so that car may drive like
+  a different one.
 - **Elements may briefly disappear during races** (including the player's car) during
   engine stalls in its mesh-batching code. Not seen in recent tests, but not fixed yet.
 - **Game data mapping**: the game's Flash screens come from unnamed `.dat` files and were
@@ -197,6 +201,8 @@ users must possess their own legally obtained copy of the game in the form of an
 - **TheFloW**: For `so_util`, `kubridge`, `FdFix`, and foundational techniques for loading
   Android executables on PS Vita.
 - **Rinnegatamante**: For `vitaGL` and continued support to the PS Vita porting scene.
+- **iwannagooutside ([9mm-vita](https://github.com/iwannagooutside/vitaGL))**: For the vitaGL
+  fixes for the Glitch engine, ported here.
 - **v-atamanenko**: For `FalsoJNI` and the `soloader-boilerplate` base template.
 - **FFmpeg**: For the software video decoder used to play the intro FMV.
 - **Vita Community**: To all developers and enthusiasts in the PS Vita homebrew community.

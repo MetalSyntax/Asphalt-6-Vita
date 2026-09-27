@@ -7,6 +7,40 @@ known issues; this file is the dated, per-release history.
 
 ---
 
+## v0.2.1-beta — 2026-09-26
+
+**Status: Public beta (not yet verified on console).** Fixes a crash when you continue after
+winning a race and reduces stutter during races. No data changes are needed.
+
+### Fixed
+
+- Crash when pressing "Next" after winning a race. The pack file for one car doesn't open with
+  this game data, and the next race could pick that car as a rival. The game now uses a car
+  whose pack loads, and the log names the missing pack.
+- Heap overflow in vitaGL when a shader binds more than 16 attribute names.
+- Vertex attributes read from the wrong place for some mesh layouts. This could explain some
+  flickering or wrong textures on 3D models.
+- Shaders that define their own `lerp()` no longer fail to compile.
+
+The last three fixes come from the vitaGL changes in
+[9mm-vita](https://github.com/iwannagooutside/vitaGL), which uses the same Glitch engine.
+
+### Performance
+
+- Mutex locks are much cheaper. Each lock used to scan a 1024-entry table under a global lock.
+- The sound archive (`file00a.bin`, 143 MB) is opened once instead of on every sound, about
+  twice per second in races.
+- Large texture re-uploads during races (60–77 ms stutters) are logged, and redundant
+  empty re-uploads are skipped.
+
+### Known issues
+
+- Races still run at about 20–30 fps. The engine is CPU-bound.
+- The large texture uploads during races aren't fully explained yet. The new `[texup]` log
+  lines will show what causes them.
+
+---
+
 ## v0.2.0-beta — 2026-09-24
 
 **Status: Public beta.** The game is playable from start to finish: menus, races, pause menu,
