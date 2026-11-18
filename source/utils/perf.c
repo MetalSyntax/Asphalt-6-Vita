@@ -66,7 +66,7 @@ void perf_report(unsigned int period_ms, uint32_t main_cpu_us) {
     // ms totales por categoria en el latido (de period_ms), + promedio por frame en us.
 #define MS(i) (unsigned)(d[i].us / 1000)
 #define PF(i) (unsigned)(d[i].us / frames)
-    l_error("[perf] %ums: cpu_main=%ums | render %ums (motor sin swap %uus/f) | swap %ums (%uus/f max %ums) | "
+    l_diag("[perf] %ums: cpu_main=%ums | render %ums (motor sin swap %uus/f) | swap %ums (%uus/f max %ums) | "
             "sleep %ux %ums | frame max %ums, >50ms %u >100ms %u >250ms %u",
             period_ms, (unsigned)(main_cpu_us / 1000),
             MS(PERF_RENDER),
@@ -75,7 +75,7 @@ void perf_report(unsigned int period_ms, uint32_t main_cpu_us) {
             (unsigned)d[PERF_SLEEP].calls, MS(PERF_SLEEP),
             (unsigned)(fmax / 1000), (unsigned)(h50 - last_h50),
             (unsigned)(h100 - last_h100), (unsigned)(h250 - last_h250));
-    l_error("[perf]   draws %u (%u/f) bindfb %u | copytex %ux %ums (max %ums) | "
+    l_diag("[perf]   draws %u (%u/f) bindfb %u | copytex %ux %ums (max %ums) | "
             "texup %ux %uKiB %ums (max %ums) | bufdata %ux %uKiB %ums (max %ums) | flush %ux %ums",
             (unsigned)(draws - last_draws), (unsigned)((draws - last_draws) / frames),
             (unsigned)(bindfb - last_bindfb),
@@ -91,7 +91,7 @@ void perf_report(unsigned int period_ms, uint32_t main_cpu_us) {
         float lod = *g_perf_lod_factor;
         int track = g_perf_cur_track ? *g_perf_cur_track : -1;
         if (lod != last_lod || track != last_track) // solo cuando cambia (una vez por pista)
-            l_error("[perf] s_GameplayFactorLOD=%d/1000 m_currentTrack=%d", (int)(lod * 1000.0f), track);
+            l_diag("[perf] s_GameplayFactorLOD=%d/1000 m_currentTrack=%d", (int)(lod * 1000.0f), track);
         last_lod = lod;
         last_track = track;
     }

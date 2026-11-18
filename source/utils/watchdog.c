@@ -175,7 +175,7 @@ static int watchdog_thread(SceSize args, void *argp) {
         // "+N strcmp" cubre parseos (constructAnimator/XML: strcmp por tag, sin malloc
         // visible si opera sobre buffer ya cargado) y "+N gettod" las esperas activas
         // de tiempo (pacing de DisplayFrame con reloj congelado).
-        l_error("[wd] %u frames (+%u en %ds) | +%u reservas +%u strstr +%u strcmp +%u mutex +%u gettod | último hito: %s #%d hace %u ms",
+        l_diag("[wd] %u frames (+%u en %ds) | +%u reservas +%u strstr +%u strcmp +%u mutex +%u gettod | último hito: %s #%d hace %u ms",
                 swaps, swaps - last_swaps, WATCHDOG_PERIOD_US / 1000000,
                 hot - last_hot,
                 spin - last_spin,
@@ -203,8 +203,24 @@ static int watchdog_thread(SceSize args, void *argp) {
                     last_main_clocks = c;
                 }
             }
+#ifdef DEBUG_SOLOADER
             if (swaps != last_swaps)
                 perf_report(WATCHDOG_PERIOD_US / 1000, main_cpu);
+            /*
+             * Log 090: en la carga de carrera hay +4..+6 frames por latido (no salta el
+             * volcado de cuelgue) pero cpu_main es 1.5-2.5 s de 5 s: el hilo principal pasa
+             * mas de la mitad BLOQUEADO y no se sabe en que. Se muestrea su espera (con tope).
+             */
+            static int slow_dumps = 0;
+            if (swaps != last_swaps && swaps - last_swaps < 30 && main_cpu &&
+                main_cpu < WATCHDOG_PERIOD_US / 2 && slow_dumps < 6) {
+                slow_dumps++;
+                l_error("[wd] === carga lenta: %u frames, cpu_main %u ms: volcando estado (%d/6) ===",
+                        (unsigned)(swaps - last_swaps), main_cpu / 1000, slow_dumps);
+                watchdog_dump_threads();
+                bc_dump("carga lenta, hilo principal mayormente bloqueado");
+            }
+#endif
         }
 
         if (swaps == last_swaps) {

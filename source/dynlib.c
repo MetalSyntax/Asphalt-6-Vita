@@ -801,7 +801,7 @@ so_default_dynlib default_dynlib[] = {
         { "glValidateProgram", (uintptr_t)&ret0 },
         { "glVertexAttrib4f", (uintptr_t)&glVertexAttrib4f },
         { "glVertexAttrib4fv", (uintptr_t)&glVertexAttrib4fv },
-        { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
+        { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer_soloader },
         { "glVertexPointer", (uintptr_t)&glVertexPointer },
         { "glViewport", (uintptr_t)&glViewport },
         { "glWeightPointerOES", (uintptr_t)&ret0 },

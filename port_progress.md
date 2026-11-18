@@ -4750,3 +4750,36 @@ nombre real del pack, para poder arreglar los datos. **Pendiente de verificar en
 - Se evaluó y NO se tocó: `Camera::IsInViewFrustrum -> 1` (arregla autos/poderes invisibles,
   sesión 2026-09-20). 9mm no tiene más técnicas de loader que A6 no use ya (relojes, afinidad,
   `sceClibMemcpy`, cache de shaders, fcache).
+
+## Bug #053: tirones de 47-98 ms en carrera por resubida del atlas de glifos (logs 089/090)
+
+- Log 089: el motor (llamador `libasphalt6.so+0x9136D0`) resube ENTERA con `glTexSubImage2D` una
+  textura `GL_ALPHA` 2048x2048 (tex=4, probablemente atlas de glifos/texto) cada vez que cambia algo.
+  62-98 ms por llamada, a veces 2 en el mismo frame -> caídas a ~5 fps.
+- **Fix 1 (`source/utils/glutil.c`, `glTexSubImage2D_soloader`):** copia sombra en RAM de la última
+  subida. Se compara fila por fila y solo se sube la franja que cambió (nada si es idéntica).
+  Confirmado en log 090: ahora sube 5-414 filas en vez de 2048.
+- Pero log 090 muestra que aun con 5 filas tarda ~47 ms: vitaGL (`lib/vitaGL/source/textures.c:985`)
+  copia la textura ENTERA a memoria nueva si se usó en los últimos `FRAME_PURGE_FREQ` (4) frames.
+- **Fix 2:** para `GL_ALPHA` (vitaGL la guarda lineal en `U8_R111`, stride = ancho) la franja se
+  escribe directo con `memcpy` sobre `vglGetTexDataPointer()`, sin llamar a `glTexSubImage2D`.
+  **Riesgo conocido:** se escribe mientras la GPU puede leer el frame anterior. El atlas agrega
+  glifos en filas libres, así que a lo sumo 1 frame con un glifo raro. **PENDIENTE de verificar en consola.**
+- Techo restante: ~30-40 ms/frame de CPU del propio motor (25-30 fps), sin cambios.
+
+## Bug #054: la pantalla de título decía "Waiting for players..." (log 089, captura 2026-11-18-004338)
+
+El texto viene de la tabla de strings `file000820.dat` (texto de multijugador). En
+`source/reimpl/io.c`, al cargar el archivo en la fcache se reemplaza en memoria por
+"Tap screen to start" (mismo largo o menor, relleno con NUL; los offsets no cambian). También
+afecta al lobby multijugador, que no funciona en este port. **Confirmado en consola (log 090).**
+
+## Logs en Release
+
+- Nuevo macro `l_diag()` en `source/utils/logger.h`: = `l_error` en Debug, no-op en Release.
+- Pasaron a `l_diag`: `[pad]`, `[touch]`, latido `[gl]`, `[gl-blend]`, `[texup]`, `[perf]`, latido `[wd]`.
+- Siguen activos en Release los errores reales y el volcado de cuelgue del watchdog.
+- Diagnósticos nuevos solo-Debug:
+  - `[wd] "carga lenta"`: volcado de hilos si <30 frames y cpu_main <50% en un latido (máx. 6).
+  - `[fmt]`: cada combinación única de formato de textura / `glVertexAttribPointer`, para el issue #1
+    de GitHub ("luces rojas se ven azules"). **No reproducido.**

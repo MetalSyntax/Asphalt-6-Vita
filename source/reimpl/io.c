@@ -250,6 +250,19 @@ static void fcache_populate(const char *path, FILE *real_file) {
         return;
     }
 
+    // La pantalla de titulo muestra "Waiting for players..." (texto de multijugador de la
+    // tabla file000820.dat) y parece que espera gente online. Se reescribe en memoria con
+    // un texto de igual o menor largo, relleno con NUL: los offsets de la tabla no cambian.
+    // ponytail: tambien afecta al lobby de multijugador (no funciona en este port).
+    if (strstr(path, "file000820.dat")) {
+        static const char from[] = "Waiting for players...", to[] = "Tap screen to start";
+        for (unsigned char *p = buf; (p = memmem(p, (size_t)(buf + size - p), from,
+                                                 sizeof(from))) != NULL; p += sizeof(from)) {
+            memset(p, 0, sizeof(from));
+            memcpy(p, to, sizeof(to) - 1);
+        }
+    }
+
     pthread_mutex_lock(&s_fcache_lock);
     if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES || fcache_find_entry_locked(path) >= 0) {
         pthread_mutex_unlock(&s_fcache_lock);

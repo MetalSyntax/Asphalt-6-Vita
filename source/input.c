@@ -231,7 +231,7 @@ static void poll_touch(void *env, void *clazz) {
             s_slots[slot].x = x;
             s_slots[slot].y = y;
             seen[slot] = true;
-            l_error("[touch] PRESS slot=%d x=%d y=%d", slot, x, y);
+            l_diag("[touch] PRESS slot=%d x=%d y=%d", slot, x, y);
             if (s_pressed) s_pressed(env, clazz, x, y, slot);
             continue;
         }
@@ -251,7 +251,7 @@ static void poll_touch(void *env, void *clazz) {
             && s_slots[slot].vita_id != FAKE_VITA_ID) {
             s_slots[slot].active = false;
             s_slots[slot].vita_id = FREE_VITA_ID;
-            l_error("[touch] RELEASE slot=%d x=%d y=%d", slot, s_slots[slot].x, s_slots[slot].y);
+            l_diag("[touch] RELEASE slot=%d x=%d y=%d", slot, s_slots[slot].x, s_slots[slot].y);
             // El release lleva la ultima posicion conocida: el motor la usa
             // para decidir sobre que widget cayo el tap.
             if (s_released)
@@ -275,7 +275,7 @@ static void fake_touch_release(void *env, void *clazz, int idx) {
     int slot = s_fake_slot[idx];
     if (slot >= 0 && slot < INPUT_MAX_SLOTS && s_slots[slot].active
         && s_slots[slot].vita_id == FAKE_VITA_ID) {
-        l_error("[pad] FAKE RELEASE idx=%d slot=%d x=%d y=%d",
+        l_diag("[pad] FAKE RELEASE idx=%d slot=%d x=%d y=%d",
                 idx, slot, s_slots[slot].x, s_slots[slot].y);
         if (s_released)
             s_released(env, clazz, s_slots[slot].x, s_slots[slot].y, slot);
@@ -302,7 +302,7 @@ static void fake_touch_evict_for(void *env, void *clazz, int idx) {
         if (other == idx || other == FAKE_IDX_LEFT || other == FAKE_IDX_RIGHT)
             continue;
         if (s_fake_slot[other] >= 0) {
-            l_error("[pad] FAKE nitro expulsa idx=%d por un slot libre", other);
+            l_diag("[pad] FAKE nitro expulsa idx=%d por un slot libre", other);
             fake_touch_release(env, clazz, other);
             return;
         }
@@ -334,7 +334,7 @@ static void fake_touch_set(void *env, void *clazz, int idx, bool down) {
         s_slots[slot].y = y;
     }
     s_fake_down[idx] = true;
-    l_error("[pad] FAKE PRESS idx=%d slot=%d x=%d y=%d", idx, s_fake_slot[idx], x, y);
+    l_diag("[pad] FAKE PRESS idx=%d slot=%d x=%d y=%d", idx, s_fake_slot[idx], x, y);
     if (s_pressed)
         s_pressed(env, clazz, x, y, s_fake_slot[idx]);
 }
@@ -345,10 +345,10 @@ static bool dispatch_key(void *env, void *clazz, bool is_down, bool was_down, in
     if (is_down == was_down)
         return was_down;
     if (is_down) {
-        l_error("[pad] KEYDOWN %d", keycode);
+        l_diag("[pad] KEYDOWN %d", keycode);
         if (s_key_down) s_key_down(env, clazz, keycode);
     } else {
-        l_error("[pad] KEYUP %d", keycode);
+        l_diag("[pad] KEYUP %d", keycode);
         if (s_key_up) s_key_up(env, clazz, keycode);
     }
     return is_down;

@@ -19,6 +19,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <malloc.h>
+#include <stdlib.h>
 #include <string.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/processmgr.h>
@@ -203,7 +204,7 @@ void gl_swap() {
     // cuando el log se corta: si después del último evento siguen apareciendo latidos, el
     // hilo principal sigue girando y el problema está en otro lado.
     if ((gl_swap_count % GL_HEARTBEAT_EVERY) == 0)
-        l_error("[gl] latido: %u frames presentados", gl_swap_count);
+        l_diag("[gl] latido: %u frames presentados", gl_swap_count);
 }
 
 void glShaderSource_soloader(GLuint shader, GLsizei count,
@@ -504,7 +505,7 @@ static void gl_blend_draw_check(const char *who, GLsizei count) {
     if (g_blend_enabled) {
         uint32_t i = n_on++;
         if (i < GL_BLEND_DRAW_LOG_HEAD || (i % GL_BLEND_DRAW_LOG_SAMPLE) == 0)
-            l_error("[gl-blend] %s BLEND ON  count=%d sfactor=0x%x dfactor=0x%x depth_test=%d depth_mask=%d depth_func=0x%x program=%u frame=%u (#%u)",
+            l_diag("[gl-blend] %s BLEND ON  count=%d sfactor=0x%x dfactor=0x%x depth_test=%d depth_mask=%d depth_func=0x%x program=%u frame=%u (#%u)",
                     who, (int)count, (unsigned)g_blend_sfactor, (unsigned)g_blend_dfactor,
                     g_depth_test_enabled, g_depth_mask, (unsigned)g_depth_func,
                     (unsigned)g_cur_program, gl_swap_count, i);
@@ -514,7 +515,7 @@ static void gl_blend_draw_check(const char *who, GLsizei count) {
         // transparentes" sino algo mas sistemico (blend que nunca se apaga de verdad).
         uint32_t i = n_off++;
         if (i < GL_BLEND_DRAW_LOG_HEAD || (i % GL_BLEND_DRAW_LOG_SAMPLE) == 0)
-            l_error("[gl-blend] %s blend off count=%d depth_test=%d depth_mask=%d depth_func=0x%x program=%u frame=%u (#%u)",
+            l_diag("[gl-blend] %s blend off count=%d depth_test=%d depth_mask=%d depth_func=0x%x program=%u frame=%u (#%u)",
                     who, (int)count, g_depth_test_enabled, g_depth_mask, (unsigned)g_depth_func,
                     (unsigned)g_cur_program, gl_swap_count, i);
     }
@@ -535,7 +536,9 @@ static void gl_blend_draw_check(const char *who, GLsizei count) {
 #define BIG_TEXUP_LOG_CAP 24
 #define TEXSPEC_SLOTS 32
 
-typedef struct { GLuint tex; GLsizei w, h; GLint ifmt; GLenum fmt, type; } texspec_t;
+// shadow: copia del ultimo contenido subido (solo texturas grandes actualizadas enteras
+// con glTexSubImage2D), para subir unicamente la franja de filas que cambio.
+typedef struct { GLuint tex; GLsizei w, h; GLint ifmt; GLenum fmt, type; unsigned char *shadow; } texspec_t;
 static texspec_t s_texspec[TEXSPEC_SLOTS];
 static unsigned s_texspec_next = 0;
 static int s_big_texup_logged = 0;
@@ -552,13 +555,47 @@ static texspec_t *texspec_find(GLuint tex) {
     return NULL;
 }
 
+/*
+ * Issue #1 de GitHub (no reproducido): "partes transparentes de las luces rojas y
+ * algunas texturas del auto salen azules" = R/B intercambiados. Se registra UNA vez cada
+ * combinacion de formato (textura o atributo de vertice) que usa el motor, con quien la
+ * pide, para ver si aparece algun camino BGRA/ABGR/ATC o un color de vertice raro.
+ */
+static void fmt_seen(const char *who, unsigned a, unsigned b, unsigned c, const void *ra) {
+#ifndef DEBUG_SOLOADER
+    return; // solo diagnostico: en Release no se paga el escaneo por draw
+#endif
+    static unsigned seen[64][4];
+    static int n = 0;
+    unsigned key = (unsigned)(uintptr_t)who;
+    for (int i = 0; i < n; i++)
+        if (seen[i][0] == key && seen[i][1] == a && seen[i][2] == b && seen[i][3] == c) return;
+    if (n >= 64) return;
+    seen[n][0] = key, seen[n][1] = a, seen[n][2] = b, seen[n][3] = c;
+    n++;
+    uint32_t r = (uint32_t)(uintptr_t)ra;
+    l_error("[fmt] %s 0x%x 0x%x 0x%x %s=0x%X (%d/64)", who, a, b, c, bc_in_so(r) ? "so+" : "ra",
+            bc_in_so(r) ? (unsigned)(r - 0x98000000u) : (unsigned)r, n);
+}
+
+void glVertexAttribPointer_soloader(GLuint index, GLint size, GLenum type, GLboolean normalized,
+                                    GLsizei stride, const void *pointer) {
+    fmt_seen("attrib(size,type,norm)", (unsigned)size, (unsigned)type, (unsigned)normalized, BC_RA);
+    glVertexAttribPointer(index, size, type, normalized, stride, pointer);
+}
+
+static void texspec_drop_shadow(texspec_t *ts) {
+    free(ts->shadow);
+    ts->shadow = NULL;
+}
+
 static void big_texup_log(const char *who, GLuint tex, GLsizei w, GLsizei h, GLint ifmt,
                           GLenum fmt, GLenum type, const void *pixels, uint32_t us,
                           const void *ra, const char *what) {
     if (s_big_texup_logged >= BIG_TEXUP_LOG_CAP) return;
     s_big_texup_logged++;
     uint32_t r = (uint32_t)(uintptr_t)ra;
-    l_error("[texup] %s tex=%u %dx%d ifmt=0x%x fmt=0x%x type=0x%x pixels=%s %u.%03u ms frame=%u %s=0x%X%s",
+    l_diag("[texup] %s tex=%u %dx%d ifmt=0x%x fmt=0x%x type=0x%x pixels=%s %u.%03u ms frame=%u %s=0x%X%s",
             who, (unsigned)tex, (int)w, (int)h, (unsigned)ifmt, (unsigned)fmt, (unsigned)type,
             pixels ? "si" : "NULL", (unsigned)(us / 1000), (unsigned)(us % 1000), gl_swap_count,
             bc_in_so(r) ? "so+" : "ra", bc_in_so(r) ? (unsigned)(r - 0x98000000u) : (unsigned)r,
@@ -606,6 +643,7 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
         default:
             break;
     }
+    fmt_seen("glTexImage2D(ifmt,fmt,type)", (unsigned)internalformat, format, type, BC_RA);
     int big = target == GL_TEXTURE_2D && level == 0 &&
               (uint32_t)width * (uint32_t)height >= BIG_TEXUP_PIXELS;
     GLuint tex = 0;
@@ -622,6 +660,7 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
             ts = &s_texspec[s_texspec_next++ % TEXSPEC_SLOTS];
             ts->tex = tex;
         }
+        texspec_drop_shadow(ts); // contenido nuevo: la copia vieja ya no vale
         ts->w = width; ts->h = height; ts->ifmt = internalformat;
         ts->fmt = format; ts->type = type;
     }
@@ -669,6 +708,50 @@ void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset, GLint y
                               GLsizei width, GLsizei height, GLenum format, GLenum type,
                               const void *pixels) {
     BC_SCOPE("glTexSubImage2D");
+    fmt_seen("glTexSubImage2D(fmt,type,-)", format, type, 0, BC_RA);
+    /*
+     * Log 089: el motor (so+0x9136D0) resube ENTERA una textura GL_ALPHA 2048x2048
+     * (tex=4, atlas de glifos/texto) cada vez que cambia algo; vitaGL la convierte
+     * pixel a pixel en 62-98 ms -> los bajones a ~5 FPS en carrera. Se guarda una copia
+     * y solo se sube la franja de filas que realmente cambio (o nada si es identica).
+     */
+    int bpp = type != GL_UNSIGNED_BYTE ? 0 :
+              (format == GL_ALPHA || format == GL_LUMINANCE) ? 1 :
+              format == GL_LUMINANCE_ALPHA ? 2 : format == GL_RGB ? 3 : format == GL_RGBA ? 4 : 0;
+    texspec_t *ts = (bpp && pixels && target == GL_TEXTURE_2D && level == 0 && !xoffset &&
+                     !yoffset && (uint32_t)width * (uint32_t)height >= BIG_TEXUP_PIXELS)
+                        ? texspec_find(bound_tex2d()) : NULL;
+    size_t row = (size_t)width * (size_t)bpp;
+    if (ts && ts->w == width && ts->h == height && ts->fmt == format && ts->type == type &&
+        (row & 3) == 0) {
+        const unsigned char *src = (const unsigned char *)pixels;
+        if (ts->shadow) {
+            GLsizei y0 = 0, y1 = height - 1;
+            while (y0 < height && !memcmp(ts->shadow + y0 * row, src + y0 * row, row)) y0++;
+            if (y0 == height) return; // identica: no hay nada que subir
+            while (y1 > y0 && !memcmp(ts->shadow + y1 * row, src + y1 * row, row)) y1--;
+            memcpy(ts->shadow + y0 * row, src + y0 * row, (size_t)(y1 - y0 + 1) * row);
+            /*
+             * Log 090: aun subiendo 5 filas vitaGL tarda ~47 ms, porque si la textura se
+             * uso en los ultimos FRAME_PURGE_FREQ frames la copia ENTERA a memoria nueva
+             * (textures.c:985) antes de escribir. Un GL_ALPHA se guarda lineal en U8_R111
+             * con stride = ancho (multiplo de 8), asi que la franja se escribe directo.
+             * ponytail: escritura sin copia mientras la GPU puede estar leyendo el frame
+             * anterior; un atlas de glifos agrega en filas libres, a lo sumo 1 frame raro.
+             */
+            unsigned char *dst = (format == GL_ALPHA && ts->ifmt == GL_ALPHA && !(width & 7))
+                                     ? (unsigned char *)vglGetTexDataPointer(GL_TEXTURE_2D) : NULL;
+            if (dst) {
+                memcpy(dst + y0 * row, src + y0 * row, (size_t)(y1 - y0 + 1) * row);
+                return;
+            }
+            yoffset = y0;
+            height = y1 - y0 + 1;
+            pixels = src + y0 * row;
+        } else if ((ts->shadow = (unsigned char *)malloc(row * (size_t)height)) != NULL) {
+            memcpy(ts->shadow, src, row * (size_t)height); // sin memoria: subida completa de siempre
+        }
+    }
     uint32_t _pt = perf_now();
     glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
     uint32_t _us = perf_now() - _pt;
@@ -683,6 +766,7 @@ void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internal
                                      GLsizei width, GLsizei height, GLint border,
                                      GLsizei imageSize, const void *data) {
     BC_SCOPE("glCompressedTexImage2D");
+    fmt_seen("glCompressedTexImage2D(ifmt,-,-)", internalformat, 0, 0, BC_RA);
     uint32_t _pt = perf_now();
     glCompressedTexImage2D(target, level, internalformat, width, height, border,
                            imageSize, data);
@@ -708,7 +792,7 @@ void glDeleteTextures_soloader(GLsizei n, const GLuint *textures) {
     // especificacion para que el atajo de glTexImage2D(NULL) no la saltee.
     for (GLsizei k = 0; textures && k < n; k++) {
         texspec_t *ts = texspec_find(textures[k]);
-        if (ts) ts->tex = 0, ts->w = 0;
+        if (ts) ts->tex = 0, ts->w = 0, texspec_drop_shadow(ts);
     }
     glDeleteTextures(n, textures);
 }

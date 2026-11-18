@@ -85,6 +85,8 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
 // Envoltorios que solo dejan migas (utils/breadcrumb.h) alrededor de llamadas de vitaGL que
 // pueden esperar a la GPU o pedir memoria: sin ellos, un cuelgue adentro de una de estas no
 // deja ningun rastro en el log.
+void glVertexAttribPointer_soloader(GLuint index, GLint size, GLenum type, GLboolean normalized,
+                                    GLsizei stride, const void *pointer);
 void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
                            GLsizei width, GLsizei height, GLint border,
                            GLenum format, GLenum type, const void *pixels);

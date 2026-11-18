@@ -7,6 +7,36 @@ known issues; this file is the dated, per-release history.
 
 ---
 
+## v0.2.2-beta — 2026-11-18
+
+**Status: Public beta.** Fixes the big in-race frame drops (down to about 5 fps) and is a
+Release build with far less logging. No data changes are needed.
+
+### Fixed
+
+- The title screen said "Waiting for players...", which made it look like the game waited for
+  online players. It now says "Tap screen to start". The text is patched in memory; the game
+  data is untouched.
+
+### Performance
+
+- The engine re-uploaded a whole 2048x2048 text/glyph texture every time new text appeared,
+  causing 60–98 ms stutters (drops to about 5 fps). Now only the changed rows are written,
+  directly into the texture.
+- Release build: per-frame and per-button diagnostic logging is now Debug-only, so the Release
+  build writes much less to the memory card. Real errors and hang dumps are still logged.
+
+### Known issues
+
+- Races still run at about 25–30 fps. The engine itself is CPU-bound.
+- The direct texture write hasn't been verified on console yet. If a text glyph flickers for one
+  frame, please report it.
+- Race loading screens are slow and show few frames (the loading bar barely animates). Still
+  being diagnosed.
+- GitHub issue #1 (red light parts appearing blue) hasn't been reproduced yet.
+
+---
+
 ## v0.2.1-beta — 2026-09-26
 
 **Status: Public beta (not yet verified on console).** Fixes a crash when you continue after

@@ -40,6 +40,14 @@ extern "C" {
 #endif
 
 #define l_error(...)   _log_print(LT_ERROR,   __VA_ARGS__)
+
+// Diagnostico frecuente (por frame, por boton, cada latido): solo en Debug. En Release
+// cada linea es un sceIoWrite a la tarjeta en pleno juego.
+#ifdef DEBUG_SOLOADER
+#define l_diag(...)    _log_print(LT_ERROR,   __VA_ARGS__)
+#else
+#define l_diag(...)    do {} while (0)
+#endif
 #define l_fatal(...)   _log_print(LT_FATAL,   __VA_ARGS__)
 
 void _log_print(int t, const char* fmt, ...)
